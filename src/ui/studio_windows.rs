@@ -5,12 +5,15 @@ use egui::{
     Sense, Stroke, Ui, Vec2,
 };
 
-use crate::audio::{AudioRuntime, Command};
-use crate::plugins::{PluginFormat, MAX_PLUGIN_SLOTS};
+use crate::audio::{db_to_gain, AudioRuntime, Command, TRACKS, TRACK_COUNT};
+use crate::plugins::PluginFormat;
 use crate::state::UiState;
-use crate::studio::Studio;
+use crate::studio::{sync_track_clip, Studio};
 use crate::theme;
 use crate::ui::widgets::knob;
+
+/// Donation destination shared with the other Replicant projects.
+pub const PAYPAL_DONATE: &str = "https://paypal.me/DanimanX?locale.x=en_US&country.x=CL";
 
 /// Thin system bar above the transport.
 pub fn draw_menu_bar(ui: &mut Ui, rect: Rect, studio: &mut Studio, state: &mut UiState) {
@@ -68,6 +71,22 @@ pub fn draw_menu_bar(ui: &mut Ui, rect: Rect, studio: &mut Studio, state: &mut U
     }
     if button(&mut child, "SYNTH", studio.synth_open) {
         studio.synth_open = !studio.synth_open;
+    }
+
+    let donate = Button::new(
+        RichText::new("DONATE")
+            .font(theme::display(8.5))
+            .color(theme::AMBER),
+    )
+    .fill(theme::accent_alpha(theme::AMBER, 18))
+    .stroke(Stroke::new(1.0, theme::accent_alpha(theme::AMBER, 130)))
+    .corner_radius(CornerRadius::same(2));
+    if child
+        .add(donate)
+        .on_hover_text("Buy me a coffee · PayPal")
+        .clicked()
+    {
+        child.ctx().open_url(egui::OpenUrl::new_tab(PAYPAL_DONATE));
     }
 
     // Zoom control: the whole UI scales, and the window grows with it so the
@@ -195,11 +214,13 @@ pub fn draw_windows(
     state: &mut UiState,
     audio: &mut AudioRuntime,
 ) {
-    draw_rack(ctx, studio, state);
-    draw_browser(ctx, studio, state);
+    draw_rack(ctx, studio, state, audio);
+    draw_browser(ctx, studio, state, audio);
     draw_midi(ctx, studio, state, audio);
     draw_project(ctx, studio, state, audio);
     draw_synth_editor(ctx, studio, state, audio);
+    draw_audio_editor(ctx, studio, state, audio);
+    crate::ui::piano_roll::draw(ctx, studio, state, audio);
 }
 
 fn window_frame() -> Frame {
@@ -223,184 +244,249 @@ fn section(ui: &mut Ui, title: &str, accent: Color32) {
     ui.add_space(4.0);
 }
 
-fn draw_rack(ctx: &egui::Context, studio: &mut Studio, state: &mut UiState) {
-    let mut open = studio.rack_open;
+fn draw_rack(
+    ctx: &egui::Context,
+    studio: &mut Studio,
+    _state: &mut UiState,
+    audio: &mut AudioRuntime,
+) {
+    if !studio.rack_open {
+        return;
+    }
+    let mut open = true;
     let mut close = false;
-    egui::Window::new("PLUGIN RACK // MASTER INSERT CHAIN")
+    egui::Window::new("PLUGIN RACK // PER-TRACK INSERTS")
         .open(&mut open)
         .frame(window_frame())
         .default_pos(Pos2::new(300.0, 120.0))
-        .default_width(760.0)
+        .default_width(820.0)
         .resizable(true)
         .show(ctx, |ui| {
             ui.label(
-                RichText::new("Plugins process the master bus on a dedicated worker thread.")
-                    .font(theme::mono(8.0))
-                    .color(theme::TEXT_FAINT),
+                RichText::new(
+                    "Each track owns one CLAP/VST3 insert. The insert runs before the master effects in the device chain.",
+                )
+                .font(theme::mono(8.0))
+                .color(theme::TEXT_FAINT),
             );
             ui.add_space(6.0);
 
-            for slot in 0..MAX_PLUGIN_SLOTS {
-                let info = studio.slots[slot].clone();
-                let pending = studio.slot_pending[slot];
-                Frame::new()
-                    .fill(theme::PANEL_SUNK)
-                    .stroke(Stroke::new(1.0, theme::BORDER_SOFT))
-                    .corner_radius(CornerRadius::same(2))
-                    .inner_margin(egui::Margin::same(6))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(format!("{:02}", slot + 1))
-                                    .font(theme::display(10.0))
-                                    .color(theme::CYAN),
-                            );
-                            match &info {
-                                Some(info) => {
+            ScrollArea::vertical()
+                .max_height(340.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (track, spec) in TRACKS.iter().enumerate().take(TRACK_COUNT) {
+                        let info = studio.slots[track].clone();
+                        let pending = studio.slot_pending[track];
+                        let accent = theme::track_accent(track);
+                        Frame::new()
+                            .fill(theme::PANEL_SUNK)
+                            .stroke(Stroke::new(
+                                1.0,
+                                if studio.selected_slot == track {
+                                    theme::accent_alpha(accent, 150)
+                                } else {
+                                    theme::BORDER_SOFT
+                                },
+                            ))
+                            .corner_radius(CornerRadius::same(2))
+                            .inner_margin(egui::Margin::same(6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
                                     ui.label(
-                                        RichText::new(&info.name)
-                                            .font(theme::display(9.0))
+                                        RichText::new(format!("{:02}", track + 1))
+                                            .font(theme::display(10.0))
+                                            .color(accent),
+                                    );
+                                    ui.label(
+                                        RichText::new(spec.name)
+                                            .font(theme::display(8.2))
                                             .color(theme::TEXT),
                                     );
-                                    ui.label(
-                                        RichText::new(info.format.label())
-                                            .font(theme::mono(7.5))
-                                            .color(theme::accent_alpha(theme::MAGENTA, 220)),
-                                    );
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "v{} · latency {} smp",
-                                            info.version,
-                                            info.latency + state.plugin_latency as u32
-                                        ))
-                                        .font(theme::mono(7.0))
-                                        .color(theme::TEXT_FAINT),
-                                    );
-                                }
-                                None if pending => {
-                                    ui.label(
-                                        RichText::new("LOADING…")
-                                            .font(theme::mono(8.0))
-                                            .color(theme::AMBER),
-                                    );
-                                }
-                                None => {
-                                    ui.label(
-                                        RichText::new("EMPTY")
-                                            .font(theme::mono(8.0))
-                                            .color(theme::TEXT_FAINT),
-                                    );
-                                }
-                            }
-
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if info.is_some() {
-                                        if ui
-                                            .add(Button::new(
-                                                RichText::new("X").font(theme::display(8.0)),
-                                            ))
-                                            .clicked()
-                                        {
-                                            studio.unload_plugin(slot);
-                                        }
-                                        let label = if info.as_ref().is_some_and(|i| i.bypass) {
-                                            "BYPASSED"
-                                        } else {
-                                            "BYPASS"
-                                        };
-                                        if ui
-                                            .add(Button::new(
-                                                RichText::new(label).font(theme::display(8.0)),
-                                            ))
-                                            .clicked()
-                                        {
-                                            let bypass = !info.as_ref().is_some_and(|i| i.bypass);
-                                            studio.set_bypass(slot, bypass);
-                                        }
-                                    }
-                                    if ui
-                                        .add(Button::new(
-                                            RichText::new("LOAD").font(theme::display(8.0)),
-                                        ))
-                                        .clicked()
-                                    {
-                                        studio.browser_target = slot;
-                                        studio.browser_open = true;
-                                        if studio.scan_results.is_empty() && !studio.scan_running {
-                                            studio.start_scan();
-                                        }
-                                    }
-                                    ui.label(
-                                        RichText::new(format!("SLOT {}", slot + 1))
-                                            .font(theme::mono(7.0))
-                                            .color(theme::TEXT_FAINT),
-                                    );
-                                },
-                            );
-                        });
-
-                        if let Some(info) = &info {
-                            if let Some(error) = &info.error {
-                                ui.label(
-                                    RichText::new(error)
-                                        .font(theme::mono(7.5))
-                                        .color(theme::RED),
-                                );
-                            }
-                            if !info.params.is_empty() {
-                                ui.add_space(4.0);
-                                let mut changes = Vec::new();
-                                Grid::new(("params", slot))
-                                    .num_columns(8)
-                                    .spacing(Vec2::new(6.0, 4.0))
-                                    .show(ui, |ui| {
-                                        for (index, param) in
-                                            info.params.iter().take(16).enumerate()
-                                        {
-                                            let mut value = param.value;
-                                            let (rect, _) = ui.allocate_exact_size(
-                                                Vec2::new(72.0, 52.0),
-                                                Sense::hover(),
+                                    match &info {
+                                        Some(info) => {
+                                            ui.label(
+                                                RichText::new(&info.name)
+                                                    .font(theme::display(9.0))
+                                                    .color(theme::TEXT),
                                             );
-                                            let accent = if info.bypass {
-                                                theme::TEXT_FAINT
-                                            } else {
-                                                theme::CYAN
-                                            };
-                                            let text = format!("{:.0}%", value * 100.0);
-                                            if knob(
-                                                ui,
-                                                rect,
-                                                ui.scope_id().with(("plugin_param", slot, index)),
-                                                &mut value,
-                                                0.0..=1.0,
-                                                param.value,
-                                                &param.name.chars().take(9).collect::<String>(),
-                                                &text,
-                                                accent,
-                                            ) {
-                                                changes.push((param.id, value));
-                                            }
-                                            if (index + 1) % 8 == 0 {
-                                                ui.end_row();
-                                            }
+                                            ui.label(
+                                                RichText::new(info.format.label())
+                                                    .font(theme::mono(7.5))
+                                                    .color(theme::accent_alpha(
+                                                        theme::MAGENTA,
+                                                        220,
+                                                    )),
+                                            );
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "v{} · latency {} smp",
+                                                    info.version, info.latency
+                                                ))
+                                                .font(theme::mono(7.0))
+                                                .color(theme::TEXT_FAINT),
+                                            );
                                         }
-                                    });
-                                for (id, value) in changes {
-                                    if let Some(info) = &studio.slots[slot] {
-                                        if let Some(param) =
-                                            info.params.iter().find(|p| p.id == id).cloned()
-                                        {
-                                            studio.set_param(slot, &param, value);
+                                        None if pending => {
+                                            ui.label(
+                                                RichText::new("LOADING…")
+                                                    .font(theme::mono(8.0))
+                                                    .color(theme::AMBER),
+                                            );
                                         }
+                                        None => {
+                                            ui.label(
+                                                RichText::new("EMPTY")
+                                                    .font(theme::mono(8.0))
+                                                    .color(theme::TEXT_FAINT),
+                                            );
+                                        }
+                                    }
+
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if info.is_some() {
+                                                if ui
+                                                    .add(Button::new(RichText::new("X").font(
+                                                        theme::display(8.0),
+                                                    )))
+                                                    .clicked()
+                                                {
+                                                    studio.unload_plugin(track, audio);
+                                                }
+                                                let label =
+                                                    if info.as_ref().is_some_and(|i| i.bypass) {
+                                                        "BYPASSED"
+                                                    } else {
+                                                        "BYPASS"
+                                                    };
+                                                if ui
+                                                    .add(Button::new(
+                                                        RichText::new(label)
+                                                            .font(theme::display(8.0)),
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    let bypass = !info
+                                                        .as_ref()
+                                                        .is_some_and(|i| i.bypass);
+                                                    studio.set_bypass(track, bypass);
+                                                }
+                                            }
+                                            if ui
+                                                .add(Button::new(
+                                                    RichText::new("LOAD").font(theme::display(8.0)),
+                                                ))
+                                                .clicked()
+                                            {
+                                                studio.browser_target = track;
+                                                studio.browser_open = true;
+                                                if studio.scan_results.is_empty()
+                                                    && !studio.scan_running
+                                                {
+                                                    studio.start_scan();
+                                                }
+                                            }
+                                            if info.is_some()
+                                                && ui
+                                                    .add(Button::new(
+                                                        RichText::new("EDIT").font(
+                                                            theme::display(8.0),
+                                                        ),
+                                                    ))
+                                                    .clicked()
+                                            {
+                                                studio.selected_slot = track;
+                                            }
+                                            ui.label(
+                                                RichText::new(format!("TRACK {}", track + 1))
+                                                    .font(theme::mono(7.0))
+                                                    .color(theme::TEXT_FAINT),
+                                            );
+                                        },
+                                    );
+                                });
+
+                                if let Some(info) = &info {
+                                    if let Some(error) = &info.error {
+                                        ui.label(
+                                            RichText::new(error)
+                                                .font(theme::mono(7.5))
+                                                .color(theme::RED),
+                                        );
+                                    }
+                                }
+                            });
+                        ui.add_space(4.0);
+                    }
+                });
+
+            let selected = studio.selected_slot.min(TRACK_COUNT - 1);
+            if let Some(info) = studio.slots[selected].clone() {
+                if !info.params.is_empty() {
+                    ui.add_space(4.0);
+                    section(
+                        ui,
+                        &format!(
+                            "PARAMETERS · TRACK {:02} · {}",
+                            selected + 1,
+                            info.name
+                        ),
+                        theme::CYAN,
+                    );
+                    ScrollArea::vertical()
+                        .max_height(230.0)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let mut changes = Vec::new();
+                            Grid::new(("params", selected))
+                                .num_columns(8)
+                                .spacing(Vec2::new(6.0, 4.0))
+                                .show(ui, |ui| {
+                                    for (index, param) in
+                                        info.params.iter().take(64).enumerate()
+                                    {
+                                        let mut value = param.value;
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            Vec2::new(72.0, 52.0),
+                                            Sense::hover(),
+                                        );
+                                        let accent = if info.bypass {
+                                            theme::TEXT_FAINT
+                                        } else {
+                                            theme::CYAN
+                                        };
+                                        let text = format!("{:.0}%", value * 100.0);
+                                        if knob(
+                                            ui,
+                                            rect,
+                                            ui.scope_id().with(("plugin_param", selected, index)),
+                                            &mut value,
+                                            0.0..=1.0,
+                                            param.value,
+                                            &param.name.chars().take(9).collect::<String>(),
+                                            &text,
+                                            accent,
+                                        ) {
+                                            changes.push((param.id, value));
+                                        }
+                                        if (index + 1) % 8 == 0 {
+                                            ui.end_row();
+                                        }
+                                    }
+                                });
+                            for (id, value) in changes {
+                                if let Some(info) = &studio.slots[selected] {
+                                    if let Some(param) =
+                                        info.params.iter().find(|p| p.id == id).cloned()
+                                    {
+                                        studio.set_param(selected, &param, value);
                                     }
                                 }
                             }
-                        }
-                    });
-                ui.add_space(4.0);
+                        });
+                }
             }
 
             if !studio.logs.is_empty() {
@@ -430,7 +516,12 @@ fn draw_rack(ctx: &egui::Context, studio: &mut Studio, state: &mut UiState) {
     studio.rack_open = open;
 }
 
-fn draw_browser(ctx: &egui::Context, studio: &mut Studio, _state: &mut UiState) {
+fn draw_browser(
+    ctx: &egui::Context,
+    studio: &mut Studio,
+    _state: &mut UiState,
+    audio: &mut AudioRuntime,
+) {
     let mut open = studio.browser_open;
     egui::Window::new("PLUGIN BROWSER")
         .open(&mut open)
@@ -442,9 +533,13 @@ fn draw_browser(ctx: &egui::Context, studio: &mut Studio, _state: &mut UiState) 
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("TARGET SLOT {:02}", studio.browser_target + 1))
-                        .font(theme::display(9.0))
-                        .color(theme::CYAN),
+                    RichText::new(format!(
+                        "TARGET TRACK {:02} · {}",
+                        studio.browser_target + 1,
+                        TRACKS[studio.browser_target.min(TRACK_COUNT - 1)].name
+                    ))
+                    .font(theme::display(9.0))
+                    .color(theme::CYAN),
                 );
                 if ui
                     .add(Button::new(
@@ -551,7 +646,7 @@ fn draw_browser(ctx: &egui::Context, studio: &mut Studio, _state: &mut UiState) 
                     }
                     if let Some(descriptor) = to_load {
                         let slot = studio.browser_target;
-                        studio.load_plugin(slot, &descriptor);
+                        studio.load_plugin(slot, &descriptor, audio);
                         studio.browser_open = false;
                     }
                 });
@@ -1156,6 +1251,305 @@ fn draw_synth_editor(
             );
         });
     studio.synth_open = open;
+}
+
+fn draw_audio_editor(
+    ctx: &egui::Context,
+    studio: &mut Studio,
+    state: &mut UiState,
+    audio: &mut AudioRuntime,
+) {
+    if !studio.audio_editor_open {
+        return;
+    }
+    let mut open = true;
+    let track = studio.audio_editor_track.min(TRACK_COUNT - 1);
+    let accent = theme::track_accent(track);
+    let mut chosen_track = track;
+    egui::Window::new(format!(
+        "AUDIO CLIP // TRACK {:02} {}",
+        track + 1,
+        TRACKS[track].name
+    ))
+    .open(&mut open)
+    .frame(window_frame())
+    .default_pos(Pos2::new(520.0, 160.0))
+    .default_size(Vec2::new(760.0, 520.0))
+    .resizable(true)
+    .show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("TRACK")
+                    .font(theme::mono(8.0))
+                    .color(theme::TEXT_FAINT),
+            );
+            egui::ComboBox::from_id_salt("audio_editor_track")
+                .selected_text(format!("{:02} {}", track + 1, TRACKS[track].name))
+                .width(190.0)
+                .show_ui(ui, |ui| {
+                    for (index, spec) in TRACKS.iter().enumerate().take(TRACK_COUNT) {
+                        if ui
+                            .selectable_label(
+                                index == track,
+                                format!("{:02} {}", index + 1, spec.name),
+                            )
+                            .clicked()
+                        {
+                            chosen_track = index;
+                        }
+                    }
+                });
+            let scene = state.launched[track].unwrap_or(0) as usize;
+            ui.label(
+                RichText::new(format!(
+                    "SLOT {:02} · {} · 16 BARS",
+                    scene + 1,
+                    UiState::scene_name(scene)
+                ))
+                .font(theme::mono(8.0))
+                .color(theme::TEXT_DIM),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(Button::new(
+                        RichText::new("CLOSE").font(theme::display(8.5)),
+                    ))
+                    .clicked()
+                {
+                    studio.audio_editor_open = false;
+                }
+                if ui
+                    .add(
+                        Button::new(
+                            RichText::new("EDIT MIDI").font(theme::display(8.0)),
+                        )
+                        .fill(theme::PANEL_SUNK),
+                    )
+                    .clicked()
+                {
+                    studio.open_piano_roll(track, state.launched[track].unwrap_or(0));
+                }
+            });
+        });
+        if chosen_track != track {
+            studio.audio_editor_track = chosen_track;
+            state.selected_track = chosen_track;
+            return;
+        }
+
+        ui.add_space(6.0);
+        let scene = state.launched[track].unwrap_or(0) as usize;
+        let (wave_rect, _) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), 168.0),
+            Sense::hover(),
+        );
+        let painter = ui.painter();
+        painter.rect_filled(wave_rect, CornerRadius::same(2), theme::BG_DEEP);
+        painter.rect_stroke(
+            wave_rect,
+            CornerRadius::same(2),
+            Stroke::new(1.0, theme::BORDER_SOFT),
+            egui::StrokeKind::Inside,
+        );
+
+        // Bar grid.
+        for bar in 0..=16 {
+            let x = wave_rect.left() + wave_rect.width() * bar as f32 / 16.0;
+            painter.line_segment(
+                [
+                    Pos2::new(x, wave_rect.top()),
+                    Pos2::new(x, wave_rect.bottom()),
+                ],
+                Stroke::new(
+                    if bar % 4 == 0 { 1.0 } else { 0.5 },
+                    if bar % 4 == 0 {
+                        theme::accent_alpha(theme::BORDER, 180)
+                    } else {
+                        theme::BORDER_SOFT
+                    },
+                ),
+            );
+        }
+
+        let points = state.clip_waveform(track, scene, 240);
+        let gain = db_to_gain(state.clip_gain_db[track]);
+        let fade_in = state.clip_fade_in[track];
+        let fade_out = state.clip_fade_out[track];
+        let mid = wave_rect.center().y;
+        let amp = wave_rect.height() * 0.40;
+        let path: Vec<Pos2> = points
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let progress = index as f32 / points.len().max(2) as f32;
+                let fade = envelope(progress, fade_in, fade_out);
+                let x = wave_rect.left()
+                    + wave_rect.width() * index as f32 / points.len().max(2) as f32;
+                Pos2::new(x, mid - value * amp * gain * fade)
+            })
+            .collect();
+        painter.add(egui::Shape::line(
+            path,
+            Stroke::new(1.1, theme::accent_alpha(accent, 225)),
+        ));
+
+        // Envelope curve.
+        let envelope_points: Vec<Pos2> = (0..=160)
+            .map(|index| {
+                let progress = index as f32 / 160.0;
+                let fade = envelope(progress, fade_in, fade_out) * gain;
+                Pos2::new(
+                    wave_rect.left() + progress * wave_rect.width(),
+                    wave_rect.top() + 4.0 + (1.0 - fade.min(1.0)) * (wave_rect.height() - 8.0),
+                )
+            })
+            .collect();
+        painter.add(egui::Shape::line(
+            envelope_points,
+            Stroke::new(1.0, theme::accent_alpha(theme::AMBER, 150)),
+        ));
+
+        let playhead = (state.beats() as f32 / 64.0).clamp(0.0, 1.0);
+        let px = wave_rect.left() + playhead * wave_rect.width();
+        painter.line_segment(
+            [Pos2::new(px, wave_rect.top()), Pos2::new(px, wave_rect.bottom())],
+            Stroke::new(1.2, theme::CYAN),
+        );
+        painter.text(
+            Pos2::new(wave_rect.left() + 5.0, wave_rect.top() + 5.0),
+            Align2::LEFT_TOP,
+            "RENDERED TRACK AUDIO",
+            theme::display(6.6),
+            theme::accent_alpha(accent, 200),
+        );
+        painter.text(
+            Pos2::new(wave_rect.right() - 5.0, wave_rect.top() + 5.0),
+            Align2::RIGHT_TOP,
+            format!("CLIP {:+.1} dB", state.clip_gain_db[track]),
+            theme::mono(6.4),
+            theme::AMBER,
+        );
+
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("CLIP ENVELOPE")
+                .font(theme::display(8.6))
+                .color(accent),
+        );
+        let mut changed = false;
+        let knob_size = Vec2::new(150.0, 84.0);
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(knob_size, Sense::hover());
+            let text = format!("{:+.1} dB", state.clip_gain_db[track]);
+            changed |= knob(
+                ui,
+                rect,
+                ui.scope_id().with(("audio_clip_gain", track)),
+                &mut state.clip_gain_db[track],
+                -60.0..=12.0,
+                0.0,
+                "CLIP GAIN",
+                &text,
+                accent,
+            );
+
+            let (rect, _) = ui.allocate_exact_size(knob_size, Sense::hover());
+            let text = format!("{:.0}%", state.clip_fade_in[track] * 100.0);
+            changed |= knob(
+                ui,
+                rect,
+                ui.scope_id().with(("audio_fade_in", track)),
+                &mut state.clip_fade_in[track],
+                0.0..=1.0,
+                0.0,
+                "FADE IN",
+                &text,
+                theme::GREEN,
+            );
+
+            let (rect, _) = ui.allocate_exact_size(knob_size, Sense::hover());
+            let text = format!("{:.0}%", state.clip_fade_out[track] * 100.0);
+            changed |= knob(
+                ui,
+                rect,
+                ui.scope_id().with(("audio_fade_out", track)),
+                &mut state.clip_fade_out[track],
+                0.0..=1.0,
+                0.0,
+                "FADE OUT",
+                &text,
+                theme::AMBER,
+            );
+
+            ui.vertical(|ui| {
+                let muted = state.mute[track];
+                let label = if muted { "MUTED" } else { "MUTE" };
+                if ui
+                    .add(
+                        Button::new(RichText::new(label).font(theme::display(8.0)))
+                            .fill(if muted {
+                                theme::accent_alpha(theme::AMBER, 30)
+                            } else {
+                                theme::PANEL_SUNK
+                            }),
+                    )
+                    .clicked()
+                {
+                    state.mute[track] = !muted;
+                    let _ = audio.command_tx.push(Command::SetTrackMute {
+                        track: track as u8,
+                        mute: state.mute[track],
+                    });
+                }
+                let soloed = state.solo[track];
+                let label = if soloed { "SOLO ON" } else { "SOLO" };
+                if ui
+                    .add(
+                        Button::new(RichText::new(label).font(theme::display(8.0)))
+                            .fill(if soloed {
+                                theme::accent_alpha(theme::GREEN, 30)
+                            } else {
+                                theme::PANEL_SUNK
+                            }),
+                    )
+                    .clicked()
+                {
+                    state.solo[track] = !soloed;
+                    let _ = audio.command_tx.push(Command::SetTrackSolo {
+                        track: track as u8,
+                        solo: state.solo[track],
+                    });
+                }
+            });
+        });
+        if changed {
+            sync_track_clip(state, audio, track);
+        }
+
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "The clip envelope is applied before the master bus: level, fade-in and fade-out are saved with the project. MIDI notes are edited in the piano roll.",
+            )
+            .font(theme::mono(7.5))
+            .color(theme::TEXT_FAINT),
+        );
+    });
+    studio.audio_editor_open = open;
+}
+
+fn envelope(progress: f32, fade_in: f32, fade_out: f32) -> f32 {
+    let fade_in = if fade_in > 0.0 {
+        (progress / fade_in).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let fade_out = if fade_out > 0.0 {
+        ((1.0 - progress) / fade_out).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    fade_in.min(fade_out)
 }
 
 fn synth_norm(value: f32, min: f32, max: f32, log: bool) -> f32 {

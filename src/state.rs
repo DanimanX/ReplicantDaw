@@ -63,6 +63,10 @@ pub struct UiState {
     pub voices: u8,
     pub effects: Vec<UiEffect>,
     pub master_gain: f32,
+    /// Audio-clip envelope per track (gain in dB, loop-normalized fades).
+    pub clip_gain_db: [f32; TRACK_COUNT],
+    pub clip_fade_in: [f32; TRACK_COUNT],
+    pub clip_fade_out: [f32; TRACK_COUNT],
     pub synth: [SynthParams; TRACK_COUNT],
     pub recorded_active: [bool; TRACK_COUNT],
     /// Floating "add effect" menu state.
@@ -109,6 +113,9 @@ impl UiState {
             voices: 0,
             effects: default_chain(),
             master_gain: 0.90,
+            clip_gain_db: [0.0; TRACK_COUNT],
+            clip_fade_in: [0.0; TRACK_COUNT],
+            clip_fade_out: [0.0; TRACK_COUNT],
             synth: std::array::from_fn(|index| SynthParams::from_spec(&TRACKS[index])),
             recorded_active: [true; TRACK_COUNT],
             add_effect_open: false,
@@ -203,6 +210,66 @@ impl UiState {
     pub fn set_recorded(&mut self, track: usize, notes: Vec<RecordedNote>) {
         if let Some(slot) = self.recorded.get_mut(track) {
             *slot = notes;
+        }
+    }
+
+    /// Append a note to a track's clip. Returns the new note index.
+    pub fn add_note(
+        &mut self,
+        track: usize,
+        note: u8,
+        velocity: u8,
+        start_step: u16,
+        length_steps: u16,
+    ) -> Option<usize> {
+        let notes = self.recorded.get_mut(track)?;
+        if notes.len() >= crate::audio::messages::MAX_RECORDED_NOTES {
+            return None;
+        }
+        notes.push(RecordedNote {
+            note,
+            velocity,
+            start_step: start_step.min(crate::audio::LOOP_STEPS as u16 - 1),
+            length_steps: length_steps.max(1),
+        });
+        Some(notes.len() - 1)
+    }
+
+    pub fn remove_note(&mut self, track: usize, index: usize) {
+        if let Some(notes) = self.recorded.get_mut(track) {
+            if index < notes.len() {
+                notes.remove(index);
+            }
+        }
+    }
+
+    /// Move a note to a new start step and pitch, clamped to the loop.
+    pub fn move_note(&mut self, track: usize, index: usize, start_step: i32, note: i32) {
+        if let Some(notes) = self.recorded.get_mut(track) {
+            if let Some(target) = notes.get_mut(index) {
+                target.start_step = start_step.clamp(0, crate::audio::LOOP_STEPS as i32 - 1) as u16;
+                target.note = note.clamp(0, 127) as u8;
+                let remaining = crate::audio::LOOP_STEPS as u16 - target.start_step;
+                target.length_steps = target.length_steps.min(remaining.max(1));
+            }
+        }
+    }
+
+    /// Resize a note, keeping at least one step and staying inside the loop.
+    pub fn resize_note(&mut self, track: usize, index: usize, length_steps: i32) {
+        if let Some(notes) = self.recorded.get_mut(track) {
+            if let Some(target) = notes.get_mut(index) {
+                let max = crate::audio::LOOP_STEPS as i32 - target.start_step as i32;
+                target.length_steps = length_steps.clamp(1, max.max(1)) as u16;
+            }
+        }
+    }
+
+    pub fn set_note_velocity(&mut self, track: usize, index: usize, velocity: u8) {
+        if let Some(notes) = self.recorded.get_mut(track) {
+            if let Some(target) = notes.get_mut(index) {
+                target.velocity = velocity.clamp(1, 127);
+            }
         }
     }
 
@@ -380,5 +447,37 @@ mod tests {
                 assert!(wave.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
             }
         }
+    }
+
+    #[test]
+    fn note_editing_helpers_clamp_to_the_loop() {
+        let mut state = UiState::new();
+        let index = state.add_note(2, 64, 100, 8, 4).expect("add note");
+        assert_eq!(state.recorded_notes(2).len(), 1);
+
+        state.move_note(2, index, -20, 200);
+        let note = state.recorded_notes(2)[0];
+        assert_eq!(note.start_step, 0);
+        assert_eq!(note.note, 127);
+
+        state.resize_note(2, index, 999);
+        assert_eq!(
+            state.recorded_notes(2)[0].length_steps,
+            crate::audio::LOOP_STEPS as u16
+        );
+
+        state.set_note_velocity(2, index, 0);
+        assert_eq!(state.recorded_notes(2)[0].velocity, 1);
+
+        state.remove_note(2, index);
+        assert!(state.recorded_notes(2).is_empty());
+    }
+
+    #[test]
+    fn clip_envelope_defaults_to_unity() {
+        let state = UiState::new();
+        assert!(state.clip_gain_db.iter().all(|gain| *gain == 0.0));
+        assert!(state.clip_fade_in.iter().all(|fade| *fade == 0.0));
+        assert!(state.clip_fade_out.iter().all(|fade| *fade == 0.0));
     }
 }

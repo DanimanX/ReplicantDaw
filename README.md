@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.0.2** · MIT · Linux, macOS and Windows.
+**Version 1.0.3** · MIT · Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -16,23 +16,29 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 
 ![FM synth editor at 125% UI zoom](docs/synth.png)
 
+![Piano roll clip editor](docs/piano-roll.png)
+
 ![Plugin rack hosting a real VST3 instrument](docs/plugins.png)
 
-## What's new in 1.0.2
+## What's new in 1.0.3
 
-- **MIDI clips everywhere** — recorded MIDI now appears in the session matrix
-  (dedicated MIDI row with a mini piano roll per track) and as a labelled
-  `MIDI CLIP` container in the arrangement. Click the matrix row to mute or
-  re-enable a clip.
-- **Editable FM synth** — every track exposes RATIO, INDEX, ATTACK, DECAY,
-  SUSTAIN, RELEASE and LEVEL. Edit them in the chain's synth module or in the
-  larger `SYNTH` editor window; values are saved with the project.
-- **Modular device chain** — the bottom panel is now a user-built chain. Add any
-  of five effect modules from `+ ADD FX`, reorder with `‹ ›`, bypass with `b`,
-  and close with `X`. Modules can be chained in any order, up to six.
-- **UI zoom** — a `ZOOM` menu in the menu bar (75–150%) plus `Ctrl` +/‑/0.
-  The window grows with the scale, so the layout keeps its proportions and the
-  text is physically larger.
+- **Piano roll clip editor** — double-click any clip cell in the session matrix
+  (or the MIDI row) to open a 16-bar piano roll. Click the grid to add notes,
+  drag the body to move them, drag the right edge to change length, right-click
+  to delete, and edit velocity per note. Edits are sent to the engine and saved
+  with the project.
+- **Arrangement editing** — double-click a MIDI clip in the arrangement to open
+  the same piano roll, or double-click an audio clip/lane to open the audio clip
+  editor with waveform, clip gain, fade-in and fade-out. The envelope is applied
+  to the rendered track audio and persisted in the project.
+- **Per-track plugin inserts** — the device chain now includes a `PLUGIN INSERT`
+  module for the selected track. Load a CLAP or VST3 plugin there (or from the
+  rack/browser) and it stays assigned to that track, before the master effect
+  chain. The rack shows all eight track inserts and their parameter knobs.
+- **Donation button** — a `DONATE` control in the menu bar opens the same
+  PayPal page used by the other Replicant projects.
+- **Project format v3** — stores per-track plugin assignments and audio-clip
+  envelopes. v1/v2 projects still load with neutral defaults.
 
 ## Features
 
@@ -64,6 +70,11 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
     is testable without hardware.
   - Clips are visible in the session matrix and the arrangement, and can be
     muted without deleting them.
+- **Piano roll and audio clip editing**
+  - Double-click a session or arrangement clip to program MIDI on its track.
+  - 16-bar grid at 16th-note resolution, four-octave view with octave shift.
+  - Add, move, resize, delete and set velocity per note.
+  - Audio clips expose clip gain and loop-normalized fade-in/fade-out.
 - **Project save / load**
   - Versioned JSON `.rproj` files: tempo, mix, scenes, synth parameters, effect
     chain, master gain, recorded MIDI and plugin state (base64).
@@ -76,8 +87,8 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
   - **VST2**: discovered and listed, but not hostable because the Steinberg SDK
     is proprietary and not vendored (see [docs/PLUGINS.md](docs/PLUGINS.md)).
   - **Audio Unit**: not implemented (macOS only).
-  - Four insert slots on the master bus, bypass, per-slot parameter knobs and
-    latency reporting.
+  - One insert slot per track (8 total), bypass, per-slot parameter knobs and
+    latency reporting. Inserts run on the track bus before the master chain.
 - **Session UI**
   - Menu bar with project, plugin, synth, MIDI and zoom controls.
   - Transport with bar/beat/step counter, editable BPM, play/stop, REC, audio
@@ -105,8 +116,10 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 | AU / AUv3 | no | no | macOS-only, not implemented |
 
 Plugins run on a dedicated worker thread, exchanging 512-frame stereo blocks
-with the engine through lock-free rings. This keeps `!Send` plugin handles out
-of the audio callback and isolates load/state cost from the UI.
+with the engine through lock-free rings. Each block carries one stereo bus per
+track, so an insert processes only the track it is assigned to. This keeps
+`!Send` plugin handles out of the audio callback and isolates load/state cost
+from the UI.
 
 **VST3 unload workaround:** some third-party VST3s (verified with OB-Xd) crash
 asynchronously inside their own teardown. Closing such a slot stops its DSP and
@@ -244,12 +257,12 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
 
 ## Project format
 
-`.rproj` is versioned JSON (format 2):
+`.rproj` is versioned JSON (format 3):
 
 ```json
 {
-  "format_version": 2,
-  "app_version": "1.0.2",
+  "format_version": 3,
+  "app_version": "1.0.3",
   "name": "Neon Demo",
   "bpm": 142.0,
   "effects": [
@@ -262,6 +275,7 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
     { "name": "SYNAPSE 01", "gain_db": -7.0, "pan": -0.12,
       "mute": false, "solo": false, "scene": 1,
       "clip_enabled": true,
+      "clip_gain_db": 0.0, "fade_in": 0.0, "fade_out": 0.0,
       "synth": { "ratio": 1.0, "index": 2.4, "attack": 0.004,
                  "decay": 0.18, "sustain": 0.25, "release": 0.25,
                  "level": 0.9 },
@@ -276,9 +290,10 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
 }
 ```
 
-Unknown fields are ignored (forward compatible), while a newer
-`format_version` is rejected with a clear error. Loading a v1 file translates
-its `fx` block into chain modules.
+`plugins[].slot` is the track index. Unknown fields are ignored (forward
+compatible), while a newer `format_version` is rejected with a clear error.
+Loading a v1 file translates its `fx` block into chain modules; v2 plugin slots
+map to the same track numbers.
 
 ## Verification
 
@@ -287,7 +302,7 @@ Keystation 49 MK3 MIDI keyboard, and third-party plugins already installed:
 
 ```
 $ cargo test
-test result: ok. 72 passed; 0 failed
+test result: ok. 78 passed; 0 failed
 
 $ cargo clippy --all-targets -- -D warnings
 Finished
@@ -317,8 +332,8 @@ Additional manual checks:
   then loaded it in a fresh process; `examples/Demo.rproj` is the same file.
 - **UI zoom**: captured at 125% (`docs/synth.png`), with the logical layout
   preserved and the synth editor open.
-- **Screenshots**: `docs/screenshot.png`, `docs/synth.png` and
-  `docs/plugins.png` are captured from the release binary under Xvfb.
+- **Screenshots**: `docs/screenshot.png`, `docs/synth.png`, `docs/plugins.png`
+  and `docs/piano-roll.png` are captured from the real binary under Xvfb.
 
 The CI matrix runs tests and the self-test on Ubuntu, macOS and Windows. The
 release workflows cross-build both macOS architectures and publish packages for
@@ -335,13 +350,32 @@ This is a prototype, not a production DAW:
   their memory is held until exit.
 - No plugin GUI embedding; parameters are edited with the rack knobs.
 - VST2 and Audio Unit hosting are not implemented (see the matrix above).
-- The modular chain is a master chain only; there are no per-track inserts.
-- No MIDI export, automation lanes, undo, or note editing after recording
-  (clear and re-record only). Recording replaces the target clip, no overdub.
+- The modular effects are still a master chain; per-track inserts host one
+  plugin each. There is no arbitrary per-track effect chain yet.
+- MIDI clips are stored per track (one clip per track), not per scene slot.
+- No MIDI export, automation lanes or undo. Recording replaces the target clip,
+  no overdub.
 - One 16-bar loop.
 - Windows and macOS are covered by CI builds but were not manually auditioned
   for this release; Linux/ALSA, MIDI input, CLAP and VST3 were verified on
   hardware.
+
+## Support
+
+Replicant DAW is free and open source. If it earns a place in your setup and
+you feel like saying thanks, you can buy me a coffee — completely optional.
+
+<p align="center">
+  <a href="https://paypal.me/DanimanX?locale.x=en_US&amp;country.x=CL">
+    <img src="https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&amp;logoColor=white&amp;style=for-the-badge" alt="Donate with PayPal">
+  </a>
+</p>
+
+<p align="center">
+  <sub><a href="https://paypal.me/DanimanX?locale.x=en_US&amp;country.x=CL">paypal.me/DanimanX</a></sub>
+</p>
+
+---
 
 ## License
 

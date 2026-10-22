@@ -9,6 +9,7 @@ use crate::audio::{
     gain_to_db, AudioRuntime, Command, EffectKind, EffectKnob, SynthParam, MAX_VOICES,
 };
 use crate::state::{UiEffect, UiState};
+use crate::studio::Studio;
 use crate::theme;
 use crate::ui::widgets::{knob, meter};
 
@@ -25,8 +26,14 @@ pub fn effect_color(kind: EffectKind) -> Color32 {
     }
 }
 
-pub fn draw(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRuntime) {
-    let tag = format!("SYNTH → {} FX → MASTER", state.effects.len());
+pub fn draw(
+    ui: &mut Ui,
+    rect: Rect,
+    state: &mut UiState,
+    studio: &mut Studio,
+    audio: &mut AudioRuntime,
+) {
+    let tag = format!("SYNTH → PLUGIN → {} FX → MASTER", state.effects.len());
     let content = theme::paint_panel(
         ui.painter(),
         rect,
@@ -41,11 +48,16 @@ pub fn draw(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRunti
     // Width weights: synth and master are wider, the add button is compact.
     let effect_count = state.effects.len();
     let synth_weight = 1.55_f32;
+    let plugin_weight = 1.12_f32;
     let effect_weight = 1.0_f32;
     let add_weight = 0.58_f32;
     let master_weight = 0.92_f32;
-    let modules = effect_count + 3;
-    let weights = synth_weight + effect_weight * effect_count as f32 + add_weight + master_weight;
+    let modules = effect_count + 4;
+    let weights = synth_weight
+        + plugin_weight
+        + effect_weight * effect_count as f32
+        + add_weight
+        + master_weight;
     let usable = content.width() - GAP * (modules.saturating_sub(1)) as f32;
     let unit = (usable / weights).max(46.0);
 
@@ -61,6 +73,14 @@ pub fn draw(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRunti
     );
     draw_synth(ui, synth_rect, state, &mut synth_change);
     x += synth_rect.width() + GAP;
+
+    // ---- Per-track plugin insert ----------------------------------------
+    let plugin_rect = Rect::from_min_size(
+        Pos2::new(x, content.top()),
+        Vec2::new(unit * plugin_weight, content.height()),
+    );
+    draw_plugin(ui, plugin_rect, studio, state, audio);
+    x += plugin_rect.width() + GAP;
 
     // ---- Effect modules -------------------------------------------------
     for index in 0..effect_count {
@@ -357,6 +377,155 @@ fn draw_synth(
         if changed {
             let value = norm_to_value(norm, min, max, log);
             *change = Some((track, *param, value));
+        }
+    }
+}
+
+fn draw_plugin(
+    ui: &mut Ui,
+    rect: Rect,
+    studio: &mut Studio,
+    state: &mut UiState,
+    audio: &mut AudioRuntime,
+) {
+    let track = state.selected_track.min(crate::audio::TRACK_COUNT - 1);
+    let accent = theme::GREEN;
+    let inner = module_shell(
+        ui,
+        rect,
+        "PLUGIN INSERT",
+        &format!("TRK {:02}", track + 1),
+        accent,
+    );
+    let info = studio.slots[track].clone();
+    let pending = studio.slot_pending[track];
+
+    match info {
+        None => {
+            let hit = ui.interact(
+                inner,
+                ui.scope_id().with(("plugin_load", track)),
+                Sense::click(),
+            );
+            let hovered = hit.hovered();
+            if hovered {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            ui.painter().rect_filled(
+                inner,
+                CornerRadius::same(2),
+                if hovered {
+                    theme::accent_alpha(accent, 18)
+                } else {
+                    theme::PANEL_SUNK
+                },
+            );
+            ui.painter().rect_stroke(
+                inner,
+                CornerRadius::same(2),
+                Stroke::new(1.0, theme::accent_alpha(accent, 70)),
+                egui::StrokeKind::Inside,
+            );
+            let center = inner.center();
+            ui.painter().text(
+                Pos2::new(center.x, center.y - 12.0),
+                Align2::CENTER_CENTER,
+                if pending { "LOADING…" } else { "VST3 / CLAP" },
+                theme::display(7.6),
+                accent,
+            );
+            ui.painter().text(
+                Pos2::new(center.x, center.y + 5.0),
+                Align2::CENTER_CENTER,
+                if pending { "" } else { "+ LOAD PLUGIN" },
+                theme::display(8.4),
+                if hovered { Color32::WHITE } else { theme::TEXT },
+            );
+            ui.painter().text(
+                Pos2::new(center.x, center.y + 20.0),
+                Align2::CENTER_CENTER,
+                "ASSIGNED TO THIS TRACK",
+                theme::mono(5.8),
+                theme::TEXT_FAINT,
+            );
+            if hit.clicked() {
+                studio.browser_target = track;
+                studio.browser_open = true;
+                if studio.scan_results.is_empty() && !studio.scan_running {
+                    studio.start_scan();
+                }
+            }
+            if hovered {
+                hit.on_hover_text("Load a CLAP or VST3 insert for the selected track");
+            }
+        }
+        Some(info) => {
+            let name = info.name.clone();
+            let vendor = info.vendor.clone();
+            let format = info.format.label();
+            let bypass = info.bypass;
+            ui.painter().text(
+                Pos2::new(inner.left() + 2.0, inner.top() + 2.0),
+                Align2::LEFT_TOP,
+                name.chars().take(22).collect::<String>(),
+                theme::display(7.4),
+                if bypass { theme::TEXT_DIM } else { accent },
+            );
+            ui.painter().text(
+                Pos2::new(inner.left() + 2.0, inner.top() + 14.0),
+                Align2::LEFT_TOP,
+                format!(
+                    "{} · {}",
+                    format,
+                    vendor.chars().take(16).collect::<String>()
+                ),
+                theme::mono(6.0),
+                theme::TEXT_FAINT,
+            );
+            ui.painter().text(
+                Pos2::new(inner.left() + 2.0, inner.top() + 25.0),
+                Align2::LEFT_TOP,
+                format!("{} params · {} smp", info.params.len(), info.latency),
+                theme::mono(5.8),
+                theme::TEXT_FAINT,
+            );
+
+            let button = 13.0;
+            let y = inner.bottom() - button;
+            let load = Rect::from_min_size(
+                Pos2::new(inner.left(), y),
+                Vec2::new((inner.width() - 2.0 * (button + 2.0)).max(20.0), button),
+            );
+            if icon_button(ui, load, "LOAD", accent) {
+                studio.browser_target = track;
+                studio.browser_open = true;
+                if studio.scan_results.is_empty() && !studio.scan_running {
+                    studio.start_scan();
+                }
+            }
+            let bypass_rect =
+                Rect::from_min_size(Pos2::new(load.right() + 2.0, y), Vec2::splat(button));
+            let close =
+                Rect::from_min_size(Pos2::new(bypass_rect.right() + 2.0, y), Vec2::splat(button));
+            if icon_button(ui, bypass_rect, if bypass { "B" } else { "b" }, accent) {
+                studio.set_bypass(track, !bypass);
+            }
+            if icon_button(ui, close, "X", theme::RED) {
+                studio.unload_plugin(track, audio);
+            }
+            let hit = ui.interact(
+                Rect::from_min_max(inner.min, Pos2::new(inner.right(), y - 2.0)),
+                ui.scope_id().with(("plugin_params", track)),
+                Sense::click(),
+            );
+            if hit.clicked() {
+                studio.selected_slot = track;
+                studio.rack_open = true;
+            }
+            if hit.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                hit.on_hover_text("Open the plugin rack to edit parameters");
+            }
         }
     }
 }

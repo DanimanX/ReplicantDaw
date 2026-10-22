@@ -1,15 +1,16 @@
 //! Arrangement lanes and the 3D spectral waterfall.
 
-use egui::{Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Shape, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 
 use crate::audio::{TRACKS, TRACK_COUNT};
 use crate::dsp::spectrum::{BINS, HISTORY};
 use crate::state::UiState;
+use crate::studio::Studio;
 use crate::theme;
 
 pub const TIMELINE_BARS: usize = 16;
 
-pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState) {
+pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Studio) {
     let content = theme::paint_panel(
         ui.painter(),
         rect,
@@ -81,6 +82,13 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState) {
         let gutter_rect = Rect::from_min_size(
             Pos2::new(content.left(), lane.top()),
             Vec2::new(gutter, lane_h),
+        );
+        // The lane itself is the fallback double-click target; clip blocks
+        // added later sit on top and take priority.
+        let lane_hit = ui.interact(
+            lane,
+            ui.scope_id().with(("arr_lane", track)),
+            Sense::click(),
         );
 
         if state.selected_track == track {
@@ -161,6 +169,24 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState) {
                 CornerRadius::same(1),
                 if enabled { accent } else { theme::BORDER },
             );
+            let clip_hit = ui.interact(
+                clip,
+                ui.scope_id().with(("arr_midi", track)),
+                Sense::click(),
+            );
+            if clip_hit.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if clip_hit.double_clicked() {
+                state.selected_track = track;
+                studio.open_piano_roll(track, launched.unwrap_or(0));
+            }
+            if clip_hit.hovered() {
+                clip_hit.on_hover_text(format!(
+                    "{} · MIDI clip · double-click to edit in the piano roll",
+                    spec.name
+                ));
+            }
 
             let header_y = clip.top() + 5.0;
             ui.painter().text(
@@ -238,6 +264,24 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState) {
                 Pos2::new(x0 + 2.0, lane.top() + 3.0),
                 Pos2::new(x1 - 2.0, lane.bottom() - 3.0),
             );
+            let block_hit = ui.interact(
+                block_rect,
+                ui.scope_id().with(("arr_audio", track, block)),
+                Sense::click(),
+            );
+            if block_hit.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if block_hit.double_clicked() {
+                state.selected_track = track;
+                studio.open_audio_editor(track);
+            }
+            if block_hit.hovered() {
+                block_hit.on_hover_text(format!(
+                    "{} · audio clip · double-click to edit the clip envelope",
+                    spec.name
+                ));
+            }
             let muted = state.mute[track] || (state.any_solo() && !state.solo[track]);
             let alpha = if muted { 45 } else { 150 };
             ui.painter().rect_filled(
@@ -289,6 +333,29 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState) {
                 theme::mono(7.0),
                 theme::GREEN,
             );
+        }
+
+        if lane_hit.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if lane_hit.double_clicked() {
+            state.selected_track = track;
+            if state.recorded_notes(track).is_empty() {
+                studio.open_audio_editor(track);
+            } else {
+                studio.open_piano_roll(track, launched.unwrap_or(0));
+            }
+        }
+        if lane_hit.hovered() {
+            lane_hit.on_hover_text(format!(
+                "{} · double-click to edit the {} clip",
+                spec.name,
+                if state.recorded_notes(track).is_empty() {
+                    "audio"
+                } else {
+                    "MIDI"
+                }
+            ));
         }
     }
 

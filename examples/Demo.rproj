@@ -1,6 +1,6 @@
 {
-  "format_version": 2,
-  "app_version": "1.0.2",
+  "format_version": 3,
+  "app_version": "1.0.3",
   "name": "Neon Demo",
   "bpm": 142.0,
   "effects": [

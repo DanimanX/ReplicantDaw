@@ -8,6 +8,8 @@
 //! - v1: fixed master FX block (`fx`), generative clips only.
 //! - v2: modular effect chain, per-track synth parameters, MIDI clip state.
 //!   v1 files still load: the legacy `fx` block is translated into a chain.
+//! - v3: per-track plugin inserts and audio-clip envelopes. Older files load
+//!   with neutral defaults (unity clip gain, no fades).
 
 use std::path::{Path, PathBuf};
 
@@ -17,7 +19,7 @@ use crate::audio::messages::{EffectKind, RecordedNote, SynthParam, TRACK_COUNT};
 use crate::audio::{SynthParams, TRACKS};
 
 pub const PROJECT_EXTENSION: &str = "rproj";
-pub const PROJECT_FORMAT_VERSION: u32 = 2;
+pub const PROJECT_FORMAT_VERSION: u32 = 3;
 
 /// Editable FM synth settings stored per track.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,6 +106,13 @@ pub struct ProjectTrack {
     /// MIDI clip playback enabled.
     #[serde(default = "default_true")]
     pub clip_enabled: bool,
+    /// Audio-clip envelope: level plus loop-normalized fades.
+    #[serde(default)]
+    pub clip_gain_db: f32,
+    #[serde(default)]
+    pub fade_in: f32,
+    #[serde(default)]
+    pub fade_out: f32,
     #[serde(default)]
     pub synth: Option<ProjectSynth>,
 }
@@ -193,6 +202,9 @@ impl Default for Project {
                 scene: Some(crate::audio::DEFAULT_SCENES[index] as u8),
                 notes: Vec::new(),
                 clip_enabled: true,
+                clip_gain_db: 0.0,
+                fade_in: 0.0,
+                fade_out: 0.0,
                 synth: Some(ProjectSynth::default_for_track(index)),
             })
             .collect();
@@ -339,6 +351,9 @@ impl Project {
                 scene: state.launched[index],
                 notes: state.recorded_notes(index).to_vec(),
                 clip_enabled: state.recorded_active[index],
+                clip_gain_db: state.clip_gain_db[index],
+                fade_in: state.clip_fade_in[index],
+                fade_out: state.clip_fade_out[index],
                 synth: Some(ProjectSynth::from_params(&state.synth_params(index))),
             })
             .collect();
@@ -410,6 +425,8 @@ mod tests {
         assert!(project.tracks.iter().all(|track| track.scene.is_some()));
         assert_eq!(project.effects.len(), 4);
         assert!(project.tracks.iter().all(|track| track.synth.is_some()));
+        assert!(project.tracks.iter().all(|track| track.clip_gain_db == 0.0));
+        assert!(project.tracks.iter().all(|track| track.fade_in == 0.0));
     }
 
     #[test]
@@ -421,6 +438,9 @@ mod tests {
         };
         project.tracks[2].gain_db = -9.5;
         project.tracks[2].mute = true;
+        project.tracks[2].clip_gain_db = -3.5;
+        project.tracks[2].fade_in = 0.25;
+        project.tracks[2].fade_out = 0.10;
         project.tracks[1].notes.push(RecordedNote {
             note: 60,
             velocity: 100,
@@ -454,6 +474,9 @@ mod tests {
         assert_eq!(loaded.name, "Neon Test");
         assert!((loaded.bpm - 137.5).abs() < 1e-6);
         assert!(loaded.tracks[2].mute);
+        assert!((loaded.tracks[2].clip_gain_db + 3.5).abs() < 1e-6);
+        assert!((loaded.tracks[2].fade_in - 0.25).abs() < 1e-6);
+        assert!((loaded.tracks[2].fade_out - 0.10).abs() < 1e-6);
         assert!(!loaded.tracks[1].clip_enabled);
         assert_eq!(loaded.tracks[1].notes.len(), 1);
         assert_eq!(loaded.tracks[1].notes[0].start_step, 16);

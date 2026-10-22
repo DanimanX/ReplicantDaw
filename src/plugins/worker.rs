@@ -360,36 +360,47 @@ impl Worker {
             return;
         }
 
-        for slot in self.slots.iter_mut().flatten() {
-            if slot.bypass {
+        // Each track bus goes through its own insert slot. Slots that are
+        // empty or bypassed leave the bus untouched.
+        for (track, slot) in self.slots.iter_mut().enumerate() {
+            let Some(slot) = slot else {
+                continue;
+            };
+            if slot.bypass || track >= block.left.len() {
                 continue;
             }
-            let event_count = if self.midi_enabled {
-                block.event_count as usize
-            } else {
-                0
-            };
-            let events = &block.events[..event_count];
+
+            let mut routed = [super::BlockEvent::default(); super::MAX_BLOCK_EVENTS];
+            let mut routed_count = 0usize;
+            if self.midi_enabled {
+                for event in &block.events[..block.event_count as usize] {
+                    if event.bus as usize == track && routed_count < routed.len() {
+                        routed[routed_count] = *event;
+                        routed_count += 1;
+                    }
+                }
+            }
+            let events = &routed[..routed_count];
             let instrument = slot.instance.is_instrument();
 
             // Instruments generate their own signal, so their output is added
-            // to the dry mix instead of replacing it. Effects replace it.
+            // to the dry track instead of replacing it. Effects replace it.
             let mut dry_left = [0.0_f32; PLUGIN_BLOCK_FRAMES];
             let mut dry_right = [0.0_f32; PLUGIN_BLOCK_FRAMES];
             if instrument {
-                dry_left[..frames].copy_from_slice(&block.left[..frames]);
-                dry_right[..frames].copy_from_slice(&block.right[..frames]);
+                dry_left[..frames].copy_from_slice(&block.left[track][..frames]);
+                dry_right[..frames].copy_from_slice(&block.right[track][..frames]);
             }
 
-            let left = &mut block.left[..frames];
-            let right = &mut block.right[..frames];
+            let left = &mut block.left[track][..frames];
+            let right = &mut block.right[track][..frames];
 
             match slot.instance.process(frames, left, right, events) {
                 Ok(()) => {
                     if instrument {
                         for index in 0..frames {
-                            block.left[index] += dry_left[index];
-                            block.right[index] += dry_right[index];
+                            block.left[track][index] += dry_left[index];
+                            block.right[track][index] += dry_right[index];
                         }
                     }
                 }

@@ -453,6 +453,19 @@ pub enum Command {
     SetInputTrack {
         track: u8,
     },
+    /// Enable or disable the CLAP/VST3 insert hosted on a track.
+    SetTrackPlugin {
+        track: u8,
+        active: bool,
+    },
+    /// Audio-clip envelope applied to a track before the master bus.
+    /// Fades are normalized to the 16-bar loop (0.0 = off, 1.0 = whole loop).
+    SetTrackClip {
+        track: u8,
+        gain: f32,
+        fade_in: f32,
+        fade_out: f32,
+    },
 }
 
 /// Telemetry published by the audio thread at roughly 60 Hz.

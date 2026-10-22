@@ -6,15 +6,22 @@ use crate::audio::{
     db_to_gain, gain_to_db, AudioRuntime, Command, SCENE_COUNT, TRACKS, TRACK_COUNT,
 };
 use crate::state::UiState;
+use crate::studio::Studio;
 use crate::theme;
 use crate::ui::widgets::{fader, knob, meter, toggle_chip};
 
-pub fn draw_matrix(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRuntime) {
+pub fn draw_matrix(
+    ui: &mut Ui,
+    rect: Rect,
+    state: &mut UiState,
+    studio: &mut Studio,
+    audio: &mut AudioRuntime,
+) {
     let content = theme::paint_panel(
         ui.painter(),
         rect,
         "CLIP MATRIX // SESSION",
-        "8 TRACKS · 8 SCENES",
+        "8 TRACKS · 8 SCENES · DOUBLE-CLICK = PIANO ROLL",
         theme::CYAN,
     );
 
@@ -140,7 +147,7 @@ pub fn draw_matrix(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut Aud
 
     // ---- MIDI clip row -------------------------------------------------
     draw_midi_row(
-        ui, content, launch_w, col_w, midi_h, midi_top, state, audio, beats,
+        ui, content, launch_w, col_w, midi_h, midi_top, state, studio, audio, beats,
     );
 
     let rows_top = midi_top + midi_h + midi_gap;
@@ -274,7 +281,10 @@ pub fn draw_matrix(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut Aud
                 );
             }
 
-            if response.clicked() {
+            if response.double_clicked() {
+                state.selected_track = track;
+                studio.open_piano_roll(track, scene as u8);
+            } else if response.clicked() {
                 if launched {
                     let _ = audio
                         .command_tx
@@ -296,7 +306,7 @@ pub fn draw_matrix(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut Aud
             }
             if response.hovered() {
                 response.on_hover_text(format!(
-                    "{} · {} · scene {}",
+                    "{} · {} · scene {} · double-click to edit MIDI",
                     spec.name,
                     UiState::scene_name(scene),
                     scene + 1
@@ -325,6 +335,7 @@ fn draw_midi_row(
     height: f32,
     top: f32,
     state: &mut UiState,
+    studio: &mut Studio,
     audio: &mut AudioRuntime,
     beats: f32,
 ) {
@@ -485,7 +496,10 @@ fn draw_midi_row(
             );
         }
 
-        if response.clicked() {
+        if response.double_clicked() {
+            state.selected_track = track;
+            studio.open_piano_roll(track, state.launched[track].unwrap_or(0));
+        } else if response.clicked() {
             state.selected_track = track;
             if has_clip {
                 state.recorded_active[track] = !enabled;
@@ -498,14 +512,14 @@ fn draw_midi_row(
         if response.hovered() {
             response.on_hover_text(if has_clip {
                 format!(
-                    "{} · MIDI clip · {} note(s) · click to {}",
+                    "{} · MIDI clip · {} note(s) · click to {} · double-click to edit",
                     spec.name,
                     state.recorded_notes(track).len(),
                     if enabled { "mute" } else { "enable" }
                 )
             } else {
                 format!(
-                    "{} · no MIDI clip yet. Arm REC on this track and play.",
+                    "{} · no MIDI clip yet. Double-click to program it in the piano roll.",
                     spec.name
                 )
             });

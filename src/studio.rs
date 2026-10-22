@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 
 use crate::audio::messages::{Command, RecordedClip, RecordedNote, TRACK_COUNT};
-use crate::audio::{AudioRuntime, MidiMessage, MidiRuntime};
+use crate::audio::{db_to_gain, AudioRuntime, MidiMessage, MidiRuntime};
 use crate::plugins::{
     scan_all, ParamInfo, PluginCommand, PluginDescriptor, PluginEvent, PluginRuntime,
     PluginSlotInfo, MAX_PLUGIN_SLOTS,
@@ -20,6 +20,22 @@ use crate::project::{Project, ProjectPlugin};
 use crate::state::UiState;
 
 pub const MAX_STATUS_CHARS: usize = 160;
+
+/// Pointer gesture in the piano roll.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RollDragMode {
+    Move,
+    Resize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RollDrag {
+    pub note_index: usize,
+    pub original_start: u16,
+    pub original_note: u8,
+    pub original_length: u16,
+    pub mode: RollDragMode,
+}
 
 pub struct Studio {
     pub midi: MidiRuntime,
@@ -39,6 +55,19 @@ pub struct Studio {
     pub project_open: bool,
     pub synth_open: bool,
     pub zoom: f32,
+
+    /// Piano-roll editor. `piano_roll_scene` is informational: clips are
+    /// stored per track in the audio engine.
+    pub piano_roll_open: bool,
+    pub piano_roll_track: usize,
+    pub piano_roll_scene: u8,
+    pub roll_base_note: i32,
+    pub roll_selected: Option<usize>,
+    pub roll_drag: Option<RollDrag>,
+
+    /// Audio-clip envelope editor.
+    pub audio_editor_open: bool,
+    pub audio_editor_track: usize,
 
     pub project_name: String,
     pub project_path: Option<PathBuf>,
@@ -69,6 +98,14 @@ impl Studio {
             project_open: false,
             synth_open: false,
             zoom: 1.0,
+            piano_roll_open: false,
+            piano_roll_track: 0,
+            piano_roll_scene: 0,
+            roll_base_note: 36,
+            roll_selected: None,
+            roll_drag: None,
+            audio_editor_open: false,
+            audio_editor_track: 0,
             project_name: "Untitled".to_string(),
             project_path: None,
             projects: Project::list_available(),
@@ -168,7 +205,12 @@ impl Studio {
         self.notify("Scanning plugin directories…");
     }
 
-    pub fn load_plugin(&mut self, slot: usize, descriptor: &PluginDescriptor) {
+    pub fn load_plugin(
+        &mut self,
+        slot: usize,
+        descriptor: &PluginDescriptor,
+        audio: &mut AudioRuntime,
+    ) {
         if slot >= MAX_PLUGIN_SLOTS {
             return;
         }
@@ -186,17 +228,28 @@ impl Studio {
             descriptor: descriptor.clone(),
             state: None,
         });
+        let _ = audio.command_tx.push(Command::SetTrackPlugin {
+            track: slot as u8,
+            active: true,
+        });
         self.notify(format!(
-            "Loading {} ({}) into slot {}",
+            "Loading {} ({}) on track {:02}",
             descriptor.name,
             descriptor.format,
             slot + 1
         ));
     }
 
-    pub fn unload_plugin(&mut self, slot: usize) {
+    pub fn unload_plugin(&mut self, slot: usize, audio: &mut AudioRuntime) {
+        if slot >= MAX_PLUGIN_SLOTS {
+            return;
+        }
         self.plugins
             .send(PluginCommand::Unload { slot: slot as u8 });
+        let _ = audio.command_tx.push(Command::SetTrackPlugin {
+            track: slot as u8,
+            active: false,
+        });
         self.slots[slot] = None;
         self.slot_pending[slot] = false;
     }
@@ -298,7 +351,7 @@ impl Studio {
 
         // Drop any current plugins first so state restore starts clean.
         for slot in 0..MAX_PLUGIN_SLOTS {
-            self.unload_plugin(slot);
+            self.unload_plugin(slot, audio);
         }
 
         state.bpm = project.bpm;
@@ -403,6 +456,11 @@ impl Studio {
                     });
                 }
             }
+
+            state.clip_gain_db[index] = track.clip_gain_db;
+            state.clip_fade_in[index] = track.fade_in;
+            state.clip_fade_out[index] = track.fade_out;
+            sync_track_clip(state, audio, index);
         }
 
         for plugin in &project.plugins {
@@ -431,6 +489,10 @@ impl Studio {
                 slot: plugin.slot,
                 descriptor,
                 state: state_bytes,
+            });
+            let _ = audio.command_tx.push(Command::SetTrackPlugin {
+                track: plugin.slot,
+                active: true,
             });
             if plugin.bypass {
                 self.plugins.send(PluginCommand::Bypass {
@@ -477,6 +539,21 @@ impl Studio {
         let note = BASE + key as u8;
         self.midi.send(MidiMessage::NoteOff { channel: 0, note });
     }
+
+    /// Open the piano roll for a track. `scene` only provides context in the
+    /// header because the engine stores one MIDI clip per track.
+    pub fn open_piano_roll(&mut self, track: usize, scene: u8) {
+        self.piano_roll_open = true;
+        self.piano_roll_track = track.min(TRACK_COUNT - 1);
+        self.piano_roll_scene = scene;
+        self.roll_selected = None;
+        self.roll_drag = None;
+    }
+
+    pub fn open_audio_editor(&mut self, track: usize) {
+        self.audio_editor_open = true;
+        self.audio_editor_track = track.min(TRACK_COUNT - 1);
+    }
 }
 
 impl PluginDescriptor {
@@ -507,6 +584,31 @@ pub fn clip_from_notes(notes: &[RecordedNote]) -> RecordedClip {
         clip.push(*note);
     }
     clip
+}
+
+/// Push a track's edited notes to the audio engine.
+pub fn sync_track_notes(state: &UiState, audio: &mut AudioRuntime, track: usize) {
+    if track >= TRACK_COUNT {
+        return;
+    }
+    let clip = clip_from_notes(state.recorded_notes(track));
+    let _ = audio.command_tx.push(Command::SetRecordedClip {
+        track: track as u8,
+        clip,
+    });
+}
+
+/// Push a track's audio-clip envelope to the audio engine.
+pub fn sync_track_clip(state: &UiState, audio: &mut AudioRuntime, track: usize) {
+    if track >= TRACK_COUNT {
+        return;
+    }
+    let _ = audio.command_tx.push(Command::SetTrackClip {
+        track: track as u8,
+        gain: db_to_gain(state.clip_gain_db[track]),
+        fade_in: state.clip_fade_in[track],
+        fade_out: state.clip_fade_out[track],
+    });
 }
 
 #[cfg(test)]

@@ -4,7 +4,8 @@
 //! engine exchanges fixed-size stereo blocks with that thread through
 //! lock-free `rtrb` rings, which keeps `!Send` plugin handles out of the
 //! audio callback and gives the UI a single place to load, unload and
-//! automate plugins.
+//! automate plugins. Each track owns one insert slot, so a plugin loaded in
+//! the device chain processes that track before the master effect chain.
 
 pub mod clap_host;
 pub mod scanner;
@@ -27,8 +28,8 @@ pub struct ParamInfo {
     pub text: String,
 }
 
-/// Maximum number of insert slots on the master bus.
-pub const MAX_PLUGIN_SLOTS: usize = 4;
+/// Maximum number of track plugin inserts. One slot per mixer track.
+pub const MAX_PLUGIN_SLOTS: usize = crate::audio::messages::TRACK_COUNT;
 /// Frames exchanged per plugin block.
 pub const PLUGIN_BLOCK_FRAMES: usize = 512;
 /// Maximum MIDI events attached to a single block.
@@ -65,18 +66,24 @@ impl fmt::Display for PluginFormat {
 /// One MIDI event inside an audio block.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BlockEvent {
+    /// Track bus the event belongs to.
+    pub bus: u8,
     /// Sample offset inside the block.
     pub offset: u16,
     pub bytes: [u8; 3],
     pub len: u8,
 }
 
-/// Stereo audio block exchanged with the plugin worker.
+/// Stereo audio blocks exchanged with the plugin worker.
+///
+/// The block carries one stereo bus per track. The worker routes each bus to
+/// that track's insert slot, so plugins stay assigned to the track that owns
+/// them instead of processing the summed master signal.
 #[derive(Clone, Copy)]
 pub struct PluginBlock {
     pub frames: u16,
-    pub left: [f32; PLUGIN_BLOCK_FRAMES],
-    pub right: [f32; PLUGIN_BLOCK_FRAMES],
+    pub left: [[f32; PLUGIN_BLOCK_FRAMES]; crate::audio::messages::TRACK_COUNT],
+    pub right: [[f32; PLUGIN_BLOCK_FRAMES]; crate::audio::messages::TRACK_COUNT],
     pub events: [BlockEvent; MAX_BLOCK_EVENTS],
     pub event_count: u8,
 }
@@ -85,8 +92,8 @@ impl Default for PluginBlock {
     fn default() -> Self {
         Self {
             frames: 0,
-            left: [0.0; PLUGIN_BLOCK_FRAMES],
-            right: [0.0; PLUGIN_BLOCK_FRAMES],
+            left: [[0.0; PLUGIN_BLOCK_FRAMES]; crate::audio::messages::TRACK_COUNT],
+            right: [[0.0; PLUGIN_BLOCK_FRAMES]; crate::audio::messages::TRACK_COUNT],
             events: [BlockEvent::default(); MAX_BLOCK_EVENTS],
             event_count: 0,
         }
@@ -94,10 +101,15 @@ impl Default for PluginBlock {
 }
 
 impl PluginBlock {
-    pub fn push_event(&mut self, offset: u16, bytes: [u8; 3], len: u8) {
+    pub fn push_event(&mut self, bus: u8, offset: u16, bytes: [u8; 3], len: u8) {
         let index = self.event_count as usize;
         if index < MAX_BLOCK_EVENTS {
-            self.events[index] = BlockEvent { offset, bytes, len };
+            self.events[index] = BlockEvent {
+                bus,
+                offset,
+                bytes,
+                len,
+            };
             self.event_count += 1;
         }
     }
@@ -192,11 +204,19 @@ mod tests {
     fn block_event_capacity_is_bounded() {
         let mut block = PluginBlock::default();
         for i in 0..(MAX_BLOCK_EVENTS + 10) {
-            block.push_event(i as u16, [0x90, 60, 100], 3);
+            block.push_event((i % 8) as u8, i as u16, [0x90, 60, 100], 3);
         }
         assert_eq!(block.event_count as usize, MAX_BLOCK_EVENTS);
         block.clear_events();
         assert_eq!(block.event_count, 0);
+    }
+
+    #[test]
+    fn plugin_block_has_one_bus_per_track() {
+        let block = PluginBlock::default();
+        assert_eq!(block.left.len(), crate::audio::messages::TRACK_COUNT);
+        assert_eq!(block.right.len(), crate::audio::messages::TRACK_COUNT);
+        assert_eq!(MAX_PLUGIN_SLOTS, crate::audio::messages::TRACK_COUNT);
     }
 
     #[test]

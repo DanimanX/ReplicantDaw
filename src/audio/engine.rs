@@ -25,6 +25,9 @@ pub const SAMPLE_RATE: u32 = 48_000;
 struct TrackState {
     gain: Smoothed,
     pan: Smoothed,
+    clip_gain: Smoothed,
+    fade_in: f32,
+    fade_out: f32,
     mute: bool,
     solo: bool,
     active: bool,
@@ -38,6 +41,9 @@ impl TrackState {
         Self {
             gain: Smoothed::new(db_to_gain(spec.gain_db), sample_rate, 0.015),
             pan: Smoothed::new(spec.pan, sample_rate, 0.015),
+            clip_gain: Smoothed::new(1.0, sample_rate, 0.015),
+            fade_in: 0.0,
+            fade_out: 0.0,
             mute: false,
             solo: false,
             active: true,
@@ -98,6 +104,7 @@ pub struct Engine {
     plugin_ready_len: u16,
     plugin_midi: bool,
     plugin_latency: u16,
+    track_plugin: [bool; TRACK_COUNT],
     last_midi_note: u8,
 }
 
@@ -169,6 +176,7 @@ impl Engine {
             plugin_ready_len: 0,
             plugin_midi: true,
             plugin_latency: 0,
+            track_plugin: [false; TRACK_COUNT],
             last_midi_note: 60,
         }
         .with_default_chain()
@@ -268,6 +276,10 @@ impl Engine {
         }
 
         let any_solo = self.tracks.iter().any(|t| t.solo);
+        let loop_samples = (self.samples_per_beat() * 4.0 * LOOP_BARS as f64).max(1.0) as f32;
+        let track_plugins = self.plugin_input.is_some()
+            && self.plugin_output.is_some()
+            && self.track_plugin.iter().any(|active| *active);
         let mut block_peaks = [0.0_f32; TRACK_COUNT];
         let mut block_master = [0.0_f32; 2];
 
@@ -292,21 +304,43 @@ impl Engine {
                 }
             }
 
-            let mut l = 0.0_f32;
-            let mut r = 0.0_f32;
             for (index, track) in self.tracks.iter_mut().enumerate() {
                 let gain = track.gain.tick();
                 let pan = track.pan.tick();
+                let clip_gain = track.clip_gain.tick();
                 let audible = !track.mute && (!any_solo || track.solo);
                 if !audible {
+                    track_l[index] = 0.0;
+                    track_r[index] = 0.0;
                     track.peak = 0.0;
                     continue;
                 }
+
+                // Audio-clip envelope: level plus loop-normalized fades.
+                let clip_envelope = if self.playing {
+                    let progress = (self.position as f32 / loop_samples).clamp(0.0, 1.0);
+                    let fade_in = if track.fade_in > 0.0 {
+                        (progress / track.fade_in).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    let fade_out = if track.fade_out > 0.0 {
+                        ((1.0 - progress) / track.fade_out).clamp(0.0, 1.0)
+                    } else {
+                        1.0
+                    };
+                    fade_in.min(fade_out)
+                } else {
+                    1.0
+                };
+                let envelope = clip_gain * clip_envelope;
+
                 let (pan_l, pan_r) = crate::dsp::pan_gains(pan);
-                let tl = track_l[index] * gain * pan_l;
-                let tr = track_r[index] * gain * pan_r;
-                l += tl;
-                r += tr;
+                let tl = track_l[index] * gain * pan_l * envelope;
+                let tr = track_r[index] * gain * pan_r * envelope;
+                track_l[index] = tl;
+                track_r[index] = tr;
+
                 let peak = tl.abs().max(tr.abs());
                 if peak > block_peaks[index] {
                     block_peaks[index] = peak;
@@ -316,36 +350,15 @@ impl Engine {
                 }
             }
 
-            // ---- Modular master effect chain -----------------------------
-            let effect_count = self.effect_count as usize;
-            for slot in &mut self.effects[..effect_count] {
-                let (wet_l, wet_r) = slot.process(l, r);
-                l = wet_l;
-                r = wet_r;
-            }
-
-            let gain = self.master_gain.tick();
-            l = soft_clip(l * gain);
-            r = soft_clip(r * gain);
-
-            l = self.dc_l.process(l);
-            r = self.dc_r.process(r);
-
-            // Speaker protection: the prototype should never emit NaN or
-            // full-scale digital clipping, even with extreme knob positions.
-            l = if l.is_finite() {
-                l.clamp(-1.0, 1.0)
+            // Track plugins process their own bus. When any track insert is
+            // active the output is delayed by one plugin block so the worker
+            // can process each bus in isolation.
+            let (mut l, mut r) = if track_plugins {
+                self.run_track_plugin_block(&track_l, &track_r)
             } else {
-                0.0
-            };
-            r = if r.is_finite() {
-                r.clamp(-1.0, 1.0)
-            } else {
-                0.0
+                self.mix_master(&track_l, &track_r)
             };
 
-            // ---- Plugin insert chain (plugin worker thread) -------------
-            let (mut l, mut r) = self.run_plugin_chain(l, r);
             // Third-party plugins can overshoot; keep the output guard last.
             l = if l.is_finite() {
                 l.clamp(-1.0, 1.0)
@@ -377,6 +390,95 @@ impl Engine {
             if let Some(tx) = &mut self.scope_tx {
                 let _ = tx.push((l + r) * 0.5);
             }
+        }
+    }
+
+    /// Sum the per-track buses through the master effect chain.
+    fn mix_master(
+        &mut self,
+        track_l: &[f32; TRACK_COUNT],
+        track_r: &[f32; TRACK_COUNT],
+    ) -> (f32, f32) {
+        let mut l = track_l.iter().sum::<f32>();
+        let mut r = track_r.iter().sum::<f32>();
+
+        let effect_count = self.effect_count as usize;
+        for slot in &mut self.effects[..effect_count] {
+            let (wet_l, wet_r) = slot.process(l, r);
+            l = wet_l;
+            r = wet_r;
+        }
+
+        let gain = self.master_gain.tick();
+        l = soft_clip(l * gain);
+        r = soft_clip(r * gain);
+
+        l = self.dc_l.process(l);
+        r = self.dc_r.process(r);
+
+        // Speaker protection: the prototype should never emit NaN or
+        // full-scale digital clipping, even with extreme knob positions.
+        l = if l.is_finite() {
+            l.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        r = if r.is_finite() {
+            r.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        (l, r)
+    }
+
+    /// Queue one frame of per-track buses and return the matching frame from
+    /// the previous plugin block.
+    fn run_track_plugin_block(
+        &mut self,
+        track_l: &[f32; TRACK_COUNT],
+        track_r: &[f32; TRACK_COUNT],
+    ) -> (f32, f32) {
+        let index = self.plugin_pending.frames as usize;
+        if index < PLUGIN_BLOCK_FRAMES {
+            for track in 0..TRACK_COUNT {
+                self.plugin_pending.left[track][index] = track_l[track];
+                self.plugin_pending.right[track][index] = track_r[track];
+            }
+            self.plugin_pending.frames += 1;
+        }
+
+        if self.plugin_pending.frames as usize >= PLUGIN_BLOCK_FRAMES {
+            if let Some(tx) = &mut self.plugin_input {
+                let mut block = std::mem::take(&mut self.plugin_pending);
+                block.frames = PLUGIN_BLOCK_FRAMES as u16;
+                let _ = tx.push(block);
+            }
+            if let Some(rx) = &mut self.plugin_output {
+                if let Ok(block) = rx.pop() {
+                    self.plugin_latency = PLUGIN_BLOCK_FRAMES as u16;
+                    self.plugin_ready = block;
+                    self.plugin_ready_len = PLUGIN_BLOCK_FRAMES as u16;
+                    self.plugin_ready_pos = 0;
+                }
+            }
+        }
+
+        if self.plugin_ready_pos < self.plugin_ready_len {
+            let position = self.plugin_ready_pos as usize;
+            let mut ready_l = [0.0_f32; TRACK_COUNT];
+            let mut ready_r = [0.0_f32; TRACK_COUNT];
+            for track in 0..TRACK_COUNT {
+                ready_l[track] = self.plugin_ready.left[track][position];
+                ready_r[track] = self.plugin_ready.right[track][position];
+            }
+            self.plugin_ready_pos += 1;
+            if self.plugin_ready_pos >= self.plugin_ready_len {
+                self.plugin_ready_len = 0;
+                self.plugin_ready_pos = 0;
+            }
+            self.mix_master(&ready_l, &ready_r)
+        } else {
+            (0.0, 0.0)
         }
     }
 
@@ -515,6 +617,44 @@ impl Engine {
             }
             Command::SetInputTrack { track } => {
                 self.record_track = (track as usize).min(TRACK_COUNT - 1) as u8;
+            }
+            Command::SetTrackPlugin { track, active } => {
+                if let Some(flag) = self.track_plugin.get_mut(track as usize) {
+                    *flag = active;
+                    if !self.track_plugin.iter().any(|enabled| *enabled) {
+                        // Leaving the plugin path: drop the one-block delay.
+                        self.plugin_pending.frames = 0;
+                        self.plugin_pending.clear_events();
+                        self.plugin_ready_len = 0;
+                        self.plugin_ready_pos = 0;
+                        self.plugin_latency = 0;
+                    } else if active {
+                        // Avoid feeding stale events into a freshly inserted
+                        // plugin and restart the block alignment cleanly.
+                        self.plugin_pending.frames = 0;
+                        self.plugin_pending.clear_events();
+                        self.plugin_ready_len = 0;
+                        self.plugin_ready_pos = 0;
+                    }
+                }
+            }
+            Command::SetTrackClip {
+                track,
+                gain,
+                fade_in,
+                fade_out,
+            } => {
+                if let Some(state) = self.tracks.get_mut(track as usize) {
+                    if gain.is_finite() {
+                        state.clip_gain.set(gain.clamp(0.0, 4.0));
+                    }
+                    if fade_in.is_finite() {
+                        state.fade_in = fade_in.clamp(0.0, 1.0);
+                    }
+                    if fade_out.is_finite() {
+                        state.fade_out = fade_out.clamp(0.0, 1.0);
+                    }
+                }
             }
             Command::SetSynthParam {
                 track,
@@ -764,52 +904,8 @@ impl Engine {
             return;
         }
         let offset = self.plugin_pending.frames.saturating_sub(1);
-        self.plugin_pending.push_event(offset, bytes, len);
-    }
-
-    fn run_plugin_chain(&mut self, l: f32, r: f32) -> (f32, f32) {
-        if self.plugin_input.is_none() || self.plugin_output.is_none() {
-            return (l, r);
-        }
-
-        let index = self.plugin_pending.frames as usize;
-        if index < PLUGIN_BLOCK_FRAMES {
-            self.plugin_pending.left[index] = l;
-            self.plugin_pending.right[index] = r;
-            self.plugin_pending.frames += 1;
-        }
-
-        if self.plugin_pending.frames as usize >= PLUGIN_BLOCK_FRAMES {
-            if let Some(tx) = &mut self.plugin_input {
-                let block = std::mem::take(&mut self.plugin_pending);
-                let _ = tx.push(block);
-                self.plugin_pending = PluginBlock::default();
-            }
-            if let Some(rx) = &mut self.plugin_output {
-                if let Ok(block) = rx.pop() {
-                    self.plugin_latency = PLUGIN_BLOCK_FRAMES as u16;
-                    self.plugin_ready = block;
-                    self.plugin_ready_len = block.frames;
-                    self.plugin_ready_pos = 0;
-                }
-            }
-        }
-
-        if self.plugin_ready_pos < self.plugin_ready_len {
-            let position = self.plugin_ready_pos as usize;
-            let out = (
-                self.plugin_ready.left[position],
-                self.plugin_ready.right[position],
-            );
-            self.plugin_ready_pos += 1;
-            if self.plugin_ready_pos >= self.plugin_ready_len {
-                self.plugin_ready_len = 0;
-                self.plugin_ready_pos = 0;
-            }
-            out
-        } else {
-            (l, r)
-        }
+        let bus = self.record_track;
+        self.plugin_pending.push_event(bus, offset, bytes, len);
     }
 
     /// Currently recorded clip for a track (used by tests and diagnostics).
@@ -1094,25 +1190,36 @@ mod tests {
             },
         );
         engine.apply(Command::Play);
+        engine.apply(Command::SetTrackPlugin {
+            track: 0,
+            active: true,
+        });
 
         let frames = PLUGIN_BLOCK_FRAMES;
         let mut out = vec![0.0; frames * 2];
         engine.process(&mut out);
         let block = dry_rx.pop().expect("engine did not send a dry block");
         assert_eq!(block.frames as usize, frames);
-        assert!(block.left.iter().any(|sample| *sample != 0.0));
+        assert!(block.left.iter().flatten().any(|sample| *sample != 0.0));
 
-        // A "plugin" that inverts the signal.
+        // A "plugin" that inverts the signal on every track bus.
         let mut processed = block;
-        for sample in processed.left.iter_mut() {
-            *sample = -*sample;
+        for bus in processed.left.iter_mut() {
+            for sample in bus.iter_mut() {
+                *sample = -*sample;
+            }
         }
-        for sample in processed.right.iter_mut() {
-            *sample = -*sample;
+        for bus in processed.right.iter_mut() {
+            for sample in bus.iter_mut() {
+                *sample = -*sample;
+            }
         }
         wet_tx.push(processed).unwrap();
 
         let mut delayed = vec![0.0; frames * 2];
+        engine.process(&mut delayed);
+        // The block becomes ready on the last frame of this call; render one
+        // more block to hear the processed audio.
         engine.process(&mut delayed);
         // The engine outputs the processed block while rendering the next one.
         let sent = dry_rx.pop().expect("second dry block");
@@ -1243,5 +1350,40 @@ mod tests {
         let out = render(&mut engine, 48_000);
         let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
         assert!(peak < 1e-3, "disabled MIDI clip still sounded ({peak})");
+    }
+
+    #[test]
+    fn clip_envelope_shapes_the_track() {
+        let mut full = Engine::offline(48_000.0);
+        for track in 1..TRACK_COUNT {
+            full.apply(Command::SetTrackMute {
+                track: track as u8,
+                mute: true,
+            });
+        }
+        full.apply(Command::Play);
+        let full_energy: f32 = render(&mut full, 48_000).iter().map(|s| s * s).sum();
+
+        let mut faded = Engine::offline(48_000.0);
+        for track in 1..TRACK_COUNT {
+            faded.apply(Command::SetTrackMute {
+                track: track as u8,
+                mute: true,
+            });
+        }
+        faded.apply(Command::SetTrackClip {
+            track: 0,
+            gain: 1.0,
+            fade_in: 1.0,
+            fade_out: 0.0,
+        });
+        faded.apply(Command::Play);
+        let faded_energy: f32 = render(&mut faded, 48_000).iter().map(|s| s * s).sum();
+
+        assert!(full_energy > 0.1);
+        assert!(
+            faded_energy < full_energy * 0.25,
+            "fade-in did not attenuate the clip ({full_energy} vs {faded_energy})"
+        );
     }
 }

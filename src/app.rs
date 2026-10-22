@@ -98,7 +98,7 @@ impl ReplicantApp {
                 path: std::path::PathBuf::from(path),
                 format,
             };
-            studio.load_plugin(0, &descriptor);
+            studio.load_plugin(0, &descriptor, &mut audio);
         } else if let Ok(slot) = std::env::var("REPLICANT_DAW_OPEN_SLOT") {
             if let Ok(index) = slot.parse::<usize>() {
                 studio.selected_slot = index.min(crate::plugins::MAX_PLUGIN_SLOTS - 1);
@@ -113,6 +113,8 @@ impl ReplicantApp {
                     "browser" => studio.browser_open = true,
                     "synth" => studio.synth_open = true,
                     "add" => state.add_effect_open = true,
+                    "piano" => studio.piano_roll_open = true,
+                    "audio" => studio.audio_editor_open = true,
                     _ => {}
                 }
             }
@@ -299,11 +301,23 @@ impl ReplicantApp {
 
         ui::studio_windows::draw_menu_bar(ui, menu_rect, &mut self.studio, &mut self.state);
         ui::transport::draw(ui, top_rect, &mut self.state, &mut self.audio);
-        ui::session::draw_matrix(ui, matrix_rect, &mut self.state, &mut self.audio);
+        ui::session::draw_matrix(
+            ui,
+            matrix_rect,
+            &mut self.state,
+            &mut self.studio,
+            &mut self.audio,
+        );
         ui::session::draw_mixer(ui, mixer_rect, &mut self.state, &mut self.audio);
-        ui::lanes::draw_lanes(ui, tracks_rect, &mut self.state);
+        ui::lanes::draw_lanes(ui, tracks_rect, &mut self.state, &mut self.studio);
         ui::lanes::draw_fft(ui, fft_rect, &mut self.state);
-        ui::devices::draw(ui, bottom_rect, &mut self.state, &mut self.audio);
+        ui::devices::draw(
+            ui,
+            bottom_rect,
+            &mut self.state,
+            &mut self.studio,
+            &mut self.audio,
+        );
         ui::studio_windows::draw_windows(
             ui.ctx(),
             &mut self.studio,

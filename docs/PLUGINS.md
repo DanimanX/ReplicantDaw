@@ -56,22 +56,24 @@ REPLICANT_DAW_PLUGIN_PATH="/data/plugins/clap:/data/plugins/vst3" cargo run --re
 ## Using the rack
 
 1. Open **PLUGINS** in the menu bar and press **RESCAN**.
-2. Pick a plugin and click **LOAD**; it goes to the slot chosen in the rack
-   (default 1). **RACK** opens the rack.
-3. Up to four slots run in series on the master bus. Each slot has **BYPASS**
-   and **X** (unload), reports its latency, and exposes up to 16 parameters as
-   knobs.
+2. Select a track in the session or device chain, then click **LOAD** in the
+   device chain's `PLUGIN INSERT` module (or in the rack). The plugin is
+   assigned to that track.
+3. **RACK** lists all eight track inserts. Each row has **BYPASS** and **X**
+   (unload), reports its latency, and exposes its parameters as knobs.
 4. State is saved with the project (`Ctrl+S`). VST3 and CLAP state blobs are
    stored base64-encoded in the `.rproj` file.
 
 Routing rules:
 
-- **Effects** replace the dry signal (100% wet insert).
+- Each plugin processes only its track's stereo bus, before the master effect
+  chain.
+- **Effects** replace the track signal (100% wet insert).
 - **Instruments** (VST3 category containing `Instrument`/`Synth`, or CLAP
-  plugins with no audio input) are summed with the dry mix, so the internal
-  synth is not lost when you add a synth plugin.
+  plugins with no audio input) are summed with the track's dry synth signal, so
+  the internal synth is not lost when you add a synth plugin.
 - **MIDI → PLUGINS** in the MIDI window forwards live notes, CC and pitch bend
-  to plugins. It is on by default.
+  to the insert on the selected input track. It is on by default.
 
 ## Unloading and teardown
 

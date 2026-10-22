@@ -5,12 +5,13 @@ on:
     tags:
       - "[0-9]*"
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-macos-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -53,10 +54,20 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Replicant DAW ${TAG#v}" --generate-notes || true
+          fi
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$TAG" dist/* --clobber; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
 
   macos-x86_64:
     name: macOS x86_64
@@ -93,7 +104,17 @@ jobs:
           if-no-files-found: error
 
       - name: Attach to GitHub release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "Replicant DAW ${TAG#v}" --generate-notes || true
+          fi
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$TAG" dist/* --clobber; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1

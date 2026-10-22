@@ -15,6 +15,49 @@ use crate::dsp::spectrum::SpectrumAnalyzer;
 
 pub const MAX_SCOPE: usize = 4096;
 
+/// Sound source of a track's single instrument slot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InstrumentSource {
+    /// Nothing loaded yet; the device chain offers `ADD PLUGIN / INSTRUMENT`.
+    #[default]
+    Empty,
+    /// The internal two-operator FM synth (`NEURAL GEN V5`).
+    Synth,
+    /// The CLAP/VST3 plugin hosted in the slot.
+    Plugin,
+}
+
+impl InstrumentSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Empty => "EMPTY",
+            Self::Synth => "FM",
+            Self::Plugin => "PLUGIN",
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Synth => "synth",
+            Self::Plugin => "plugin",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Self {
+        match id.to_ascii_lowercase().as_str() {
+            "synth" | "fm" => Self::Synth,
+            "plugin" | "vst3" | "clap" => Self::Plugin,
+            _ => Self::Empty,
+        }
+    }
+
+    /// Does the internal synth sound on this track?
+    pub fn synth_audible(self) -> bool {
+        self == Self::Synth
+    }
+}
+
 /// One effect module mirrored from the engine chain.
 #[derive(Clone, Copy, Debug)]
 pub struct UiEffect {
@@ -70,10 +113,11 @@ pub struct UiState {
     pub clip_fade_in: [f32; TRACK_COUNT],
     pub clip_fade_out: [f32; TRACK_COUNT],
     pub synth: [SynthParams; TRACK_COUNT],
-    /// Internal FM synth audible on this track.
-    pub synth_enabled: [bool; TRACK_COUNT],
-    /// Explicit instrument source choice; `None` follows the plugin type.
-    pub instrument_plugin: [Option<bool>; TRACK_COUNT],
+    /// What makes this track sound: nothing, the internal FM synth, or the
+    /// hosted plugin. New tracks start empty, as the device chain shows.
+    pub instrument: [InstrumentSource; TRACK_COUNT],
+    /// Last synth-mute value pushed to the engine, to avoid resending it.
+    pub synth_sent: [bool; TRACK_COUNT],
     /// Per-slot clip playback enable, indexed by (track, scene).
     pub recorded_active: [[bool; SCENE_COUNT]; TRACK_COUNT],
     /// Floating "add effect" menu state.
@@ -125,8 +169,10 @@ impl UiState {
             clip_fade_in: [0.0; TRACK_COUNT],
             clip_fade_out: [0.0; TRACK_COUNT],
             synth: std::array::from_fn(|index| SynthParams::from_spec(&TRACKS[index])),
-            synth_enabled: [true; TRACK_COUNT],
-            instrument_plugin: [None; TRACK_COUNT],
+            instrument: [InstrumentSource::Empty; TRACK_COUNT],
+            // The engine starts with every synth enabled, so the empty default
+            // must be pushed once; start "sent" as the opposite value.
+            synth_sent: [true; TRACK_COUNT],
             recorded_active: [[true; SCENE_COUNT]; TRACK_COUNT],
             add_effect_open: false,
             add_menu_pos: egui::Pos2::new(200.0, 200.0),

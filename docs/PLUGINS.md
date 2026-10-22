@@ -55,10 +55,12 @@ REPLICANT_DAW_PLUGIN_PATH="/data/plugins/clap:/data/plugins/vst3" cargo run --re
 
 ## Using the rack
 
-1. Open **PLUGINS** in the menu bar and press **RESCAN**.
-2. Select a track, then click the `PLUGIN` chip in the device chain's
-   `INSTRUMENT` module (or **LOAD** in the rack). The plugin is assigned to that
-   track and its name shows in the instrument slot.
+1. Plugins are scanned automatically at startup; **RESCAN** in the picker
+   refreshes the list.
+2. A new track starts empty. Click `ADD PLUGIN / INSTRUMENT` in the device
+   chain (or the `PLUGIN` chip) to open the instrument browser: the internal
+   `NEURAL GEN V5` FM synth is listed first, followed by every CLAP/VST3 plugin
+   installed on the system. Picking one assigns it to the track.
 3. **RACK** lists all eight track inserts. Each row has **EDIT**, **LOAD**,
    **BYPASS** and **X** (unload), reports its latency, and exposes its
    parameters as knobs.
@@ -66,8 +68,32 @@ REPLICANT_DAW_PLUGIN_PATH="/data/plugins/clap:/data/plugins/vst3" cargo run --re
    plugin editor: a parameter surface that can fill the whole window with
    **FULLSCREEN** (F11 toggles it, Esc restores it) and filters parameters by
    name.
-5. State is saved with the project (`Ctrl+S`). VST3 and CLAP state blobs are
+5. **GUI** (instrument module, rack row, or `PLUGIN GUI` in the editor) opens
+   the plugin's own window — its native interface, where the vendor's controls
+   are the ones you see.
+6. State is saved with the project (`Ctrl+S`). VST3 and CLAP state blobs are
    stored base64-encoded in the `.rproj` file.
+
+## Native plugin windows
+
+The DAW hosts the plugin's real editor, not a reimplementation:
+
+- **CLAP** — the host creates an X11 toplevel, hands its id to the plugin's
+  `clap.gui` extension (`create` → `set_parent` → `show`) and answers
+  `clap_host_gui` (resize/show/hide/closed) plus `clap_host_thread-check`.
+  Plugins that only support floating windows are created floating instead.
+- **VST3** — the editor is opened through the VST3 host's own window and its
+  platform events are pumped from the plugin worker.
+
+Known limits:
+
+- Linux/X11 is the tested path. On Windows and macOS the CLAP path reports
+  that native windows are only wired for X11; the parameter editor still works.
+- Some plugins are badly behaved when hosted in-process: **u-he CLAP builds
+  (verified with Bazille) abort the process** when their window is requested.
+  Save first, and use the parameter editor for those.
+- No window embedding into the DAW's own canvas: each plugin editor is its own
+  OS window.
 
 Instrument vs effect:
 

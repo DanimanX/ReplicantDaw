@@ -269,11 +269,11 @@ fn norm_to_value(norm: f32, min: f32, max: f32, log: bool) -> f32 {
     }
 }
 
-/// The track's instrument slot: internal FM synth plus the CLAP/VST3 insert.
+/// The track's instrument slot.
 ///
-/// Ableton-style: one slot, two possible sound sources. `FM` plays the
-/// internal `NEURAL GEN V5` engine, `PLUGIN` plays the hosted instrument. The
-/// choice is pushed to the engine so only one source sounds per track.
+/// Ableton-style: one slot, one sound source per track. It starts **empty**
+/// and shows `ADD PLUGIN / INSTRUMENT`; from there the user either picks a
+/// scanned CLAP/VST3 plugin or switches to the internal `NEURAL GEN V5` synth.
 fn draw_instrument(
     ui: &mut Ui,
     rect: Rect,
@@ -282,13 +282,18 @@ fn draw_instrument(
     audio: &mut AudioRuntime,
     change: &mut Option<(usize, SynthParam, f32)>,
 ) {
+    use crate::state::InstrumentSource;
+
     let track = state.selected_track.min(crate::audio::TRACK_COUNT - 1);
     let accent = theme::track_accent(track);
     let info = studio.slots[track].clone();
     let pending = studio.slot_pending[track];
-    let plugin_is_instrument = info.as_ref().is_some_and(|slot| slot.is_instrument);
-    let plugin_selected = state.instrument_plugin[track].unwrap_or(plugin_is_instrument);
-    let plugin_source = plugin_selected && info.is_some();
+    let mut source = state.instrument[track];
+    // A plugin can only be the source when one is actually loaded.
+    if source == InstrumentSource::Plugin && info.is_none() {
+        source = InstrumentSource::Empty;
+        state.instrument[track] = source;
+    }
 
     let inner = module_shell(
         ui,
@@ -298,49 +303,144 @@ fn draw_instrument(
         accent,
     );
 
+    // ---- Empty slot: the call to action --------------------------------
+    if source == InstrumentSource::Empty && info.is_none() {
+        let hit = ui.interact(
+            inner,
+            ui.scope_id().with(("instrument_add", track)),
+            Sense::click(),
+        );
+        let hovered = hit.hovered();
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        ui.painter().rect_filled(
+            inner,
+            CornerRadius::same(2),
+            if hovered {
+                theme::accent_alpha(accent, 22)
+            } else {
+                theme::PANEL_SUNK
+            },
+        );
+        ui.painter().rect_stroke(
+            inner,
+            CornerRadius::same(2),
+            Stroke::new(
+                1.2,
+                if hovered {
+                    theme::accent_alpha(accent, 190)
+                } else {
+                    theme::accent_alpha(accent, 70)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        );
+        let center = inner.center();
+        ui.painter().text(
+            Pos2::new(center.x, center.y - 20.0),
+            Align2::CENTER_CENTER,
+            "+",
+            theme::display(26.0),
+            if hovered { Color32::WHITE } else { accent },
+        );
+        ui.painter().text(
+            Pos2::new(center.x, center.y + 6.0),
+            Align2::CENTER_CENTER,
+            if pending {
+                "LOADING…"
+            } else {
+                "ADD PLUGIN / INSTRUMENT"
+            },
+            theme::display(9.0),
+            if hovered { Color32::WHITE } else { theme::TEXT },
+        );
+        ui.painter().text(
+            Pos2::new(center.x, center.y + 24.0),
+            Align2::CENTER_CENTER,
+            format!(
+                "{} PLUGIN(S) SCANNED · VST3 / CLAP / INTERNAL FM",
+                studio.scan_results.len()
+            ),
+            theme::mono(6.2),
+            theme::TEXT_FAINT,
+        );
+        if hit.clicked() {
+            studio.open_instrument_browser(track);
+        }
+        if hovered {
+            hit.on_hover_text(
+                "Pick a CLAP/VST3 plugin installed on this system, or the internal FM synth",
+            );
+        }
+        return;
+    }
+
     // ---- Source selector + plugin actions -------------------------------
     let row_h = 16.0;
-    let chip_w = (inner.width() * 0.24).clamp(42.0, 78.0);
+    let chip_w = (inner.width() * 0.22).clamp(38.0, 70.0);
     let fm_chip = Rect::from_min_size(inner.min, Vec2::new(chip_w, row_h));
     let plugin_chip = Rect::from_min_size(
         Pos2::new(fm_chip.right() + 3.0, inner.top()),
-        Vec2::new((inner.width() * 0.42).clamp(60.0, 150.0), row_h),
+        Vec2::new((inner.width() * 0.34).clamp(56.0, 132.0), row_h),
+    );
+    let open_chip = Rect::from_min_size(
+        Pos2::new(plugin_chip.right() + 3.0, inner.top()),
+        Vec2::new((inner.width() * 0.22).clamp(34.0, 86.0), row_h),
     );
     let track_select = Rect::from_min_size(
-        Pos2::new(plugin_chip.right() + 3.0, inner.top()),
-        Vec2::new((inner.right() - plugin_chip.right() - 3.0).max(20.0), row_h),
+        Pos2::new(open_chip.right() + 3.0, inner.top()),
+        Vec2::new((inner.right() - open_chip.right() - 3.0).max(20.0), row_h),
     );
 
     if source_chip(
         ui,
         fm_chip,
         "FM",
-        !plugin_source,
+        source == InstrumentSource::Synth,
         accent,
         ui.scope_id().with(("instrument_fm", track)),
     ) {
-        state.instrument_plugin[track] = Some(false);
+        state.instrument[track] = InstrumentSource::Synth;
+        source = InstrumentSource::Synth;
     }
     let plugin_label = match &info {
-        Some(info) => info.name.chars().take(14).collect::<String>(),
-        None => "+ VST3 / CLAP".to_string(),
+        Some(info) => info.name.chars().take(12).collect::<String>(),
+        None => "+ ADD".to_string(),
     };
     if source_chip(
         ui,
         plugin_chip,
         &plugin_label,
-        plugin_source,
+        source == InstrumentSource::Plugin,
         theme::GREEN,
         ui.scope_id().with(("instrument_plugin", track)),
     ) {
         if info.is_some() {
-            state.instrument_plugin[track] = Some(true);
+            state.instrument[track] = InstrumentSource::Plugin;
+            source = InstrumentSource::Plugin;
         } else {
-            studio.browser_target = track;
-            studio.browser_open = true;
-            if studio.scan_results.is_empty() && !studio.scan_running {
-                studio.start_scan();
-            }
+            studio.open_instrument_browser(track);
+        }
+    }
+    // The native-editor chip only makes sense with a plugin in the slot.
+    let gui_label = if info.as_ref().is_some_and(|slot| slot.gui_open) {
+        "GUI ON"
+    } else {
+        "GUI"
+    };
+    if source_chip(
+        ui,
+        open_chip,
+        if info.is_some() { gui_label } else { "ADD" },
+        info.as_ref().is_some_and(|slot| slot.gui_open),
+        theme::CYAN,
+        ui.scope_id().with(("instrument_gui", track)),
+    ) {
+        match &info {
+            Some(slot) if slot.gui_open => studio.close_plugin_gui(track),
+            Some(_) => studio.open_plugin_gui(track),
+            None => studio.open_instrument_browser(track),
         }
     }
 
@@ -362,11 +462,17 @@ fn draw_instrument(
     let track_painter = ui
         .painter()
         .with_clip_rect(track_select.shrink2(Vec2::new(2.0, 0.0)));
+    let label_font = theme::fitted_font(
+        &track_painter,
+        state.track_label(track),
+        theme::mono(7.0),
+        track_select.width() - 6.0,
+    );
     track_painter.text(
         Pos2::new(track_select.left() + 4.0, track_select.center().y),
         Align2::LEFT_CENTER,
         state.track_label(track),
-        theme::mono(7.0),
+        label_font,
         accent,
     );
     if track_hit.clicked() {
@@ -409,7 +515,7 @@ fn draw_instrument(
         }
         if icon_button(ui, close, "X", theme::RED) {
             studio.unload_plugin(track, audio);
-            state.instrument_plugin[track] = None;
+            state.instrument[track] = crate::studio::source_after_unload(state.instrument[track]);
         }
     }
 
@@ -420,7 +526,7 @@ fn draw_instrument(
         Pos2::new(inner.right(), inner.bottom() - 13.0),
     );
 
-    if plugin_source {
+    if source == InstrumentSource::Plugin {
         if let Some(info) = &info {
             draw_plugin_parameters(ui, content, studio, track, info, accent);
             return;
@@ -498,9 +604,9 @@ fn draw_instrument(
         Pos2::new(badge.right() - 2.0, badge.center().y),
         Align2::RIGHT_CENTER,
         if badge_hit.hovered() {
-            "OPEN ▸"
+            "OPEN >"
         } else {
-            "EDITOR ▸"
+            "EDITOR >"
         },
         theme::mono(6.0),
         if badge_hit.hovered() {

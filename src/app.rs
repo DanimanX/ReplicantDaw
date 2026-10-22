@@ -111,6 +111,7 @@ impl ReplicantApp {
                     "midi" => studio.midi_open = true,
                     "project" => studio.project_open = true,
                     "browser" => studio.browser_open = true,
+                    "instrument" => studio.open_instrument_browser(state.selected_track),
                     "synth" => studio.synth_open = true,
                     "add" => state.add_effect_open = true,
                     "piano" => {
@@ -131,6 +132,12 @@ impl ReplicantApp {
                     _ => {}
                 }
             }
+        }
+        if std::env::var_os("REPLICANT_DAW_OPEN_GUI").is_some() {
+            studio.open_plugin_gui(0);
+        }
+        if std::env::var_os("REPLICANT_DAW_CLOSE_GUI").is_some() {
+            studio.close_plugin_gui(0);
         }
         if let Ok(zoom) = std::env::var("REPLICANT_DAW_ZOOM") {
             if let Ok(percent) = zoom.parse::<u32>() {

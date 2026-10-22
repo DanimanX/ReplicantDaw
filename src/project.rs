@@ -12,6 +12,9 @@
 //!   with neutral defaults (unity clip gain, no fades).
 //! - v4: one MIDI clip per session slot and user-editable track names. v3
 //!   `notes` are migrated into the slot named by the track's `scene`.
+//! - v5: the instrument slot is explicit (`empty` / `synth` / `plugin`).
+//!   v4 files map their `instrument_plugin` flag onto it and keep the synth
+//!   audible, because that was the only source back then.
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +24,7 @@ use crate::audio::messages::{EffectKind, RecordedNote, SynthParam, TRACK_COUNT};
 use crate::audio::{SynthParams, TRACKS};
 
 pub const PROJECT_EXTENSION: &str = "rproj";
-pub const PROJECT_FORMAT_VERSION: u32 = 4;
+pub const PROJECT_FORMAT_VERSION: u32 = 5;
 
 /// Editable FM synth settings stored per track.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -132,8 +135,10 @@ pub struct ProjectTrack {
     pub fade_out: f32,
     #[serde(default)]
     pub synth: Option<ProjectSynth>,
-    /// Instrument slot choice: `Some(true)` = plugin, `Some(false)` = internal
-    /// FM synth, `None` = follow the plugin type.
+    /// Instrument slot source: `empty`, `synth` or `plugin`.
+    #[serde(default)]
+    pub instrument: String,
+    /// Legacy (v4) instrument choice. Migrated into `instrument` on load.
     #[serde(default)]
     pub instrument_plugin: Option<bool>,
 }
@@ -228,6 +233,7 @@ impl Default for Project {
                 fade_in: 0.0,
                 fade_out: 0.0,
                 synth: Some(ProjectSynth::default_for_track(index)),
+                instrument: "synth".to_string(),
                 instrument_plugin: None,
             })
             .collect();
@@ -325,6 +331,17 @@ impl Project {
             }
         }
 
+        // v4 stored the instrument choice as a tri-state flag.
+        if project.format_version < 5 {
+            for track in project.tracks.iter_mut() {
+                track.instrument = match track.instrument_plugin {
+                    Some(true) => "plugin".to_string(),
+                    Some(false) | None => "synth".to_string(),
+                };
+                track.instrument_plugin = None;
+            }
+        }
+
         // A v1 file has no `effects`; translate its fixed FX block.
         if project.format_version < 2 {
             if let Some(legacy) = project.legacy_fx.take() {
@@ -399,7 +416,8 @@ impl Project {
                 fade_in: state.clip_fade_in[index],
                 fade_out: state.clip_fade_out[index],
                 synth: Some(ProjectSynth::from_params(&state.synth_params(index))),
-                instrument_plugin: state.instrument_plugin[index],
+                instrument: state.instrument[index].id().to_string(),
+                instrument_plugin: None,
             })
             .collect();
 
@@ -486,7 +504,7 @@ mod tests {
         project.tracks[2].clip_gain_db = -3.5;
         project.tracks[2].fade_in = 0.25;
         project.tracks[2].fade_out = 0.10;
-        project.tracks[2].instrument_plugin = Some(true);
+        project.tracks[2].instrument = "plugin".to_string();
         project.tracks[1].clips.push(ProjectClip {
             scene: 2,
             notes: vec![RecordedNote {
@@ -526,7 +544,7 @@ mod tests {
         assert!((loaded.tracks[2].clip_gain_db + 3.5).abs() < 1e-6);
         assert!((loaded.tracks[2].fade_in - 0.25).abs() < 1e-6);
         assert!((loaded.tracks[2].fade_out - 0.10).abs() < 1e-6);
-        assert_eq!(loaded.tracks[2].instrument_plugin, Some(true));
+        assert_eq!(loaded.tracks[2].instrument, "plugin");
         assert_eq!(loaded.tracks[1].clips.len(), 1);
         assert_eq!(loaded.tracks[1].clips[0].scene, 2);
         assert!(!loaded.tracks[1].clips[0].enabled);
@@ -562,6 +580,32 @@ mod tests {
         assert!(!track.clips[0].enabled);
         assert_eq!(track.clips[0].notes.len(), 1);
         assert!(track.notes.is_empty());
+    }
+
+    #[test]
+    fn v4_instrument_flag_migrates_to_the_source_field() {
+        let json = r#"{
+            "format_version": 4,
+            "name": "Old Instrument",
+            "bpm": 120.0,
+            "tracks": [
+                { "name": "SYNTH TRACK", "gain_db": -6.0, "pan": 0.0,
+                  "instrument_plugin": false },
+                { "name": "HYBRID TRACK", "gain_db": -6.0, "pan": 0.0,
+                  "instrument_plugin": true },
+                { "name": "PLAIN TRACK", "gain_db": -6.0, "pan": 0.0 }
+            ]
+        }"#;
+        let project = Project::from_json(json).expect("parse v4 project");
+        assert_eq!(project.format_version, PROJECT_FORMAT_VERSION);
+        assert_eq!(project.tracks[0].instrument, "synth");
+        assert_eq!(project.tracks[1].instrument, "plugin");
+        // A v4 file without the flag played the internal synth.
+        assert_eq!(project.tracks[2].instrument, "synth");
+        assert!(project
+            .tracks
+            .iter()
+            .all(|track| track.instrument_plugin.is_none()));
     }
 
     #[test]

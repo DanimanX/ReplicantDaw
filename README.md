@@ -5,14 +5,15 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.0.5** · MIT · Linux, macOS and Windows.
+**Version 1.1.0** · MIT · Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
-> Captured headlessly from the real release binary with the silent fallback
-> clock (no audio device attached), so the badges show `SILENT FALLBACK`.
-> The session shows recorded MIDI clips in the matrix and arrangement, and a
-> five-module effect chain.
+> Captured headlessly from the real binary with the silent fallback clock (no
+> audio device attached), so the badges show `SILENT FALLBACK`. A fresh session
+> starts with an empty instrument slot and the plugins already scanned.
+
+![Instrument browser listing the plugins installed on the system](docs/instrument-browser.png)
 
 ![FM synth editor at 125% UI zoom](docs/synth.png)
 
@@ -21,6 +22,24 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Per-track plugin rack hosting a real CLAP instrument](docs/plugins.png)
 
 ![Plugin editor at full screen](docs/plugin-editor.png)
+
+## What's new in 1.1.0
+
+- **Tracks start empty** — a new session has no synth loaded. The device chain
+  opens with a single `ADD PLUGIN / INSTRUMENT` button; the internal
+  `NEURAL GEN V5` FM synth is now one choice in that browser, next to the
+  plugins.
+- **Plugins are preloaded** — the plugin scanner runs automatically at startup,
+  so the picker already lists everything installed under the standard CLAP and
+  VST3 locations (42 plugins on the test machine).
+- **Native plugin windows** — `PLUGIN GUI` opens the plugin's own window instead
+  of only the parameter surface. CLAP editors are embedded into a host-owned
+  X11 window with the `clap.gui` and `clap.thread-check` host extensions
+  registered; VST3 editors use the editor window provided by the VST3 host.
+  The button lives in the instrument module, the rack row and the plugin editor.
+- **Instrument source is explicit** — each track records whether it plays
+  nothing, the FM synth, or the plugin, and project format v5 stores it. v4
+  files keep playing their synth.
 
 ## Fixes in 1.0.5
 
@@ -60,11 +79,14 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
   - Lock-free SPSC `rtrb` rings for commands, telemetry, scope samples, MIDI,
     recording events and plugin audio blocks.
 - **Instrument slots**
-  - Each track has one instrument slot: internal 2-op FM synth or a hosted
-    CLAP/VST3 instrument.
-  - Loading an instrument plugin mutes the internal synth for that track;
-    effect plugins stay inserts and keep the synth audible.
-  - Full-screen parameter editor per insert, with a name filter.
+  - Each track has one instrument slot and starts empty.
+  - `ADD PLUGIN / INSTRUMENT` opens a browser with the internal 2-op FM synth
+    plus every CLAP/VST3 plugin found on the system (scanned at startup).
+  - Loading an instrument plugin makes it the track's sound source; effect
+    plugins stay inserts and keep the current source.
+  - `PLUGIN GUI` opens the plugin's own native window (CLAP embedded in a
+    host-owned X11 window, VST3 through its editor window).
+  - Full-screen parameter editor per insert, with a name filter, as a fallback.
 - **Synthesis**
   - 8 tracks with a 32-voice polyphonic two-operator FM engine.
   - Per-track editable FM ratio, modulation index and ADSR envelope.
@@ -281,12 +303,12 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
 
 ## Project format
 
-`.rproj` is versioned JSON (format 4):
+`.rproj` is versioned JSON (format 5):
 
 ```json
 {
-  "format_version": 4,
-  "app_version": "1.0.4",
+  "format_version": 5,
+  "app_version": "1.1.0",
   "name": "Neon Demo",
   "bpm": 142.0,
   "effects": [
@@ -299,7 +321,7 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
     { "name": "MY LEAD", "gain_db": -7.0, "pan": -0.12,
       "mute": false, "solo": false, "scene": 1,
       "clip_gain_db": 0.0, "fade_in": 0.0, "fade_out": 0.0,
-      "instrument_plugin": false,
+      "instrument": "synth",
       "synth": { "ratio": 1.0, "index": 2.4, "attack": 0.004,
                  "decay": 0.18, "sustain": 0.25, "release": 0.25,
                  "level": 0.9 },
@@ -319,11 +341,11 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
 
 `tracks[].clips` holds one entry per non-empty session slot, so each of the
 8 × 8 slots is independent. `plugins[].slot` is the track index and
-`instrument_plugin` records the instrument-slot choice (`null` follows the
-plugin type). Unknown fields are ignored (forward compatible), while a newer
-`format_version` is rejected with a clear error. Loading a v3 file moves its
-single `notes` clip into the slot named by `scene`; v1 files translate their
-`fx` block into chain modules.
+`instrument` records the sound source (`empty`, `synth` or `plugin`). Unknown
+fields are ignored (forward compatible), while a newer `format_version` is
+rejected with a clear error. Loading a v4 file maps its `instrument_plugin`
+flag onto `instrument`; a v3 file moves its single `notes` clip into the slot
+named by `scene`; v1 files translate their `fx` block into chain modules.
 
 ## Verification
 
@@ -332,7 +354,7 @@ Keystation 49 MK3 MIDI keyboard, and third-party plugins already installed:
 
 ```
 $ cargo test
-test result: ok. 87 passed; 0 failed
+test result: ok. 88 passed; 0 failed
 
 $ cargo clippy --all-targets -- -D warnings
 Finished
@@ -387,8 +409,12 @@ This is a prototype, not a production DAW:
   natural next step.
 - The VST3 workaround parks closed instances instead of destroying them, so
   their memory is held until exit.
-- No native plugin GUI embedding: the plugin editor is a full-screen parameter
-  surface, not the vendor's own window.
+- Native plugin windows are experimental. CLAP editors are embedded on
+  Linux/X11; Windows and macOS fall back with a clear message. u-he CLAP
+  plugins (Bazille) abort the process when their window is requested, so save
+  before opening a plugin GUI and use the parameter editor if it fails.
+  Rendering of plugin windows could not be verified headlessly (Xvfb has no
+  compositor), only that they are created, sized, mapped and closed cleanly.
 - VST2 and Audio Unit hosting are not implemented (see the matrix above).
 - The modular effects are still a master chain; per-track inserts host one
   plugin each. There is no arbitrary per-track effect chain yet.

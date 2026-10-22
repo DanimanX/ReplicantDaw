@@ -402,6 +402,23 @@ fn draw_rack(
                                             {
                                                 studio.open_plugin_editor(track, false);
                                             }
+                                            if info.as_ref().is_some_and(|i| i.has_editor)
+                                                && ui
+                                                    .add(Button::new(
+                                                        RichText::new("GUI").font(
+                                                            theme::display(8.0),
+                                                        )
+                                                        .color(theme::AMBER),
+                                                    ))
+                                                    .on_hover_text("Open the plugin's own window")
+                                                    .clicked()
+                                            {
+                                                if info.as_ref().is_some_and(|i| i.gui_open) {
+                                                    studio.close_plugin_gui(track);
+                                                } else {
+                                                    studio.open_plugin_gui(track);
+                                                }
+                                            }
                                             ui.label(
                                                 RichText::new(format!(
                                                     "TRACK {:02}",
@@ -530,7 +547,12 @@ fn draw_browser(
     audio: &mut AudioRuntime,
 ) {
     let mut open = studio.browser_open;
-    egui::Window::new("PLUGIN BROWSER")
+    let title = if studio.instrument_browser {
+        "INSTRUMENT BROWSER // ADD PLUGIN / INSTRUMENT"
+    } else {
+        "PLUGIN BROWSER"
+    };
+    egui::Window::new(title)
         .open(&mut open)
         .frame(window_frame())
         .default_pos(Pos2::new(260.0, 150.0))
@@ -579,7 +601,35 @@ fn draw_browser(
             ui.add_space(4.0);
 
             let filter = studio.browser_filter.to_lowercase();
+            let mut choose_synth = false;
+            if studio.instrument_browser {
+                // The internal engine is always available, above the plugins.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("INT ")
+                            .font(theme::mono(8.0))
+                            .color(theme::GREEN),
+                    );
+                    ui.label(
+                        RichText::new("NEURAL GEN V5 · internal 2-op FM synth")
+                            .font(theme::display(8.5))
+                            .color(theme::TEXT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(Button::new(
+                                RichText::new("USE").font(theme::display(8.0)),
+                            ))
+                            .clicked()
+                        {
+                            choose_synth = true;
+                        }
+                    });
+                });
+                ui.separator();
+            }
             ScrollArea::vertical()
+                .id_salt("plugin_browser_list")
                 .max_height(300.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -655,6 +705,7 @@ fn draw_browser(
                         let slot = studio.browser_target;
                         studio.load_plugin(slot, &descriptor, audio);
                         studio.browser_open = false;
+                        studio.instrument_browser = false;
                     }
                 });
             ui.add_space(4.0);
@@ -665,8 +716,21 @@ fn draw_browser(
                 .font(theme::mono(7.0))
                 .color(theme::TEXT_FAINT),
             );
+            if choose_synth {
+                let track = studio.browser_target;
+                studio.select_synth(state, track);
+                studio.browser_open = false;
+                studio.instrument_browser = false;
+                studio.notify(format!(
+                    "Track {:02} now plays the internal FM synth",
+                    track + 1
+                ));
+            }
         });
     studio.browser_open = open;
+    if !open {
+        studio.instrument_browser = false;
+    }
 }
 
 fn draw_midi(

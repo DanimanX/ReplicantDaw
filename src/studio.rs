@@ -42,12 +42,16 @@ pub struct Studio {
     pub plugins: PluginRuntime,
     pub slots: [Option<PluginSlotInfo>; MAX_PLUGIN_SLOTS],
     pub slot_pending: [bool; MAX_PLUGIN_SLOTS],
+    /// Slots that had a plugin on the previous frame, used to notice loads.
+    slot_loaded: [bool; MAX_PLUGIN_SLOTS],
     pub selected_slot: usize,
 
     pub scan_results: Vec<PluginDescriptor>,
     pub scan_running: bool,
     scan_rx: Option<Receiver<Vec<PluginDescriptor>>>,
     pub browser_open: bool,
+    /// True while the picker is choosing an instrument for the device chain.
+    pub instrument_browser: bool,
     pub browser_target: usize,
     pub browser_filter: String,
     pub rack_open: bool,
@@ -97,11 +101,13 @@ impl Studio {
             plugins,
             slots: std::array::from_fn(|_| None),
             slot_pending: [false; MAX_PLUGIN_SLOTS],
+            slot_loaded: [false; MAX_PLUGIN_SLOTS],
             selected_slot: 0,
             scan_results: Vec::new(),
             scan_running: false,
             scan_rx: None,
             browser_open: false,
+            instrument_browser: false,
             browser_target: 0,
             browser_filter: String::new(),
             rack_open: false,
@@ -137,6 +143,9 @@ impl Studio {
             studio.midi.ports.len(),
             studio.projects.len()
         );
+        // Preload the plugins installed on this machine so the instrument
+        // browser is populated the first time it opens.
+        studio.start_scan();
         studio
     }
 
@@ -202,7 +211,41 @@ impl Studio {
             PluginEvent::State { .. } => {
                 // Consumed by `collect_plugin_states` when saving.
             }
+            PluginEvent::Gui {
+                slot,
+                open,
+                message,
+            } => {
+                if let Some(info) = self.slots.get_mut(slot as usize).and_then(Option::as_mut) {
+                    info.gui_open = open;
+                }
+                match message {
+                    Some(message) => self.log_error(message),
+                    None if open => self.notify("Plugin editor opened"),
+                    None => self.notify("Plugin editor closed"),
+                }
+            }
             PluginEvent::Log(message) => self.log_error(message),
+        }
+    }
+
+    /// Open the plugin picker for a track's instrument slot.
+    ///
+    /// The list is populated by the automatic scan that runs at startup, and
+    /// rescanned immediately if nothing has been found yet.
+    pub fn open_instrument_browser(&mut self, track: usize) {
+        self.browser_target = track.min(TRACK_COUNT - 1);
+        self.browser_open = true;
+        self.instrument_browser = true;
+        if self.scan_results.is_empty() && !self.scan_running {
+            self.start_scan();
+        }
+    }
+
+    /// Choose the internal FM synth as the instrument source for `track`.
+    pub fn select_synth(&mut self, state: &mut UiState, track: usize) {
+        if track < TRACK_COUNT {
+            state.instrument[track] = crate::state::InstrumentSource::Synth;
         }
     }
 
@@ -270,6 +313,27 @@ impl Studio {
         });
         self.slots[slot] = None;
         self.slot_pending[slot] = false;
+    }
+
+    /// Ask the worker to open the plugin's own editor window.
+    pub fn open_plugin_gui(&mut self, slot: usize) {
+        if slot >= MAX_PLUGIN_SLOTS {
+            return;
+        }
+        self.plugins
+            .send(PluginCommand::OpenGui { slot: slot as u8 });
+        self.notify(format!(
+            "Opening the plugin editor on track {:02}",
+            slot + 1
+        ));
+    }
+
+    pub fn close_plugin_gui(&mut self, slot: usize) {
+        if slot >= MAX_PLUGIN_SLOTS {
+            return;
+        }
+        self.plugins
+            .send(PluginCommand::CloseGui { slot: slot as u8 });
     }
 
     pub fn set_bypass(&mut self, slot: usize, bypass: bool) {
@@ -486,7 +550,7 @@ impl Studio {
                 }
             }
 
-            state.instrument_plugin[index] = track.instrument_plugin;
+            state.instrument[index] = crate::state::InstrumentSource::from_id(&track.instrument);
             state.clip_gain_db[index] = track.clip_gain_db;
             state.clip_fade_in[index] = track.fade_in;
             state.clip_fade_out[index] = track.fade_out;
@@ -599,14 +663,19 @@ impl Studio {
     /// selected still takes over that track's sound source.
     pub fn sync_instrument_sources(&mut self, state: &mut UiState, audio: &mut AudioRuntime) {
         for track in 0..TRACK_COUNT {
+            // A newly loaded instrument plugin takes over an empty slot.
             let loaded = self.slots[track].is_some();
-            let plugin_is_instrument = self.slots[track]
-                .as_ref()
-                .is_some_and(|slot| slot.is_instrument);
-            let want_synth =
-                desired_synth(loaded, plugin_is_instrument, state.instrument_plugin[track]);
-            if state.synth_enabled[track] != want_synth {
-                state.synth_enabled[track] = want_synth;
+            if loaded && !self.slot_loaded[track] {
+                let is_instrument = self.slots[track]
+                    .as_ref()
+                    .is_some_and(|slot| slot.is_instrument);
+                state.instrument[track] = source_after_load(state.instrument[track], is_instrument);
+            }
+            self.slot_loaded[track] = loaded;
+
+            let want_synth = state.instrument[track].synth_audible();
+            if state.synth_sent[track] != want_synth {
+                state.synth_sent[track] = want_synth;
                 let _ = audio.command_tx.push(Command::SetTrackSynth {
                     track: track as u8,
                     enabled: want_synth,
@@ -639,17 +708,33 @@ impl PluginDescriptor {
     }
 }
 
-/// Should the internal FM synth sound, given the instrument slot state?
+/// Deciding the instrument source when a plugin is loaded or unloaded.
 ///
-/// `choice` is the user's explicit source (`Some(true)` = plugin); `None`
-/// follows the plugin type, so loading an instrument takes over the track.
-pub fn desired_synth(
-    plugin_loaded: bool,
+/// Loading a plugin only takes over an *empty* or already-plugin slot when the
+/// plugin is an instrument; an effect plugin leaves the current source alone.
+pub fn source_after_load(
+    current: crate::state::InstrumentSource,
     plugin_is_instrument: bool,
-    choice: Option<bool>,
-) -> bool {
-    let plugin_selected = choice.unwrap_or(plugin_is_instrument);
-    !(plugin_selected && plugin_loaded)
+) -> crate::state::InstrumentSource {
+    use crate::state::InstrumentSource;
+    match current {
+        InstrumentSource::Empty | InstrumentSource::Plugin if plugin_is_instrument => {
+            InstrumentSource::Plugin
+        }
+        InstrumentSource::Empty if !plugin_is_instrument => InstrumentSource::Empty,
+        other => other,
+    }
+}
+
+/// Deciding the instrument source when a plugin is unloaded.
+pub fn source_after_unload(
+    current: crate::state::InstrumentSource,
+) -> crate::state::InstrumentSource {
+    use crate::state::InstrumentSource;
+    match current {
+        InstrumentSource::Plugin => InstrumentSource::Empty,
+        other => other,
+    }
 }
 
 /// Convenience for the UI: does this session slot hold recorded material?
@@ -719,17 +804,39 @@ mod tests {
 
     #[test]
     fn instrument_slot_decides_the_sound_source() {
-        // No plugin: the FM synth always sounds.
-        assert!(desired_synth(false, false, None));
-        assert!(desired_synth(false, false, Some(true)));
+        use crate::state::InstrumentSource;
 
-        // Instrument plugin: takes over automatically.
-        assert!(!desired_synth(true, true, None));
-        // Effect plugin: the synth keeps sounding.
-        assert!(desired_synth(true, false, None));
-        // Explicit choices win.
-        assert!(!desired_synth(true, false, Some(true)));
-        assert!(desired_synth(true, true, Some(false)));
+        assert!(InstrumentSource::Synth.synth_audible());
+        assert!(!InstrumentSource::Empty.synth_audible());
+        assert!(!InstrumentSource::Plugin.synth_audible());
+
+        // A new track starts empty: the chain shows ADD PLUGIN / INSTRUMENT.
+        assert_eq!(InstrumentSource::default(), InstrumentSource::Empty);
+
+        // Instrument plugins take over an empty or plugin slot.
+        assert_eq!(
+            source_after_load(InstrumentSource::Empty, true),
+            InstrumentSource::Plugin
+        );
+        // Effect plugins leave an empty slot empty.
+        assert_eq!(
+            source_after_load(InstrumentSource::Empty, false),
+            InstrumentSource::Empty
+        );
+        // An explicit FM choice survives an effect plugin.
+        assert_eq!(
+            source_after_load(InstrumentSource::Synth, false),
+            InstrumentSource::Synth
+        );
+        // Unloading a plugin empties the slot.
+        assert_eq!(
+            source_after_unload(InstrumentSource::Plugin),
+            InstrumentSource::Empty
+        );
+        assert_eq!(
+            source_after_unload(InstrumentSource::Synth),
+            InstrumentSource::Synth
+        );
     }
 
     #[test]

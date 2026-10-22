@@ -35,6 +35,8 @@ pub struct PluginSlotInfo {
     pub params: Vec<ParamInfo>,
     pub latency: u32,
     pub is_instrument: bool,
+    pub has_editor: bool,
+    pub gui_open: bool,
     pub error: Option<String>,
 }
 
@@ -64,6 +66,13 @@ pub enum PluginCommand {
     SetSampleRate {
         sample_rate: f32,
     },
+    /// Open the plugin's own editor window (its native GUI).
+    OpenGui {
+        slot: u8,
+    },
+    CloseGui {
+        slot: u8,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +81,12 @@ pub enum PluginEvent {
     State {
         request: u64,
         slots: Vec<(u8, Vec<u8>)>,
+    },
+    /// Result of an editor-window request, so the UI can report failures.
+    Gui {
+        slot: u8,
+        open: bool,
+        message: Option<String>,
     },
     Log(String),
 }
@@ -188,7 +203,14 @@ impl Drop for Worker {
         // Never tear down VST3 components during shutdown either: the crash
         // would turn a normal quit into a core dump.
         for slot in self.slots.iter_mut() {
-            if let Some(slot) = slot.take() {
+            if let Some(mut slot) = slot.take() {
+                match &mut slot.instance {
+                    Instance::Vst3(plugin) => {
+                        plugin.close_gui();
+                        plugin.stop();
+                    }
+                    Instance::Clap(plugin) => plugin.shutdown(),
+                }
                 match slot.instance {
                     Instance::Vst3(plugin) => std::mem::forget(plugin),
                     Instance::Clap(plugin) => drop(plugin),
@@ -227,6 +249,9 @@ impl Worker {
                     }
                 }
                 Err(_) => {
+                    // Plugin editors pump their own platform events; do it
+                    // here, on the thread that owns the plugin instances.
+                    self.service_gui_windows();
                     if !did_work {
                         thread::sleep(Duration::from_micros(150));
                     }
@@ -282,6 +307,10 @@ impl Worker {
             PluginCommand::Unload { slot } => {
                 if let Some(entry) = self.slots.get_mut(slot as usize) {
                     if let Some(mut removed) = entry.take() {
+                        match &mut removed.instance {
+                            Instance::Clap(plugin) => plugin.shutdown(),
+                            Instance::Vst3(_) => {}
+                        }
                         if removed.instance.is_vst3() {
                             if let Instance::Vst3(plugin) = &mut removed.instance {
                                 plugin.stop();
@@ -307,6 +336,52 @@ impl Worker {
             PluginCommand::SetSampleRate { sample_rate } => {
                 self.sample_rate = sample_rate;
             }
+            PluginCommand::OpenGui { slot } => {
+                let index = slot as usize;
+                let mut message = None;
+                let opened = match self.slots.get_mut(index).and_then(Option::as_mut) {
+                    Some(slot) => {
+                        let result = match &mut slot.instance {
+                            Instance::Clap(plugin) => plugin.open_gui(),
+                            Instance::Vst3(plugin) => plugin.open_gui(),
+                        };
+                        match result {
+                            Ok(()) => true,
+                            Err(error) => {
+                                message = Some(error);
+                                false
+                            }
+                        }
+                    }
+                    None => {
+                        message = Some("no plugin loaded in this slot".to_string());
+                        false
+                    }
+                };
+                if let Some(message) = &message {
+                    let _ = self.event_tx.push(PluginEvent::Log(message.clone()));
+                }
+                let _ = self.event_tx.push(PluginEvent::Gui {
+                    slot,
+                    open: opened,
+                    message,
+                });
+                self.emit_slots();
+            }
+            PluginCommand::CloseGui { slot } => {
+                if let Some(slot) = self.slots.get_mut(slot as usize).and_then(Option::as_mut) {
+                    match &mut slot.instance {
+                        Instance::Clap(plugin) => plugin.close_gui(),
+                        Instance::Vst3(plugin) => plugin.close_gui(),
+                    }
+                }
+                let _ = self.event_tx.push(PluginEvent::Gui {
+                    slot,
+                    open: false,
+                    message: None,
+                });
+                self.emit_slots();
+            }
             PluginCommand::SaveState { request } => {
                 let mut states = Vec::new();
                 for (index, slot) in self.slots.iter_mut().enumerate() {
@@ -329,6 +404,16 @@ impl Worker {
         }
     }
 
+    /// Pump every open editor window.
+    fn service_gui_windows(&mut self) {
+        for slot in self.slots.iter_mut().flatten() {
+            match &mut slot.instance {
+                Instance::Clap(plugin) => plugin.service_gui(),
+                Instance::Vst3(plugin) => plugin.service_gui(),
+            }
+        }
+    }
+
     fn emit_slots(&mut self) {
         let mut infos = Vec::with_capacity(MAX_PLUGIN_SLOTS);
         for (index, slot) in self.slots.iter().enumerate() {
@@ -347,6 +432,14 @@ impl Worker {
                     params: slot.instance.params().to_vec(),
                     latency: slot.instance.latency(),
                     is_instrument: slot.instance.is_instrument(),
+                    has_editor: match &slot.instance {
+                        Instance::Clap(plugin) => plugin.has_gui(),
+                        Instance::Vst3(plugin) => plugin.has_editor(),
+                    },
+                    gui_open: match &slot.instance {
+                        Instance::Clap(plugin) => plugin.is_gui_open(),
+                        Instance::Vst3(plugin) => plugin.is_gui_open(),
+                    },
                     error: slot.error.clone(),
                 });
             }

@@ -1,14 +1,21 @@
 //! In-process VST3 hosting.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use vst3_host::audio::AudioBuffers;
 use vst3_host::midi::{MidiChannel, MidiEvent};
+use vst3_host::window::PluginWindow;
+use vst3_host::Plugin;
 
 use super::{BlockEvent, ParamInfo, PLUGIN_BLOCK_FRAMES};
 
 pub struct Vst3Instance {
-    plugin: vst3_host::Plugin,
+    /// Shared with the editor window, because `PluginWindow` takes an
+    /// `Arc<Mutex<Plugin>>`. Both live on the plugin worker thread, so the
+    /// lock is uncontended.
+    plugin: Arc<Mutex<Plugin>>,
+    window: Option<PluginWindow>,
     buffers: AudioBuffers,
     path: PathBuf,
     name: String,
@@ -26,11 +33,13 @@ impl Vst3Instance {
             PLUGIN_BLOCK_FRAMES,
         )
         .map_err(|error| format!("VST3 load failed: {error}"))?;
+        let plugin = Arc::new(Mutex::new(plugin));
 
-        let info = plugin.info().clone();
+        let info = lock(&plugin).info().clone();
         let buffers = AudioBuffers::new(2, 2, PLUGIN_BLOCK_FRAMES, sample_rate as f64);
         let mut instance = Self {
             plugin,
+            window: None,
             buffers,
             path: path.to_path_buf(),
             name: info.name,
@@ -41,33 +50,32 @@ impl Vst3Instance {
         };
 
         if let Some(state) = state {
-            instance
-                .plugin
+            lock(&instance.plugin)
                 .load_state(state)
                 .map_err(|error| format!("VST3 state restore failed: {error}"))?;
         }
 
-        instance.params = instance
-            .plugin
-            .get_parameters()
-            .map(|params| {
-                params
-                    .iter()
-                    .map(|param| ParamInfo {
-                        id: param.id,
-                        name: param.name.clone(),
-                        value: param.value as f32,
-                        text: instance
-                            .plugin
-                            .format_parameter(param.id, param.value)
-                            .unwrap_or_default(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        instance.params = {
+            let plugin = lock(&instance.plugin);
+            plugin
+                .get_parameters()
+                .map(|params| {
+                    params
+                        .iter()
+                        .map(|param| ParamInfo {
+                            id: param.id,
+                            name: param.name.clone(),
+                            value: param.value as f32,
+                            text: plugin
+                                .format_parameter(param.id, param.value)
+                                .unwrap_or_default(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
 
-        instance
-            .plugin
+        lock(&instance.plugin)
             .start_processing()
             .map_err(|error| format!("VST3 could not start processing: {error}"))?;
 
@@ -99,7 +107,7 @@ impl Vst3Instance {
     }
 
     pub fn latency(&self) -> u32 {
-        self.plugin.latency_samples()
+        lock(&self.plugin).latency_samples()
     }
 
     pub fn is_instrument(&self) -> bool {
@@ -109,13 +117,54 @@ impl Vst3Instance {
 
     pub fn set_param(&mut self, id: u32, value: f32) {
         let normalized = value.clamp(0.0, 1.0) as f64;
-        if self.plugin.set_parameter(id, normalized).is_ok() {
+        let mut plugin = lock(&self.plugin);
+        if plugin.set_parameter(id, normalized).is_ok() {
+            let text = plugin.format_parameter(id, normalized).unwrap_or_default();
+            drop(plugin);
             if let Some(param) = self.params.iter_mut().find(|p| p.id == id) {
                 param.value = normalized as f32;
-                param.text = self
-                    .plugin
-                    .format_parameter(id, normalized)
-                    .unwrap_or_default();
+                param.text = text;
+            }
+        }
+    }
+
+    /// Does this component expose an editor?
+    pub fn has_editor(&self) -> bool {
+        lock(&self.plugin).has_editor()
+    }
+
+    pub fn is_gui_open(&self) -> bool {
+        self.window.as_ref().is_some_and(PluginWindow::is_open)
+    }
+
+    /// Open the plugin's own editor window (its native GUI).
+    pub fn open_gui(&mut self) -> Result<(), String> {
+        if self.is_gui_open() {
+            return Ok(());
+        }
+        self.close_gui();
+        let mut window = PluginWindow::new(Arc::clone(&self.plugin));
+        window
+            .open()
+            .map_err(|error| format!("could not open the plugin editor: {error}"))?;
+        self.window = Some(window);
+        Ok(())
+    }
+
+    pub fn close_gui(&mut self) {
+        if let Some(mut window) = self.window.take() {
+            window.close();
+        }
+    }
+
+    /// Pump the editor's platform events. Called from the worker's idle loop.
+    pub fn service_gui(&mut self) {
+        if let Some(window) = self.window.as_mut() {
+            if window.is_open() {
+                let _ = window.service_platform_events();
+            } else {
+                window.close();
+                self.window = None;
             }
         }
     }
@@ -126,11 +175,12 @@ impl Vst3Instance {
     /// OB-Xd) crash asynchronously inside their own teardown, so the worker
     /// parks the instance instead of dropping it.
     pub fn stop(&mut self) {
-        let _ = self.plugin.stop_processing();
+        self.close_gui();
+        let _ = lock(&self.plugin).stop_processing();
     }
 
     pub fn save_state(&mut self) -> Result<Vec<u8>, String> {
-        self.plugin
+        lock(&self.plugin)
             .save_state()
             .map_err(|error| format!("VST3 state save failed: {error}"))
     }
@@ -171,7 +221,7 @@ impl Vst3Instance {
                 },
                 _ => continue,
             };
-            let _ = self.plugin.send_live_midi_event(midi);
+            let _ = lock(&self.plugin).send_live_midi_event(midi);
         }
 
         self.buffers.block_size = frames;
@@ -180,7 +230,7 @@ impl Vst3Instance {
         self.buffers.outputs[0][..frames].fill(0.0);
         self.buffers.outputs[1][..frames].fill(0.0);
 
-        self.plugin
+        lock(&self.plugin)
             .process_audio(&mut self.buffers)
             .map_err(|error| format!("VST3 process failed: {error}"))?;
 
@@ -188,6 +238,13 @@ impl Vst3Instance {
         right[..frames].copy_from_slice(&self.buffers.outputs[1][..frames]);
         Ok(())
     }
+}
+
+/// Lock the plugin, recovering from a poisoned mutex.
+fn lock(plugin: &Arc<Mutex<Plugin>>) -> std::sync::MutexGuard<'_, Plugin> {
+    plugin
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 // Teardown is handled inside `vst3_host::Plugin::drop`, which stops

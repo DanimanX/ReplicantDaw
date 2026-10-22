@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.2.0** · MIT, Linux, macOS and Windows.
+**Version 1.2.1** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -24,6 +24,12 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Plugin editor at full screen](docs/plugin-editor.png)
 
 ![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
+
+## Fixes in 1.2.1
+
+- **Windows build** — the plugin window's transient parent used `c_ulong`,
+  which is `u32` on Windows and `u64` on Unix: the comparison to the stored
+  `u64` failed to compile there. The conversion is now explicit on both.
 
 ## What's new in 1.2.0
 

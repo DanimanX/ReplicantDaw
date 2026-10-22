@@ -431,7 +431,10 @@ fn host_window_id(cc: &eframe::CreationContext<'_>) -> Option<u64> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = cc.window_handle().ok()?;
     match handle.as_raw() {
-        RawWindowHandle::Xlib(window) => Some(window.window),
+        // `c_ulong` is `u32` on Windows and `u64` on Unix, so the cast is
+        // required on one platform and redundant on the other.
+        #[allow(clippy::unnecessary_cast)]
+        RawWindowHandle::Xlib(window) => Some(window.window as u64),
         RawWindowHandle::Xcb(window) => Some(u64::from(window.window.get())),
         _ => None,
     }

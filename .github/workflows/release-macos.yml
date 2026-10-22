@@ -54,7 +54,7 @@ jobs:
             cp "target/${TARGET}/release/${BIN_NAME}" "dist/${PKG}/"
             cp README.md LICENSE "dist/${PKG}/"
             tar -C dist -czf "dist/${PKG}.tar.gz" "${PKG}"
-            shasum -a 256 "dist/${PKG}.tar.gz" > "dist/${PKG}.tar.gz.sha256"
+            ( cd dist && shasum -a 256 "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256" )
           done
 
       - name: Upload build artifacts

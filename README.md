@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.1.2** · MIT, Linux, macOS and Windows.
+**Version 1.1.3** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -24,6 +24,13 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Plugin editor at full screen](docs/plugin-editor.png)
 
 ![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
+
+## Fixes in 1.1.3
+
+- **macOS build** — the file-descriptor polling added in 1.1.2 used `libc`,
+  which was only declared for Linux while the code is compiled for every
+  `unix`. The dependency now covers `cfg(unix)`, so the macOS builds compile
+  again.
 
 ## Fixes in 1.1.2
 

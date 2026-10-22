@@ -1,6 +1,6 @@
 [package]
 name = "replicant-daw"
-version = "1.1.2"
+version = "1.1.3"
 edition = "2021"
 rust-version = "1.85"
 description = "A cyberpunk DAW prototype: real-time FM synthesis and a neon interface."
@@ -29,8 +29,10 @@ env_logger = "0.11"
 # CLAP GUI embedding: the host creates a plain X11 window and hands its id to
 # the plugin, which is the only mode CLAP plugins commonly implement.
 xcb = "1.7"
-# Polling the file descriptors CLAP plugins register (JUCE needs the X11 fd
-# to service its editor on Linux).
+
+[target.'cfg(unix)'.dependencies]
+# Polling the file descriptors CLAP plugins register through
+# `clap_host_posix_fd_support` (JUCE drives its editor from the X11 socket).
 libc = "0.2"
 
 [profile.release]

@@ -194,6 +194,58 @@ fn selftest() -> Result<(), String> {
         return Err("rtrb telemetry/scope path did not deliver data".into());
     }
 
+    // MIDI recording through the real lock-free path.
+    let (mut midi_tx, midi_rx) = rtrb::RingBuffer::new(64);
+    let (record_tx, mut record_rx) = rtrb::RingBuffer::new(64);
+    let mut recorded = Engine::new_with_io(
+        48_000.0,
+        audio::EngineIo {
+            midi: Some(midi_rx),
+            record_events: Some(record_tx),
+            ..audio::EngineIo::default()
+        },
+    );
+    recorded.apply(Command::SetBpm(120.0));
+    recorded.apply(Command::RecordStart { track: 0 });
+    midi_tx
+        .push(audio::MidiMessage::NoteOn {
+            channel: 0,
+            note: 64,
+            velocity: 100,
+        })
+        .map_err(|error| error.to_string())?;
+    for _ in 0..(48_000 / block) {
+        recorded.process(&mut buffer);
+    }
+    midi_tx
+        .push(audio::MidiMessage::NoteOff {
+            channel: 0,
+            note: 64,
+        })
+        .map_err(|error| error.to_string())?;
+    for _ in 0..(12_000 / block) {
+        recorded.process(&mut buffer);
+    }
+    recorded.apply(Command::RecordStop);
+    let captured = recorded.recorded_clip(0).len;
+    let mut mirrored = 0usize;
+    while record_rx.pop().is_ok() {
+        mirrored += 1;
+    }
+    println!("- midi recording: {captured} note(s), {mirrored} UI event(s)");
+    if captured == 0 {
+        return Err("MIDI recording captured no notes".into());
+    }
+
+    let mut midi = audio::MidiRuntime::new();
+    println!("- midi inputs available: {}", midi.ports.len());
+    if let Some(first) = midi.ports.first().cloned() {
+        match midi.open(0) {
+            Ok(()) => println!("- midi input opened: {first}"),
+            Err(error) => println!("- midi input unavailable ({error})"),
+        }
+    }
+
     // The silent clock must produce paced audio for headless verification.
     let (fallback_peak, fallback_playing) = audio::stream::probe_silent_clock()?;
     println!("- silent clock: peak {fallback_peak:.3}, playing={fallback_playing}");

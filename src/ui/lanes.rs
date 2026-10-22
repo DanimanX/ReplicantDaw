@@ -125,9 +125,38 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState) {
             theme::accent_alpha(accent, 130),
         );
 
+        // Recorded MIDI takes over the lane when present.
+        let notes = state.recorded_notes(track).to_vec();
+        if !notes.is_empty() {
+            let steps_total = crate::audio::LOOP_STEPS as f32;
+            let mut min_note = 127u8;
+            let mut max_note = 0u8;
+            for note in &notes {
+                min_note = min_note.min(note.note);
+                max_note = max_note.max(note.note);
+            }
+            let span = (max_note.saturating_sub(min_note)).max(11) as f32;
+            for note in &notes {
+                let x0 = lane.left() + note.start_step as f32 / steps_total * lane.width();
+                let x1 = lane.left()
+                    + note.end_step().min(steps_total as u16) as f32 / steps_total * lane.width();
+                let pitch = (note.note.saturating_sub(min_note)) as f32 / span;
+                let top = lane.top() + 3.0 + (1.0 - pitch) * (lane.height() - 10.0);
+                let rect = Rect::from_min_max(
+                    Pos2::new(x0.max(lane.left() + 1.0), top),
+                    Pos2::new(x1.max(x0 + 3.0).min(lane.right() - 1.0), top + 4.0),
+                );
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::same(1),
+                    theme::accent_alpha(accent, 210),
+                );
+            }
+        }
+
         // Audio clip blocks, one per four bars.
         let block_bars = 4usize;
-        let blocks = if launched.is_some() {
+        let blocks = if launched.is_some() && state.recorded_notes(track).is_empty() {
             TIMELINE_BARS / block_bars
         } else {
             0

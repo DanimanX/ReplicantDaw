@@ -108,6 +108,11 @@ impl Voice {
         self.age
     }
 
+    #[inline]
+    pub fn note(&self) -> u8 {
+        self.note
+    }
+
     pub fn release(&mut self) {
         if self.stage != Stage::Off && self.stage != Stage::Release {
             self.stage = Stage::Release;

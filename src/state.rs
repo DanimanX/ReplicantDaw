@@ -6,7 +6,10 @@ use std::f32::consts::TAU;
 
 use rtrb::Consumer;
 
-use crate::audio::{gain_to_db, Telemetry, DEFAULT_BPM, SCENE_COUNT, TRACKS, TRACK_COUNT};
+use crate::audio::messages::RecordedNote;
+use crate::audio::{
+    gain_to_db, RecordEvent, Telemetry, DEFAULT_BPM, SCENE_COUNT, TRACKS, TRACK_COUNT,
+};
 use crate::dsp::spectrum::SpectrumAnalyzer;
 
 pub const MAX_SCOPE: usize = 4096;
@@ -55,6 +58,14 @@ pub struct UiState {
     pub analyzer: SpectrumAnalyzer,
     pub selected_track: usize,
     pub hovered_scene: Option<usize>,
+    /// Mirror of the engine's recorded clips, used for display and saving.
+    pub recorded: [Vec<RecordedNote>; TRACK_COUNT],
+    pub recording: bool,
+    pub record_track: u8,
+    pub input_track: u8,
+    pub recorded_total: u16,
+    pub plugin_latency: u16,
+    pub plugin_midi: bool,
 }
 
 impl Default for UiState {
@@ -86,6 +97,13 @@ impl UiState {
             analyzer: SpectrumAnalyzer::new(48_000.0),
             selected_track: 0,
             hovered_scene: None,
+            recorded: std::array::from_fn(|_| Vec::new()),
+            recording: false,
+            record_track: 0,
+            input_track: 0,
+            recorded_total: 0,
+            plugin_latency: 0,
+            plugin_midi: true,
         }
     }
 
@@ -94,6 +112,10 @@ impl UiState {
         self.position_frames = frame.position_frames;
         self.sample_rate = frame.sample_rate;
         self.voices = frame.active_voices;
+        self.recording = frame.recording;
+        self.record_track = frame.record_track;
+        self.recorded_total = frame.recorded_notes;
+        self.plugin_latency = frame.plugin_latency;
         self.cpu += (frame.cpu_load - self.cpu) * 0.22;
 
         let decay = (-dt.max(0.001) * 7.5).exp();
@@ -125,6 +147,40 @@ impl UiState {
                 self.scope.pop_front();
             }
             self.scope.push_back(sample);
+        }
+    }
+
+    /// Apply a recording event mirrored from the engine.
+    pub fn apply_record_event(&mut self, event: RecordEvent) {
+        let track = event.track as usize;
+        if track >= TRACK_COUNT {
+            return;
+        }
+        if event.reset {
+            self.recorded[track].clear();
+            return;
+        }
+        if self.recorded[track].len() < crate::audio::messages::MAX_RECORDED_NOTES {
+            self.recorded[track].push(event.note);
+        }
+    }
+
+    pub fn recorded_notes(&self, track: usize) -> &[RecordedNote] {
+        self.recorded
+            .get(track)
+            .map(|notes| notes.as_slice())
+            .unwrap_or(&[])
+    }
+
+    pub fn clear_recorded(&mut self, track: usize) {
+        if let Some(notes) = self.recorded.get_mut(track) {
+            notes.clear();
+        }
+    }
+
+    pub fn set_recorded(&mut self, track: usize, notes: Vec<RecordedNote>) {
+        if let Some(slot) = self.recorded.get_mut(track) {
+            *slot = notes;
         }
     }
 

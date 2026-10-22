@@ -45,6 +45,9 @@ jobs:
       - name: Tests
         run: cargo test --locked --all-targets
 
+      - name: Engine self-test
+        run: cargo run --release --locked -- --selftest
+
       - name: Release build
         run: cargo build --release --locked
 

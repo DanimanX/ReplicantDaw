@@ -10,7 +10,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use super::engine::{Engine, SAMPLE_RATE};
+use super::engine::{Engine, EngineIo, SAMPLE_RATE};
 use super::messages::{Command, Telemetry};
 
 const COMMAND_CAPACITY: usize = 1024;
@@ -33,14 +33,22 @@ pub struct AudioRuntime {
 
 impl AudioRuntime {
     pub fn start() -> Self {
+        Self::start_with_io(EngineIo::default())
+    }
+
+    /// Start with extra engine side channels (MIDI, recording, plugins).
+    pub fn start_with_io(io: EngineIo) -> Self {
         if std::env::var_os("REPLICANT_DAW_NO_AUDIO").is_some() {
-            return Self::start_silent(Some("audio disabled by REPLICANT_DAW_NO_AUDIO".into()));
+            return Self::start_silent_with_io(
+                Some("audio disabled by REPLICANT_DAW_NO_AUDIO".into()),
+                io,
+            );
         }
-        match start_cpal() {
+        match start_cpal(io) {
             Ok(runtime) => runtime,
-            Err(error) => {
+            Err((error, io)) => {
                 log::warn!("Audio device unavailable ({error}); using the silent clock");
-                Self::start_silent(Some(error))
+                Self::start_silent_with_io(Some(error), io)
             }
         }
     }
@@ -48,18 +56,21 @@ impl AudioRuntime {
     /// A real-time paced engine with no device, used for headless runs and as
     /// a graceful fallback. The UI and FFT stay alive; only sound is missing.
     pub fn start_silent(error: Option<String>) -> Self {
+        Self::start_silent_with_io(error, EngineIo::default())
+    }
+
+    pub fn start_silent_with_io(error: Option<String>, mut io: EngineIo) -> Self {
         let (command_tx, command_rx) = RingBuffer::new(COMMAND_CAPACITY);
         let (telemetry_tx, telemetry_rx) = RingBuffer::new(TELEMETRY_CAPACITY);
         let (scope_tx, scope_rx) = RingBuffer::new(SCOPE_CAPACITY);
 
+        io.commands = Some(command_rx);
+        io.telemetry = Some(telemetry_tx);
+        io.scope = Some(scope_tx);
+
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
-        let mut engine = Engine::new(
-            SAMPLE_RATE as f32,
-            Some(command_rx),
-            Some(telemetry_tx),
-            Some(scope_tx),
-        );
+        let mut engine = Engine::new_with_io(SAMPLE_RATE as f32, io);
 
         let worker = thread::Builder::new()
             .name("replicant-silent-clock".into())
@@ -119,13 +130,17 @@ impl Drop for AudioRuntime {
     }
 }
 
-fn start_cpal() -> Result<AudioRuntime, String> {
+#[allow(clippy::result_large_err)]
+fn start_cpal(mut io: EngineIo) -> Result<AudioRuntime, (String, EngineIo)> {
     let host = cpal::default_host();
-    let device = host
-        .default_output_device()
-        .ok_or_else(|| "no default output device".to_string())?;
+    let Some(device) = host.default_output_device() else {
+        return Err(("no default output device".to_string(), io));
+    };
     let device_name = device.to_string();
-    let supported = choose_config(&device)?;
+    let supported = match choose_config(&device) {
+        Ok(config) => config,
+        Err(error) => return Err((error, io)),
+    };
     let sample_format = supported.sample_format();
     let sample_rate = supported.sample_rate();
     let config: StreamConfig = supported.config();
@@ -141,17 +156,19 @@ fn start_cpal() -> Result<AudioRuntime, String> {
     let (telemetry_tx, telemetry_rx) = RingBuffer::new(TELEMETRY_CAPACITY);
     let (scope_tx, scope_rx) = RingBuffer::new(SCOPE_CAPACITY);
 
-    let engine = Engine::new(
-        sample_rate as f32,
-        Some(command_rx),
-        Some(telemetry_tx),
-        Some(scope_tx),
-    );
+    io.commands = Some(command_rx);
+    io.telemetry = Some(telemetry_tx);
+    io.scope = Some(scope_tx);
+    let engine = Engine::new_with_io(sample_rate as f32, io);
 
-    let stream = build_stream(&device, config, sample_format, engine)?;
-    stream
-        .play()
-        .map_err(|error| format!("could not start stream: {error}"))?;
+    let stream = build_stream(&device, config, sample_format, engine)
+        .map_err(|error| (error, EngineIo::default()))?;
+    stream.play().map_err(|error| {
+        (
+            format!("could not start stream: {error}"),
+            EngineIo::default(),
+        )
+    })?;
 
     let backend = format!("{:?}", host.id());
     Ok(AudioRuntime {

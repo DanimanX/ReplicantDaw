@@ -161,7 +161,90 @@ pub fn draw(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRunti
         state.playing = false;
         state.position_frames = 0;
     }
-    x += 74.0;
+
+    // Record arm / capture.
+    let rec_rect = Rect::from_center_size(Pos2::new(x + 78.0, mid), Vec2::new(44.0, 26.0));
+    let rec = ui.interact(
+        rec_rect,
+        ui.scope_id().with("transport_rec"),
+        Sense::click(),
+    );
+    let rec_hover = rec.hovered();
+    painter.rect_filled(
+        rec_rect,
+        CornerRadius::same(2),
+        if state.recording {
+            theme::accent_alpha(theme::RED, 40)
+        } else if rec_hover {
+            theme::PANEL_RAISED
+        } else {
+            theme::PANEL_SUNK
+        },
+    );
+    painter.rect_stroke(
+        rec_rect,
+        CornerRadius::same(2),
+        Stroke::new(
+            1.0,
+            if state.recording {
+                theme::RED
+            } else if rec_hover {
+                theme::accent_alpha(theme::RED, 150)
+            } else {
+                theme::BORDER
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    painter.circle_filled(
+        Pos2::new(rec_rect.left() + 10.0, rec_rect.center().y),
+        3.5,
+        if state.recording {
+            theme::RED
+        } else {
+            theme::accent_alpha(theme::RED, 160)
+        },
+    );
+    painter.text(
+        Pos2::new(rec_rect.left() + 18.0, rec_rect.center().y),
+        Align2::LEFT_CENTER,
+        "REC",
+        theme::display(8.0),
+        if state.recording {
+            theme::RED
+        } else {
+            theme::TEXT_DIM
+        },
+    );
+    if rec_hover {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if rec.clicked() {
+        if state.recording {
+            let _ = audio.command_tx.push(Command::RecordStop);
+            state.recording = false;
+        } else {
+            let track = state.selected_track as u8;
+            state.clear_recorded(track as usize);
+            state.recording = true;
+            state.record_track = track;
+            let _ = audio.command_tx.push(Command::RecordStart { track });
+        }
+    }
+    if state.recording && rec_rect.right() < rect.right() - 10.0 {
+        painter.text(
+            Pos2::new(rec_rect.left(), rect.bottom() - 8.0),
+            Align2::LEFT_BOTTOM,
+            format!(
+                "TRK {:02} · {} NOTES",
+                state.record_track + 1,
+                state.recorded_total
+            ),
+            theme::mono(7.0),
+            theme::accent_alpha(theme::RED, 200),
+        );
+    }
+    x += 108.0;
 
     divider(ui, x, rect.top() + 10.0, rect.bottom() - 10.0);
     x += 12.0;

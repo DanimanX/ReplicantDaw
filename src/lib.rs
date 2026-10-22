@@ -7,7 +7,10 @@
 pub mod app;
 pub mod audio;
 pub mod dsp;
+pub mod plugins;
+pub mod project;
 pub mod state;
+pub mod studio;
 pub mod theme;
 pub mod ui;
 

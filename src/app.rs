@@ -5,14 +5,21 @@ use std::time::{Duration, Instant};
 
 use egui::{Pos2, Rect, Vec2};
 
-use crate::audio::{AudioRuntime, Command, TRACK_COUNT};
+use rtrb::{Consumer, RingBuffer};
+
+use crate::audio::{AudioRuntime, Command, EngineIo, MidiRuntime, RecordEvent, TRACK_COUNT};
+use crate::plugins::{PluginCommand, PluginRuntime};
 use crate::state::UiState;
+use crate::studio::Studio;
 use crate::theme;
 use crate::ui;
 
 pub struct ReplicantApp {
     audio: AudioRuntime,
     state: UiState,
+    studio: Studio,
+    record_rx: Consumer<RecordEvent>,
+    last_input_track: usize,
     last_update: Instant,
     started: Instant,
     frames: u64,
@@ -28,10 +35,30 @@ struct SmokePlan {
 impl ReplicantApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install(&cc.egui_ctx);
-        let mut audio = AudioRuntime::start();
+
+        // Rings are created before the engine so MIDI, recording and plugin
+        // audio all flow into the same audio callback instance.
+        let mut midi = MidiRuntime::new();
+        let midi_rx = midi.take_consumer();
+        let (mut plugins, plugin_in, plugin_out) = PluginRuntime::start(48_000.0);
+        let (record_tx, record_rx) = RingBuffer::new(1024);
+        let io = EngineIo {
+            midi: midi_rx,
+            record_events: Some(record_tx),
+            plugin_input: Some(plugin_in),
+            plugin_output: Some(plugin_out),
+            ..EngineIo::default()
+        };
+        let mut audio = AudioRuntime::start_with_io(io);
+        plugins.send(PluginCommand::SetSampleRate {
+            sample_rate: audio.sample_rate as f32,
+        });
+        let mut studio = Studio::new(midi, plugins);
+
         let mut state = UiState::new();
         state.sample_rate = audio.sample_rate;
         state.analyzer.set_sample_rate(audio.sample_rate as f32);
+        studio.refresh_project_list();
 
         let smoke = std::env::var("REPLICANT_DAW_SMOKE")
             .ok()
@@ -47,6 +74,47 @@ impl ReplicantApp {
                     delay: Duration::from_secs_f32(delay),
                 }
             });
+
+        // Optional demo hooks used by the headless screenshot harness.
+        if let Ok(path) = std::env::var("REPLICANT_DAW_OPEN_PLUGIN") {
+            let format = if path.to_lowercase().ends_with(".clap") {
+                crate::plugins::PluginFormat::Clap
+            } else {
+                crate::plugins::PluginFormat::Vst3
+            };
+            let name = std::path::Path::new(&path)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Plugin".to_string());
+            let descriptor = crate::plugins::PluginDescriptor {
+                name,
+                path: std::path::PathBuf::from(path),
+                format,
+            };
+            studio.load_plugin(0, &descriptor);
+        } else if let Ok(slot) = std::env::var("REPLICANT_DAW_OPEN_SLOT") {
+            if let Ok(index) = slot.parse::<usize>() {
+                studio.selected_slot = index.min(crate::plugins::MAX_PLUGIN_SLOTS - 1);
+            }
+        }
+        if let Ok(windows) = std::env::var("REPLICANT_DAW_SMOKE_WINDOWS") {
+            for window in windows.split(',') {
+                match window.trim() {
+                    "rack" => studio.rack_open = true,
+                    "midi" => studio.midi_open = true,
+                    "project" => studio.project_open = true,
+                    "browser" => studio.browser_open = true,
+                    _ => {}
+                }
+            }
+        }
+
+        if let Ok(path) = std::env::var("REPLICANT_DAW_PROJECT") {
+            match studio.load_project(std::path::Path::new(&path), &mut state, &mut audio) {
+                Ok(()) => log::info!("Loaded project {path}"),
+                Err(error) => log::warn!("Could not load project {path}: {error}"),
+            }
+        }
 
         if smoke.is_some() {
             // A deterministic, lively frame for documentation and CI.
@@ -72,6 +140,9 @@ impl ReplicantApp {
         Self {
             audio,
             state,
+            studio,
+            record_rx,
+            last_input_track: 0,
             last_update: Instant::now(),
             started: Instant::now(),
             frames: 0,
@@ -85,6 +156,18 @@ impl ReplicantApp {
     }
 
     fn pump_audio(&mut self, dt: f32) {
+        self.studio.pump();
+
+        while let Ok(event) = self.record_rx.pop() {
+            self.state.apply_record_event(event);
+        }
+
+        if self.state.selected_track != self.last_input_track {
+            self.last_input_track = self.state.selected_track;
+            let track = self.state.selected_track as u8;
+            self.push(Command::SetInputTrack { track });
+        }
+
         while let Ok(telemetry) = self.audio.telemetry_rx.pop() {
             if telemetry.sample_rate != self.state.sample_rate {
                 self.state
@@ -103,12 +186,28 @@ impl ReplicantApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (space, stop) = ctx.input(|i| {
+        let (space, stop, save, open_project, plugins) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::Escape),
+                i.modifiers.command && i.key_pressed(egui::Key::S),
+                i.modifiers.command && i.key_pressed(egui::Key::O),
+                i.modifiers.command && i.key_pressed(egui::Key::P),
             )
         });
+        if save {
+            match self.studio.save_project(&self.state) {
+                Ok(path) => self.studio.notify(format!("Saved {}", path.display())),
+                Err(error) => self.studio.notify(error),
+            }
+        }
+        if open_project {
+            self.studio.project_open = true;
+            self.studio.refresh_project_list();
+        }
+        if plugins {
+            self.studio.browser_open = true;
+        }
         if space {
             if self.state.playing {
                 self.push(Command::Stop);
@@ -139,9 +238,14 @@ impl ReplicantApp {
             return;
         }
 
+        let menu_h = 24.0;
         let top_h = 60.0;
         let bottom_h = (inner.height() * 0.245).clamp(168.0, 252.0);
-        let top_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), top_h));
+        let menu_rect = Rect::from_min_size(inner.min, Vec2::new(inner.width(), menu_h));
+        let top_rect = Rect::from_min_size(
+            Pos2::new(inner.left(), inner.top() + menu_h + 5.0),
+            Vec2::new(inner.width(), top_h),
+        );
         let bottom_rect = Rect::from_min_max(
             Pos2::new(inner.left(), inner.bottom() - bottom_h),
             inner.max,
@@ -167,12 +271,19 @@ impl ReplicantApp {
             right.max,
         );
 
+        ui::studio_windows::draw_menu_bar(ui, menu_rect, &mut self.studio, &mut self.state);
         ui::transport::draw(ui, top_rect, &mut self.state, &mut self.audio);
         ui::session::draw_matrix(ui, matrix_rect, &mut self.state, &mut self.audio);
         ui::session::draw_mixer(ui, mixer_rect, &mut self.state, &mut self.audio);
         ui::lanes::draw_lanes(ui, tracks_rect, &mut self.state);
         ui::lanes::draw_fft(ui, fft_rect, &mut self.state);
         ui::devices::draw(ui, bottom_rect, &mut self.state, &mut self.audio);
+        ui::studio_windows::draw_windows(
+            ui.ctx(),
+            &mut self.studio,
+            &mut self.state,
+            &mut self.audio,
+        );
     }
 
     fn maybe_screenshot(&mut self, ctx: &egui::Context) {
@@ -183,6 +294,16 @@ impl ReplicantApp {
             return;
         }
         self.screenshot_requested = true;
+
+        if let Ok(save_path) = std::env::var("REPLICANT_DAW_SMOKE_SAVE") {
+            match self
+                .studio
+                .save_project_as(&self.state, std::path::PathBuf::from(&save_path))
+            {
+                Ok(path) => println!("SMOKE_PROJECT_SAVED {}", path.display()),
+                Err(error) => eprintln!("SMOKE_PROJECT_FAILED {error}"),
+            }
+        }
 
         let path = plan.path.clone();
         if let Some(parent) = path.parent() {

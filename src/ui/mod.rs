@@ -3,5 +3,6 @@
 pub mod devices;
 pub mod lanes;
 pub mod session;
+pub mod studio_windows;
 pub mod transport;
 pub mod widgets;

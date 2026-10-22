@@ -263,9 +263,10 @@ Additional manual checks:
 - Screenshots: `docs/screenshot.png` and `docs/plugins.png` are captured from
   the release binary running under Xvfb.
 
-The CI matrix runs tests and the self-test on Ubuntu, macOS (arm64 + x86_64)
-and Windows, and each tag publishes platform packages through
-`.github/workflows/release-*.yml`.
+The CI matrix runs tests and the self-test on Ubuntu, macOS and Windows. The
+release workflows cross-build both macOS architectures and publish platform
+packages for Linux, macOS and Windows on every tag
+(`.github/workflows/release-*.yml`).
 
 ## Limitations / next steps
 

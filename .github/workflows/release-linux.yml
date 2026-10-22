@@ -82,6 +82,7 @@ jobs:
           fi
           for attempt in 1 2 3 4 5; do
             if gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber; then
+              gh release edit "$TAG" --draft=false --title "Replicant DAW ${TAG#v}" || true
               exit 0
             fi
             sleep 5

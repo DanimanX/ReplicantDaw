@@ -69,7 +69,10 @@ jobs:
           }
           for ($i = 0; $i -lt 5; $i++) {
             gh release upload $tag dist/*.zip dist/*.sha256 --clobber
-            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($LASTEXITCODE -eq 0) {
+              gh release edit $tag --draft=false --title "Replicant DAW $tag"
+              exit 0
+            }
             Start-Sleep -Seconds 5
           }
           exit 1

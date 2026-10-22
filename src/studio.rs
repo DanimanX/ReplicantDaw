@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -17,6 +18,7 @@ use crate::plugins::{
     PluginSlotInfo, MAX_PLUGIN_SLOTS,
 };
 use crate::project::{Project, ProjectPlugin};
+use crate::samples::{list_directory, DecodedSample, SampleClip, SampleEntry};
 use crate::state::UiState;
 
 pub const MAX_STATUS_CHARS: usize = 160;
@@ -37,6 +39,13 @@ pub enum LoopEdge {
     End,
     /// Empty ruler: build a new region from this anchor step.
     New(u16),
+}
+
+/// Which edge of a sample's trim region is being dragged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimEdge {
+    Start,
+    End,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +97,18 @@ pub struct Studio {
     /// Audio-clip envelope editor.
     pub audio_editor_open: bool,
     pub audio_editor_track: usize,
+
+    /// Sample browser drawer and sample editor.
+    pub sample_browser_open: bool,
+    pub sample_dir: PathBuf,
+    pub sample_entries: Vec<SampleEntry>,
+    pub sample_filter: String,
+    pub sample_editor_open: bool,
+    pub sample_editor: Option<DecodedSample>,
+    /// Which trim handle the user is dragging in the sample editor.
+    pub sample_trim_drag: Option<TrimEdge>,
+    /// When the current one-shot preview began, for drawing its cursor.
+    pub preview_started: Option<Instant>,
 
     /// Full plugin parameter editor (opens maximized, like a plugin window).
     pub plugin_editor_open: bool,
@@ -144,6 +165,14 @@ impl Studio {
             roll_loop_drag: None,
             audio_editor_open: false,
             audio_editor_track: 0,
+            sample_browser_open: false,
+            sample_dir: crate::samples::initial_directory(),
+            sample_entries: Vec::new(),
+            sample_filter: String::new(),
+            sample_editor_open: false,
+            sample_editor: None,
+            sample_trim_drag: None,
+            preview_started: None,
             plugin_editor_open: false,
             plugin_editor_track: 0,
             plugin_editor_fullscreen: false,
@@ -187,6 +216,134 @@ impl Studio {
             self.logs.remove(0);
         }
         self.status = message.chars().take(MAX_STATUS_CHARS).collect();
+    }
+
+    /// Re-read the current sample folder.
+    pub fn reload_sample_dir(&mut self) {
+        match list_directory(&self.sample_dir) {
+            Ok(entries) => {
+                self.sample_entries = entries;
+                self.sample_filter.clear();
+            }
+            Err(error) => {
+                self.sample_entries.clear();
+                self.log_error(error);
+            }
+        }
+    }
+
+    /// Move the browser to another folder and list it.
+    pub fn set_sample_dir(&mut self, dir: PathBuf) {
+        self.sample_dir = dir;
+        self.reload_sample_dir();
+    }
+
+    /// Open a sample file in the editor window.
+    pub fn open_sample_editor_path(&mut self, path: &std::path::Path) {
+        match DecodedSample::load(path) {
+            Ok(sample) => {
+                self.notify(format!(
+                    "Loaded {} · {:.2} s · {} Hz · {}",
+                    sample.name,
+                    sample.source_duration_secs(),
+                    sample.source_rate,
+                    path.display()
+                ));
+                self.sample_editor = Some(sample);
+                self.sample_editor_open = true;
+                self.preview_started = None;
+                // The editor takes over the space; the browser stays one
+                // click away behind the SAMPLES tab.
+                self.sample_browser_open = false;
+            }
+            Err(error) => self.log_error(error),
+        }
+    }
+
+    /// Reopen the editor for a sample that is already in a clip slot.
+    pub fn open_sample_editor_clip(&mut self, clip: &SampleClip) {
+        self.sample_editor = Some(DecodedSample::from_clip(clip));
+        self.sample_editor_open = true;
+        self.preview_started = None;
+    }
+
+    /// Put a rendered sample in a session slot and hand it to the engine.
+    pub fn assign_sample(
+        &mut self,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+        track: usize,
+        scene: usize,
+        clip: Arc<SampleClip>,
+    ) {
+        let name = clip.name.clone();
+        let duration = clip.duration_secs();
+        // A slot holds one kind of clip. Assigning audio replaces any MIDI
+        // notes that were programmed there instead of layering both.
+        if !state.recorded_notes(track, scene).is_empty() {
+            state.clear_recorded(track, scene);
+            let _ = audio.command_tx.push(Command::SetRecordedClip {
+                track: track as u8,
+                scene: scene as u8,
+                clip: RecordedClip::default(),
+            });
+        }
+        state.set_sample_clip(track, scene, Some(Arc::clone(&clip)));
+        let _ = audio.sample_tx.push(crate::audio::SampleUpload {
+            track: track as u8,
+            scene: scene as u8,
+            sample: Some(Arc::clone(&clip.buffer)),
+        });
+        self.notify(format!(
+            "{} → track {:02} · slot {:02} ({:.2} s)",
+            name,
+            track + 1,
+            scene + 1,
+            duration
+        ));
+    }
+
+    /// Remove a sample from a clip slot and stop that slot's playback.
+    pub fn clear_sample(
+        &mut self,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+        track: usize,
+        scene: usize,
+    ) {
+        if state.sample_clip(track, scene).is_none() {
+            return;
+        }
+        state.set_sample_clip(track, scene, None);
+        let _ = audio.sample_tx.push(crate::audio::SampleUpload {
+            track: track as u8,
+            scene: scene as u8,
+            sample: None,
+        });
+        self.notify(format!(
+            "Sample cleared from track {:02} · slot {:02}",
+            track + 1,
+            scene + 1
+        ));
+    }
+
+    /// Audition the edited sample through the master bus.
+    pub fn preview_sample(&mut self, audio: &mut AudioRuntime) {
+        let Some(editor) = &mut self.sample_editor else {
+            return;
+        };
+        let clip = editor.to_clip(audio.sample_rate);
+        let _ = audio.sample_tx.push(crate::audio::SampleUpload {
+            track: crate::audio::PREVIEW_TRACK,
+            scene: 0,
+            sample: Some(Arc::clone(&clip.buffer)),
+        });
+        self.preview_started = Some(Instant::now());
+    }
+
+    pub fn stop_preview(&mut self, audio: &mut AudioRuntime) {
+        let _ = audio.command_tx.push(Command::StopPreview);
+        self.preview_started = None;
     }
 
     /// Per-frame service pump.
@@ -470,6 +627,11 @@ impl Studio {
     ) -> Result<(), String> {
         let project = Project::load(path)?;
 
+        // Any editor from the previous project would point at stale audio.
+        self.sample_editor_open = false;
+        self.sample_editor = None;
+        self.preview_started = None;
+
         // Drop any current plugins first so state restore starts clean.
         for slot in 0..MAX_PLUGIN_SLOTS {
             self.unload_plugin(slot, audio);
@@ -512,6 +674,18 @@ impl Studio {
         let _ = audio.command_tx.push(Command::SetMasterGain {
             gain: project.master_gain,
         });
+
+        // Drop samples from the previous project before loading this one.
+        state.clear_samples();
+        for track in 0..TRACK_COUNT {
+            for scene in 0..crate::audio::SCENE_COUNT {
+                let _ = audio.sample_tx.push(crate::audio::SampleUpload {
+                    track: track as u8,
+                    scene: scene as u8,
+                    sample: None,
+                });
+            }
+        }
 
         for (index, track) in project.tracks.iter().take(TRACK_COUNT).enumerate() {
             state.track_gain_db[index] = track.gain_db;
@@ -582,6 +756,36 @@ impl Studio {
                     scene: scene as u8,
                     active: entry.enabled,
                 });
+            }
+
+            for entry in &track.samples {
+                let scene = (entry.scene as usize).min(crate::audio::SCENE_COUNT - 1);
+                match DecodedSample::load(&entry.path) {
+                    Ok(mut sample) => {
+                        sample.edits = entry.edits();
+                        let clip = sample.to_clip(audio.sample_rate);
+                        // One clip kind per slot: a stale MIDI clip from a
+                        // hand-edited project must not play under the sample.
+                        if !state.recorded_notes(index, scene).is_empty() {
+                            state.clear_recorded(index, scene);
+                            let _ = audio.command_tx.push(Command::SetRecordedClip {
+                                track: index as u8,
+                                scene: scene as u8,
+                                clip: RecordedClip::default(),
+                            });
+                        }
+                        state.set_sample_clip(index, scene, Some(Arc::clone(&clip)));
+                        let _ = audio.sample_tx.push(crate::audio::SampleUpload {
+                            track: index as u8,
+                            scene: scene as u8,
+                            sample: Some(Arc::clone(&clip.buffer)),
+                        });
+                    }
+                    Err(error) => self.log_error(format!(
+                        "Could not restore sample '{}': {error}",
+                        entry.path.display()
+                    )),
+                }
             }
 
             if let Some(synth) = &track.synth {

@@ -3,6 +3,7 @@
 
 use std::collections::VecDeque;
 use std::f32::consts::TAU;
+use std::sync::Arc;
 
 use rtrb::Consumer;
 
@@ -12,6 +13,7 @@ use crate::audio::{
     TRACK_COUNT,
 };
 use crate::dsp::spectrum::SpectrumAnalyzer;
+use crate::samples::SampleClip;
 
 pub const MAX_SCOPE: usize = 4096;
 
@@ -133,12 +135,16 @@ pub struct UiState {
     pub recorded: [[Vec<RecordedNote>; SCENE_COUNT]; TRACK_COUNT],
     /// Loop region of each clip, as `(start, end)` in 16th notes.
     pub clip_loop: [[(u16, u16); SCENE_COUNT]; TRACK_COUNT],
+    /// Audio sample assigned to each session slot, if any.
+    pub sample_slots: [[Option<Arc<SampleClip>>; SCENE_COUNT]; TRACK_COUNT],
     pub recording: bool,
     pub record_track: u8,
     pub input_track: u8,
     pub recorded_total: u16,
     pub plugin_latency: u16,
     pub plugin_midi: bool,
+    /// Engine playhead of each track's launched clip, in 16th notes.
+    pub clip_steps: [u16; TRACK_COUNT],
 }
 
 impl Default for UiState {
@@ -186,12 +192,14 @@ impl UiState {
             hovered_scene: None,
             recorded: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
             clip_loop: [[(0, crate::audio::LOOP_STEPS as u16); SCENE_COUNT]; TRACK_COUNT],
+            sample_slots: std::array::from_fn(|_| std::array::from_fn(|_| None)),
             recording: false,
             record_track: 0,
             input_track: 0,
             recorded_total: 0,
             plugin_latency: 0,
             plugin_midi: true,
+            clip_steps: [0; TRACK_COUNT],
         }
     }
 
@@ -204,6 +212,7 @@ impl UiState {
         self.record_track = frame.record_track;
         self.recorded_total = frame.recorded_notes;
         self.plugin_latency = frame.plugin_latency;
+        self.clip_steps = frame.clip_steps;
         self.cpu += (frame.cpu_load - self.cpu) * 0.22;
 
         let decay = (-dt.max(0.001) * 7.5).exp();
@@ -254,6 +263,17 @@ impl UiState {
         }
     }
 
+    /// Engine phase of the clip currently launched on `track`, if `scene` is
+    /// the slot that is playing. `None` means this clip is not the one the
+    /// engine is advancing, so there is no honest playhead to draw.
+    pub fn clip_phase(&self, track: usize, scene: usize) -> Option<u16> {
+        if self.launched.get(track).copied().flatten() == Some(scene as u8) {
+            self.clip_steps.get(track).copied()
+        } else {
+            None
+        }
+    }
+
     /// Loop region of a clip, never empty and always inside the 16-bar loop.
     pub fn clip_loop(&self, track: usize, scene: usize) -> (u16, u16) {
         let total = crate::audio::LOOP_STEPS as u16;
@@ -282,6 +302,28 @@ impl UiState {
         if let Some(slot) = self.clip_loop.get_mut(track).and_then(|s| s.get_mut(scene)) {
             *slot = (lo, hi);
         }
+    }
+
+    /// Audio sample assigned to a session slot.
+    pub fn sample_clip(&self, track: usize, scene: usize) -> Option<&Arc<SampleClip>> {
+        self.sample_slots
+            .get(track)
+            .and_then(|slots| slots.get(scene))
+            .and_then(|slot| slot.as_ref())
+    }
+
+    pub fn set_sample_clip(&mut self, track: usize, scene: usize, sample: Option<Arc<SampleClip>>) {
+        if let Some(slot) = self
+            .sample_slots
+            .get_mut(track)
+            .and_then(|slots| slots.get_mut(scene))
+        {
+            *slot = sample;
+        }
+    }
+
+    pub fn clear_samples(&mut self) {
+        self.sample_slots = std::array::from_fn(|_| std::array::from_fn(|_| None));
     }
 
     pub fn recorded_notes(&self, track: usize, scene: usize) -> &[RecordedNote] {
@@ -538,6 +580,40 @@ mod tests {
             state.ingest(t, 1.0 / 60.0);
         }
         assert!(state.peaks[0] < 0.01, "peak {}", state.peaks[0]);
+    }
+
+    #[test]
+    fn clip_phase_is_only_reported_for_the_launched_slot() {
+        let mut state = UiState::new();
+        state.launched[2] = Some(3);
+        state.clip_steps[2] = 41;
+        assert_eq!(state.clip_phase(2, 3), Some(41));
+        assert_eq!(state.clip_phase(2, 2), None);
+        assert_eq!(state.clip_phase(0, 3), None);
+    }
+
+    #[test]
+    fn sample_slots_are_addressed_by_track_and_scene() {
+        let mut state = UiState::new();
+        let clip = std::sync::Arc::new(crate::samples::SampleClip {
+            path: std::path::PathBuf::from("/tmp/kick.wav"),
+            name: "kick".to_string(),
+            source: std::sync::Arc::new(vec![0.0; 4]),
+            source_rate: 48_000,
+            source_frames: 2,
+            edits: crate::samples::SampleEdits::default(),
+            buffer: std::sync::Arc::new(crate::audio::SampleBuffer {
+                frames: vec![0.0; 4],
+                sample_rate: 48_000,
+            }),
+            peaks: vec![0.5],
+        });
+        state.set_sample_clip(1, 4, Some(clip));
+        assert!(state.sample_clip(1, 4).is_some());
+        assert!(state.sample_clip(1, 3).is_none());
+        assert!(state.sample_clip(0, 4).is_none());
+        state.set_sample_clip(1, 4, None);
+        assert!(state.sample_clip(1, 4).is_none());
     }
 
     #[test]

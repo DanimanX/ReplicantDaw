@@ -1,10 +1,13 @@
 //! Session view (clip matrix) and mixer strips.
 
+use std::sync::Arc;
+
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use crate::audio::{
     db_to_gain, gain_to_db, AudioRuntime, Command, SCENE_COUNT, TRACKS, TRACK_COUNT,
 };
+use crate::samples::SampleClip;
 use crate::state::UiState;
 use crate::studio::Studio;
 use crate::theme;
@@ -179,6 +182,7 @@ pub fn draw_matrix(
             let launched = state.launched[track] == Some(scene as u8);
             let active = launched && state.playing;
             let hovered = response.hovered();
+            let sample_hover = response.dnd_hover_payload::<Arc<SampleClip>>().is_some();
             if hovered {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -195,8 +199,16 @@ pub fn draw_matrix(
                 cell,
                 CornerRadius::same(2),
                 Stroke::new(
-                    if launched { 1.2 } else { 1.0 },
-                    if launched {
+                    if sample_hover {
+                        1.8
+                    } else if launched {
+                        1.2
+                    } else {
+                        1.0
+                    },
+                    if sample_hover {
+                        theme::MAGENTA
+                    } else if launched {
                         accent
                     } else if hovered {
                         theme::accent_alpha(accent, 110)
@@ -218,14 +230,42 @@ pub fn draw_matrix(
             // Slot content: this slot's own MIDI clip, or the generative
             // pattern preview when the slot is empty.
             let notes = state.recorded_notes(track, scene);
+            let sample = state.sample_clip(track, scene).cloned();
             let has_clip = !notes.is_empty();
+            let has_sample = sample.is_some();
             let clip_enabled = state.recorded_active[track][scene];
             let wave_rect = Rect::from_min_max(
                 Pos2::new(cell.left() + 5.0, cell.top() + 5.0),
                 Pos2::new(cell.right() - 5.0, cell.bottom() - 8.0),
             );
             if wave_rect.width() > 8.0 && wave_rect.height() > 6.0 {
-                if has_clip {
+                if let Some(sample) = &sample {
+                    let wave = Rect::from_min_max(
+                        Pos2::new(wave_rect.left(), wave_rect.top() + 6.0),
+                        wave_rect.max,
+                    );
+                    draw_sample_wave(
+                        ui.painter(),
+                        wave,
+                        sample,
+                        if clip_enabled {
+                            theme::accent_alpha(theme::MAGENTA, 220)
+                        } else {
+                            theme::accent_alpha(theme::MAGENTA, 70)
+                        },
+                    );
+                    ui.painter().text(
+                        Pos2::new(wave_rect.left(), wave_rect.top()),
+                        Align2::LEFT_TOP,
+                        format!("SAMPLE · {}", sample.extension()),
+                        theme::display(5.8),
+                        if clip_enabled {
+                            theme::MAGENTA
+                        } else {
+                            theme::TEXT_FAINT
+                        },
+                    );
+                } else if has_clip {
                     mini_roll(
                         ui.painter(),
                         wave_rect,
@@ -266,9 +306,15 @@ pub fn draw_matrix(
                 }
             }
 
-            // Slot label: scene name or the MIDI clip summary.
+            // Slot label: scene name, sample or the MIDI clip summary.
             if cell.width() > 54.0 {
-                let label = if has_clip {
+                let label = if let Some(sample) = &sample {
+                    format!(
+                        "{:.1}s{}",
+                        sample.duration_secs(),
+                        if clip_enabled { "" } else { " · MUTED" }
+                    )
+                } else if has_clip {
                     format!(
                         "MIDI · {}N{}",
                         notes.len(),
@@ -282,8 +328,10 @@ pub fn draw_matrix(
                     Align2::LEFT_BOTTOM,
                     label,
                     theme::mono(6.0),
-                    if has_clip && !clip_enabled {
+                    if (has_clip || has_sample) && !clip_enabled {
                         theme::AMBER
+                    } else if has_sample {
+                        theme::accent_alpha(theme::MAGENTA, 200)
                     } else if launched {
                         theme::accent_alpha(accent, 200)
                     } else {
@@ -319,10 +367,44 @@ pub fn draw_matrix(
                 );
             }
 
+            if let Some(payload) = response.dnd_release_payload::<Arc<SampleClip>>() {
+                let clip = (*payload).clone();
+                studio.assign_sample(state, audio, track, scene, clip);
+            }
+
+            let mut edit_sample = false;
+            let mut clear_sample = false;
+            if sample.is_some() {
+                response.context_menu(|ui| {
+                    if ui
+                        .button(format!("EDIT SAMPLE · SLOT {:02}", scene + 1))
+                        .clicked()
+                    {
+                        edit_sample = true;
+                        ui.close();
+                    }
+                    if ui.button("CLEAR SAMPLE").clicked() {
+                        clear_sample = true;
+                        ui.close();
+                    }
+                });
+            }
+            if clear_sample {
+                studio.clear_sample(state, audio, track, scene);
+            }
+
             if response.double_clicked() {
                 state.selected_track = track;
-                studio.open_piano_roll(track, scene as u8);
-            } else if response.secondary_clicked() && !notes.is_empty() {
+                if let Some(sample) = &sample {
+                    studio.open_sample_editor_clip(sample);
+                } else {
+                    studio.open_piano_roll(track, scene as u8);
+                }
+            } else if edit_sample {
+                if let Some(sample) = &sample {
+                    studio.open_sample_editor_clip(sample);
+                }
+            } else if response.secondary_clicked() && has_clip && sample.is_none() {
                 state.recorded_active[track][scene] = !clip_enabled;
                 let _ = audio.command_tx.push(Command::SetRecordedActive {
                     track: track as u8,
@@ -344,12 +426,23 @@ pub fn draw_matrix(
                 }
             }
             if response.hovered() {
-                response.on_hover_text(format!(
-                    "{} · {} · slot {}\nclick = launch/stop · double-click = piano roll · right-click = mute clip",
-                    state.track_label(track),
-                    UiState::scene_name(scene),
-                    scene + 1
-                ));
+                if let Some(sample) = &sample {
+                    response.on_hover_text(format!(
+                        "{} · {} · slot {}\nsample {} · {:.2} s\nclick = launch/stop · double-click = edit sample · right-click = sample menu",
+                        state.track_label(track),
+                        UiState::scene_name(scene),
+                        scene + 1,
+                        sample.name,
+                        sample.duration_secs()
+                    ));
+                } else {
+                    response.on_hover_text(format!(
+                        "{} · {} · slot {}\nclick = launch/stop · double-click = piano roll · right-click = mute clip",
+                        state.track_label(track),
+                        UiState::scene_name(scene),
+                        scene + 1
+                    ));
+                }
             }
         }
     }
@@ -411,14 +504,17 @@ fn draw_midi_row(
             Sense::click(),
         );
         let notes = state.recorded_notes(track, scene);
+        let sample = state.sample_clip(track, scene).cloned();
         let has_clip = !notes.is_empty();
+        let has_sample = sample.is_some();
+        let has_content = has_clip || has_sample;
         let enabled = state.recorded_active[track][scene];
         let hovered = response.hovered();
         if hovered {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
-        let bg = if has_clip && enabled {
+        let bg = if has_content && enabled {
             Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 30)
         } else if hovered {
             theme::PANEL_RAISED
@@ -430,8 +526,8 @@ fn draw_midi_row(
             cell,
             CornerRadius::same(2),
             Stroke::new(
-                if has_clip { 1.1 } else { 1.0 },
-                if has_clip && enabled {
+                if has_content { 1.1 } else { 1.0 },
+                if has_content && enabled {
                     accent
                 } else if hovered {
                     theme::accent_alpha(accent, 120)
@@ -444,14 +540,14 @@ fn draw_midi_row(
         ui.painter().rect_filled(
             Rect::from_min_size(cell.min, Vec2::new(2.0, cell.height())),
             CornerRadius::same(1),
-            if has_clip && enabled {
+            if has_content && enabled {
                 accent
             } else {
                 theme::BORDER
             },
         );
 
-        let label_color = if has_clip && enabled {
+        let label_color = if has_content && enabled {
             theme::accent_alpha(accent, 230)
         } else {
             theme::TEXT_FAINT
@@ -459,12 +555,41 @@ fn draw_midi_row(
         ui.painter().text(
             Pos2::new(cell.left() + 5.0, cell.top() + 2.0),
             Align2::LEFT_TOP,
-            format!("MIDI {}/{}", scene + 1, SCENE_COUNT),
+            if has_sample {
+                format!("SAMPLE {}/{}", scene + 1, SCENE_COUNT)
+            } else {
+                format!("MIDI {}/{}", scene + 1, SCENE_COUNT)
+            },
             theme::display(6.4),
             label_color,
         );
 
-        if has_clip {
+        if let Some(sample) = &sample {
+            ui.painter().text(
+                Pos2::new(cell.right() - 4.0, cell.top() + 2.0),
+                Align2::RIGHT_TOP,
+                format!("{:.1} S", sample.duration_secs()),
+                theme::mono(5.8),
+                label_color,
+            );
+            let roll = Rect::from_min_max(
+                Pos2::new(cell.left() + 4.0, cell.top() + 11.0),
+                Pos2::new(cell.right() - 4.0, cell.bottom() - 3.0),
+            );
+            if roll.height() > 5.0 {
+                draw_sample_wave(ui.painter(), roll, sample, theme::accent_alpha(accent, 210));
+                if state.playing && enabled {
+                    let px = roll.left()
+                        + state.clip_phase(track, scene).unwrap_or(0) as f32
+                            / crate::audio::LOOP_STEPS as f32
+                            * roll.width();
+                    ui.painter().line_segment(
+                        [Pos2::new(px, roll.top()), Pos2::new(px, roll.bottom())],
+                        Stroke::new(1.0, theme::CYAN),
+                    );
+                }
+            }
+        } else if has_clip {
             ui.painter().text(
                 Pos2::new(cell.right() - 4.0, cell.top() + 2.0),
                 Align2::RIGHT_TOP,
@@ -489,8 +614,13 @@ fn draw_midi_row(
                     enabled,
                 );
                 if state.playing && enabled {
-                    let progress = (beats / (crate::audio::LOOP_BARS as f32 * 4.0)).clamp(0.0, 1.0);
-                    let px = roll.left() + progress * roll.width();
+                    let (loop_start, loop_end) = state.clip_loop(track, scene);
+                    let phase = state
+                        .clip_phase(track, scene)
+                        .unwrap_or(loop_start)
+                        .clamp(loop_start, loop_end.saturating_sub(1));
+                    let px =
+                        roll.left() + phase as f32 / crate::audio::LOOP_STEPS as f32 * roll.width();
                     ui.painter().line_segment(
                         [Pos2::new(px, roll.top()), Pos2::new(px, roll.bottom())],
                         Stroke::new(1.0, theme::CYAN),
@@ -517,27 +647,42 @@ fn draw_midi_row(
         }
 
         let open_roll = response.double_clicked();
-        let toggle_mute = !open_roll && response.clicked() && has_clip;
+        let toggle_mute = !open_roll && response.clicked() && has_content;
         let select = response.clicked() || open_roll;
         if open_roll {
-            studio.open_piano_roll(track, scene as u8);
+            if let Some(sample) = &sample {
+                studio.open_sample_editor_clip(sample);
+            } else {
+                studio.open_piano_roll(track, scene as u8);
+            }
         }
         if response.hovered() {
-            response.on_hover_text(if has_clip {
-                format!(
-                    "{} · slot {} · {} note(s) · click to {} · double-click to edit",
+            if let Some(sample) = &sample {
+                response.on_hover_text(format!(
+                    "{} · slot {} · sample {} · {:.2} s · click to {} · double-click to edit",
                     state.track_label(track),
                     scene + 1,
-                    notes.len(),
+                    sample.name,
+                    sample.duration_secs(),
                     if enabled { "mute" } else { "enable" }
-                )
+                ));
             } else {
-                format!(
-                    "{} · slot {} has no MIDI clip. Double-click to program it.",
-                    state.track_label(track),
-                    scene + 1
-                )
-            });
+                response.on_hover_text(if has_clip {
+                    format!(
+                        "{} · slot {} · {} note(s) · click to {} · double-click to edit",
+                        state.track_label(track),
+                        scene + 1,
+                        notes.len(),
+                        if enabled { "mute" } else { "enable" }
+                    )
+                } else {
+                    format!(
+                        "{} · slot {} has no MIDI clip. Double-click to program it.",
+                        state.track_label(track),
+                        scene + 1
+                    )
+                });
+            }
         }
 
         if select {
@@ -793,4 +938,31 @@ fn pan_text(pan: f32) -> String {
     } else {
         format!("R{:.0}", pan * 100.0)
     }
+}
+
+/// Draw the coarse sample envelope cached on the clip.
+fn draw_sample_wave(painter: &egui::Painter, rect: Rect, sample: &SampleClip, color: Color32) {
+    if rect.width() < 4.0 || rect.height() < 3.0 || sample.peaks.is_empty() {
+        return;
+    }
+    let mid = rect.center().y;
+    let amp = rect.height() * 0.46;
+    let width = rect.width().floor().max(1.0) as usize;
+    let buckets = sample.peaks.len();
+    for x in 0..width {
+        let bucket = (x * buckets / width).min(buckets - 1);
+        let value = sample.peaks[bucket].clamp(0.0, 1.0);
+        let px = rect.left() + x as f32;
+        painter.line_segment(
+            [
+                Pos2::new(px, mid - value * amp),
+                Pos2::new(px, mid + value * amp),
+            ],
+            Stroke::new(1.0, color),
+        );
+    }
+    painter.line_segment(
+        [Pos2::new(rect.left(), mid), Pos2::new(rect.right(), mid)],
+        Stroke::new(0.6, theme::accent_alpha(color, 45)),
+    );
 }

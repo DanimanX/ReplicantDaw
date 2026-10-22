@@ -3,6 +3,7 @@
 pub mod devices;
 pub mod lanes;
 pub mod piano_roll;
+pub mod samples;
 pub mod session;
 pub mod studio_windows;
 pub mod transport;

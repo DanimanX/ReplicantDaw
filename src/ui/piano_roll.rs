@@ -476,13 +476,19 @@ fn draw_grid(
                 );
             }
 
-            // Playhead.
-            let step = (state.beats() as f32 * 4.0).rem_euclid(LOOP_STEPS as f32);
-            let px = grid.left() + step * STEP_W;
-            painter.line_segment(
-                [Pos2::new(px, grid.top()), Pos2::new(px, grid.bottom())],
-                Stroke::new(1.4, theme::accent_alpha(theme::CYAN, 220)),
-            );
+            // Playhead: the engine's own clip phase, which wraps inside this
+            // loop. Using the global timeline position here made the cursor
+            // run past a short loop even though the audio repeated inside it.
+            if state.playing {
+                if let Some(phase) = state.clip_phase(track, scene) {
+                    let step = phase.clamp(loop_start, loop_end.saturating_sub(1)) as f32;
+                    let px = grid.left() + step * STEP_W;
+                    painter.line_segment(
+                        [Pos2::new(px, grid.top()), Pos2::new(px, grid.bottom())],
+                        Stroke::new(1.4, theme::accent_alpha(theme::CYAN, 220)),
+                    );
+                }
+            }
 
             // Debug aid for the headless UI harness: dump the geometry once.
             if std::env::var_os("REPLICANT_DEBUG_ROLL").is_some() {

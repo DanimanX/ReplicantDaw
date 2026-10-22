@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.2.3** · MIT, Linux, macOS and Windows.
+**Version 1.3.0** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -24,6 +24,24 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Plugin editor at full screen](docs/plugin-editor.png)
 
 ![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
+
+## What's new in 1.3.0
+
+- **The playhead follows the clip loop.** The piano roll, the session MIDI row
+  and the arrangement clip block now draw the engine's own clip phase, which
+  wraps inside the selected loop region. Previously they mapped the global
+  16-bar transport position, so the cursor kept running past a short loop
+  while the audio repeated inside it.
+- **Sample browser drawer.** The `SAMPLES` tab on the right of the clip matrix
+  opens a drawer that navigates folders and lists `.wav`, `.flac` and `.mp3`
+  files. Selecting a file opens the sample editor.
+- **Sample editor.** Waveform with draggable trim handles, gain, normalize,
+  reverse, fade in/out, a one-shot preview through the master bus, and live
+  re-rendering. Once rendered, the `DRAG TO A CLIP CELL` handle assigns the
+  sample to any session slot; the clip matrix draws its waveform and the audio
+  engine plays it on launch.
+- **Samples are saved with the project** (format v7) as a path plus edit
+  settings, and restored on load.
 
 ## Fixes in 1.2.3
 

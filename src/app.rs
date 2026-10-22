@@ -105,6 +105,9 @@ impl ReplicantApp {
                 studio.selected_slot = index.min(crate::plugins::MAX_PLUGIN_SLOTS - 1);
             }
         }
+        if let Ok(sample) = std::env::var("REPLICANT_DAW_SAMPLE") {
+            studio.open_sample_editor_path(std::path::Path::new(&sample));
+        }
         if let Ok(windows) = std::env::var("REPLICANT_DAW_SMOKE_WINDOWS") {
             for window in windows.split(',') {
                 match window.trim() {
@@ -121,6 +124,10 @@ impl ReplicantApp {
                         studio.piano_roll_scene = state.launched[state.selected_track].unwrap_or(0);
                     }
                     "audio" => studio.audio_editor_open = true,
+                    "samples" => {
+                        studio.sample_browser_open = true;
+                        studio.reload_sample_dir();
+                    }
                     "plugined" => {
                         studio.plugin_editor_track = state.selected_track;
                         studio.plugin_editor_open = true;
@@ -335,6 +342,7 @@ impl ReplicantApp {
             &mut self.studio,
             &mut self.audio,
         );
+        ui::samples::draw_browser(ui.ctx(), matrix_rect, &mut self.studio);
         ui::session::draw_mixer(
             ui,
             mixer_rect,

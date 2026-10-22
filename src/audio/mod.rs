@@ -12,8 +12,8 @@ pub use effects::EffectSlot;
 pub use engine::{Engine, EngineIo, DEFAULT_BPM, LOOP_BARS, MAX_VOICES, SAMPLE_RATE};
 pub use messages::{
     db_to_gain, gain_to_db, Command, EffectKind, EffectKnob, RecordEvent, RecordedClip,
-    RecordedNote, SynthParam, Telemetry, LOOP_STEPS, MAX_EFFECTS, MAX_RECORDED_NOTES, SCENE_COUNT,
-    STEPS_PER_BAR, TRACK_COUNT,
+    RecordedNote, SampleBuffer, SampleUpload, SynthParam, Telemetry, LOOP_STEPS, MAX_EFFECTS,
+    MAX_RECORDED_NOTES, PREVIEW_TRACK, SCENE_COUNT, STEPS_PER_BAR, TRACK_COUNT,
 };
 pub use midi::{MidiMessage, MidiRuntime};
 pub use stream::AudioRuntime;

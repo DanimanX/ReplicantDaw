@@ -4,6 +4,8 @@
 //! The UI never blocks the audio callback and the audio callback never
 //! allocates, locks or waits.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 pub const TRACK_COUNT: usize = 8;
@@ -13,6 +15,39 @@ pub const STEPS_PER_BAR: usize = 16;
 pub const LOOP_STEPS: usize = 256;
 /// Maximum notes stored in one recorded clip.
 pub const MAX_RECORDED_NOTES: usize = 512;
+
+/// Stereo interleaved frames at the engine's sample rate.
+///
+/// Uploaded to the audio thread inside an [`Arc`]: cloning and dropping the
+/// handle never allocates, so the real-time callback only pays an atomic.
+#[derive(Clone, Debug)]
+pub struct SampleBuffer {
+    pub frames: Vec<f32>,
+    pub sample_rate: u32,
+}
+
+impl SampleBuffer {
+    pub fn frame_count(&self) -> usize {
+        self.frames.len() / 2
+    }
+
+    pub fn duration_secs(&self) -> f32 {
+        self.frame_count() as f32 / self.sample_rate.max(1) as f32
+    }
+}
+
+/// Sample data moving from the UI to the engine.
+///
+/// A `track` of [`PREVIEW_TRACK`] loads the one-shot preview instead of a
+/// clip slot; `scene` is ignored in that case.
+pub const PREVIEW_TRACK: u8 = u8::MAX;
+
+#[derive(Clone, Debug)]
+pub struct SampleUpload {
+    pub track: u8,
+    pub scene: u8,
+    pub sample: Option<Arc<SampleBuffer>>,
+}
 
 /// A note captured by MIDI recording or loaded from a project.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,6 +486,8 @@ pub enum Command {
         scene: u8,
         clip: RecordedClip,
     },
+    /// Stop the editor's one-shot sample preview.
+    StopPreview,
     /// Loop region of one session clip, in 16th notes from the loop start.
     /// `start < end`; notes outside the region do not play.
     SetClipLoop {
@@ -506,6 +543,13 @@ pub struct Telemetry {
     pub record_track: u8,
     pub recorded_notes: u16,
     pub plugin_latency: u16,
+    /// Playhead of each track's launched clip, in 16th notes.
+    ///
+    /// This is the engine's own clip phase, which wraps inside the clip's
+    /// loop region; the global `position_frames` keeps running over the whole
+    /// 16-bar timeline. The UI draws this value so the cursor and the sound
+    /// agree even when the loop is shorter than the session.
+    pub clip_steps: [u16; TRACK_COUNT],
 }
 
 impl Default for Telemetry {
@@ -523,6 +567,7 @@ impl Default for Telemetry {
             record_track: 0,
             recorded_notes: 0,
             plugin_latency: 0,
+            clip_steps: [0; TRACK_COUNT],
         }
     }
 }

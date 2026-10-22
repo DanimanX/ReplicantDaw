@@ -11,16 +11,19 @@ use cpal::{FromSample, SampleFormat, SizedSample, Stream, StreamConfig, Supporte
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use super::engine::{Engine, EngineIo, SAMPLE_RATE};
-use super::messages::{Command, Telemetry};
+use super::messages::{Command, SampleUpload, Telemetry};
 
 const COMMAND_CAPACITY: usize = 1024;
 const TELEMETRY_CAPACITY: usize = 256;
 const SCOPE_CAPACITY: usize = 32_768;
+const SAMPLE_CAPACITY: usize = 256;
 
 pub struct AudioRuntime {
     pub command_tx: Producer<Command>,
     pub telemetry_rx: Consumer<Telemetry>,
     pub scope_rx: Consumer<f32>,
+    /// Rendered samples assigned to clip slots and the editor preview.
+    pub sample_tx: Producer<SampleUpload>,
     /// Human-readable host summary, e.g. `ALSA / Built-in Audio`.
     pub backend: String,
     pub device_name: String,
@@ -63,10 +66,12 @@ impl AudioRuntime {
         let (command_tx, command_rx) = RingBuffer::new(COMMAND_CAPACITY);
         let (telemetry_tx, telemetry_rx) = RingBuffer::new(TELEMETRY_CAPACITY);
         let (scope_tx, scope_rx) = RingBuffer::new(SCOPE_CAPACITY);
+        let (sample_tx, sample_rx) = RingBuffer::new(SAMPLE_CAPACITY);
 
         io.commands = Some(command_rx);
         io.telemetry = Some(telemetry_tx);
         io.scope = Some(scope_tx);
+        io.samples = Some(sample_rx);
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
@@ -101,6 +106,7 @@ impl AudioRuntime {
             command_tx,
             telemetry_rx,
             scope_rx,
+            sample_tx,
             backend: "SILENT CLOCK".into(),
             device_name: "No output device".into(),
             sample_rate: SAMPLE_RATE,
@@ -155,10 +161,12 @@ fn start_cpal(mut io: EngineIo) -> Result<AudioRuntime, (String, EngineIo)> {
     let (command_tx, command_rx) = RingBuffer::new(COMMAND_CAPACITY);
     let (telemetry_tx, telemetry_rx) = RingBuffer::new(TELEMETRY_CAPACITY);
     let (scope_tx, scope_rx) = RingBuffer::new(SCOPE_CAPACITY);
+    let (sample_tx, sample_rx) = RingBuffer::new(SAMPLE_CAPACITY);
 
     io.commands = Some(command_rx);
     io.telemetry = Some(telemetry_tx);
     io.scope = Some(scope_tx);
+    io.samples = Some(sample_rx);
     let engine = Engine::new_with_io(sample_rate as f32, io);
 
     let stream = build_stream(&device, config, sample_format, engine)
@@ -175,6 +183,7 @@ fn start_cpal(mut io: EngineIo) -> Result<AudioRuntime, (String, EngineIo)> {
         command_tx,
         telemetry_rx,
         scope_rx,
+        sample_tx,
         backend,
         device_name,
         sample_rate,

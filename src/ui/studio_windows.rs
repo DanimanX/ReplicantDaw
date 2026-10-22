@@ -222,6 +222,7 @@ pub fn draw_windows(
     draw_project(ctx, studio, state, audio);
     draw_synth_editor(ctx, studio, state, audio);
     draw_audio_editor(ctx, studio, state, audio);
+    crate::ui::samples::draw_editor(ctx, studio, audio);
     crate::ui::piano_roll::draw(ctx, studio, state, audio);
 }
 

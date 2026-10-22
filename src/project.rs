@@ -15,6 +15,8 @@
 //! - v5: the instrument slot is explicit (`empty` / `synth` / `plugin`).
 //!   v4 files map their `instrument_plugin` flag onto it and keep the synth
 //!   audible, because that was the only source back then.
+//! - v7: audio samples assigned to session slots, with their edit settings.
+//!   v6 files load with no samples.
 
 use std::path::{Path, PathBuf};
 
@@ -22,9 +24,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::messages::{EffectKind, RecordedNote, SynthParam, TRACK_COUNT};
 use crate::audio::{SynthParams, TRACKS};
+use crate::samples::SampleEdits;
 
 pub const PROJECT_EXTENSION: &str = "rproj";
-pub const PROJECT_FORMAT_VERSION: u32 = 6;
+pub const PROJECT_FORMAT_VERSION: u32 = 7;
 
 /// Editable FM synth settings stored per track.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,6 +113,42 @@ pub struct ProjectClip {
     pub loop_end: Option<u16>,
 }
 
+/// One audio sample assigned to a session slot.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectSample {
+    /// Session scene index (0-7).
+    pub scene: u8,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub gain_db: f32,
+    #[serde(default)]
+    pub trim_start: f32,
+    #[serde(default)]
+    pub trim_end: f32,
+    #[serde(default)]
+    pub fade_in: f32,
+    #[serde(default)]
+    pub fade_out: f32,
+    #[serde(default)]
+    pub reverse: bool,
+    #[serde(default)]
+    pub normalize: bool,
+}
+
+impl ProjectSample {
+    pub fn edits(&self) -> SampleEdits {
+        SampleEdits {
+            trim_start: self.trim_start,
+            trim_end: self.trim_end,
+            gain_db: self.gain_db,
+            fade_in: self.fade_in,
+            fade_out: self.fade_out,
+            reverse: self.reverse,
+            normalize: self.normalize,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectTrack {
     pub name: String,
@@ -125,6 +164,9 @@ pub struct ProjectTrack {
     /// Session clips, one per non-empty slot.
     #[serde(default)]
     pub clips: Vec<ProjectClip>,
+    /// Audio samples assigned to slots.
+    #[serde(default)]
+    pub samples: Vec<ProjectSample>,
     /// Legacy (v3) single clip. Migrated into `clips` on load.
     #[serde(default)]
     pub notes: Vec<RecordedNote>,
@@ -232,6 +274,7 @@ impl Default for Project {
                 solo: false,
                 scene: Some(crate::audio::DEFAULT_SCENES[index] as u8),
                 clips: Vec::new(),
+                samples: Vec::new(),
                 notes: Vec::new(),
                 clip_enabled: true,
                 clip_gain_db: 0.0,
@@ -422,6 +465,22 @@ impl Project {
                         }
                     })
                     .collect(),
+                samples: (0..crate::audio::SCENE_COUNT)
+                    .filter_map(|scene| {
+                        let clip = state.sample_clip(index, scene)?;
+                        Some(ProjectSample {
+                            scene: scene as u8,
+                            path: clip.path.clone(),
+                            gain_db: clip.edits.gain_db,
+                            trim_start: clip.edits.trim_start,
+                            trim_end: clip.edits.trim_end,
+                            fade_in: clip.edits.fade_in,
+                            fade_out: clip.edits.fade_out,
+                            reverse: clip.edits.reverse,
+                            normalize: clip.edits.normalize,
+                        })
+                    })
+                    .collect(),
                 notes: Vec::new(),
                 clip_enabled: true,
                 clip_gain_db: state.clip_gain_db[index],
@@ -529,6 +588,17 @@ mod tests {
             loop_start: Some(16),
             loop_end: Some(64),
         });
+        project.tracks[1].samples.push(ProjectSample {
+            scene: 5,
+            path: PathBuf::from("/samples/kick.wav"),
+            gain_db: -2.5,
+            trim_start: 0.05,
+            trim_end: 0.10,
+            fade_in: 0.01,
+            fade_out: 0.02,
+            reverse: true,
+            normalize: true,
+        });
         project.tracks[1].synth = Some(ProjectSynth {
             ratio: 2.5,
             index: 4.0,
@@ -566,6 +636,15 @@ mod tests {
         assert_eq!(loaded.tracks[1].clips[0].notes[0].start_step, 16);
         assert_eq!(loaded.tracks[1].clips[0].loop_start, Some(16));
         assert_eq!(loaded.tracks[1].clips[0].loop_end, Some(64));
+        assert_eq!(loaded.tracks[1].samples.len(), 1);
+        assert_eq!(loaded.tracks[1].samples[0].scene, 5);
+        assert_eq!(
+            loaded.tracks[1].samples[0].path,
+            PathBuf::from("/samples/kick.wav")
+        );
+        assert!((loaded.tracks[1].samples[0].gain_db + 2.5).abs() < 1e-6);
+        assert!(loaded.tracks[1].samples[0].reverse);
+        assert!(loaded.tracks[1].samples[0].normalize);
         assert_eq!(loaded.effects.len(), 5);
         assert_eq!(loaded.effects[4].kind, "DELAY");
         assert!((loaded.master_gain - 0.75).abs() < 1e-6);

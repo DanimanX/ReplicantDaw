@@ -296,13 +296,13 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
                     enabled,
                 );
                 if state.playing && enabled {
-                    // Playhead inside the loop region.
-                    let progress = (state.playhead_beats()
-                        / (crate::audio::LOOP_BARS as f32 * 4.0))
-                        .clamp(0.0, 1.0);
-                    let loop_x0 = roll.left() + loop_start as f32 / steps_total * roll.width();
-                    let loop_w = (loop_end - loop_start) as f32 / steps_total * roll.width();
-                    let px = loop_x0 + progress * loop_w;
+                    // The engine's clip phase already wraps inside the loop,
+                    // so map that step straight onto the clip block.
+                    let phase = state
+                        .clip_phase(track, scene)
+                        .unwrap_or(loop_start)
+                        .clamp(loop_start, loop_end.saturating_sub(1));
+                    let px = roll.left() + phase as f32 / steps_total * roll.width();
                     ui.painter().line_segment(
                         [Pos2::new(px, roll.top()), Pos2::new(px, roll.bottom())],
                         Stroke::new(1.0, theme::CYAN),
@@ -311,9 +311,66 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
             }
         }
 
-        // Audio clip blocks, one per four bars.
+        // Audio samples live in their slot's loop region, like MIDI clips.
+        let sample = state.sample_clip(track, scene).cloned();
+        if let Some(sample) = &sample {
+            let steps_total = crate::audio::LOOP_STEPS as f32;
+            let (loop_start, loop_end) = state.clip_loop(track, scene);
+            let x0 = lane.left() + loop_start as f32 / steps_total * lane.width();
+            let x1 = lane.left() + loop_end as f32 / steps_total * lane.width();
+            let block = Rect::from_min_max(
+                Pos2::new(x0 + 1.5, lane.top() + 1.5),
+                Pos2::new(x1 - 1.5, lane.bottom() - 1.5),
+            );
+            ui.painter().rect_filled(
+                block,
+                CornerRadius::same(2),
+                theme::accent_alpha(theme::MAGENTA, 16),
+            );
+            ui.painter().rect_stroke(
+                block,
+                CornerRadius::same(2),
+                Stroke::new(1.0, theme::accent_alpha(theme::MAGENTA, 150)),
+                egui::StrokeKind::Inside,
+            );
+            let wave = Rect::from_min_max(
+                Pos2::new(block.left() + 4.0, block.top() + 9.0),
+                Pos2::new(block.right() - 4.0, block.bottom() - 2.0),
+            );
+            if wave.width() > 6.0 && wave.height() > 4.0 {
+                draw_peaks(ui.painter(), wave, &sample.peaks, theme::MAGENTA);
+            }
+            let sample_hit = ui.interact(
+                block,
+                ui.scope_id().with(("arr_sample", track)),
+                Sense::click(),
+            );
+            let edit_sample = sample_hit.double_clicked();
+            if sample_hit.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                sample_hit.on_hover_text(format!(
+                    "{} · sample {} · {:.2} s · double-click to edit",
+                    state.track_label(track),
+                    sample.name,
+                    sample.duration_secs()
+                ));
+            }
+            if edit_sample {
+                state.selected_track = track;
+                studio.open_sample_editor_clip(sample);
+            }
+            ui.painter().text(
+                Pos2::new(block.left() + 6.0, block.top() + 1.0),
+                Align2::LEFT_TOP,
+                format!("SAMPLE · {}", sample.extension()),
+                theme::display(5.8),
+                theme::MAGENTA,
+            );
+        }
+
+        // Audio clip blocks, one per four bars (generative slots only).
         let block_bars = 4usize;
-        let blocks = if launched.is_some() && notes.is_empty() {
+        let blocks = if launched.is_some() && notes.is_empty() && sample.is_none() {
             TIMELINE_BARS / block_bars
         } else {
             0
@@ -401,7 +458,9 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
         }
         if lane_hit.double_clicked() {
             state.selected_track = track;
-            if notes.is_empty() {
+            if let Some(sample) = &sample {
+                studio.open_sample_editor_clip(sample);
+            } else if notes.is_empty() {
                 studio.open_audio_editor(track);
             } else {
                 studio.open_piano_roll(track, launched.unwrap_or(0));
@@ -664,4 +723,26 @@ fn heat(value: f32, shade: f32) -> Color32 {
         (color[1] * shade) as u8,
         (color[2] * shade) as u8,
     )
+}
+
+/// Draw a cached sample envelope with one vertical span per pixel.
+fn draw_peaks(painter: &egui::Painter, rect: Rect, peaks: &[f32], color: Color32) {
+    if peaks.is_empty() || rect.width() < 2.0 {
+        return;
+    }
+    let mid = rect.center().y;
+    let amp = rect.height() * 0.46;
+    let width = rect.width().floor().max(1.0) as usize;
+    for x in 0..width {
+        let bucket = (x * peaks.len() / width).min(peaks.len() - 1);
+        let value = peaks[bucket].clamp(0.0, 1.0);
+        let px = rect.left() + x as f32;
+        painter.line_segment(
+            [
+                Pos2::new(px, mid - value * amp),
+                Pos2::new(px, mid + value * amp),
+            ],
+            Stroke::new(1.0, theme::accent_alpha(color, 200)),
+        );
+    }
 }

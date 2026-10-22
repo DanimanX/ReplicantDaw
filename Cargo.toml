@@ -1,6 +1,6 @@
 [package]
 name = "replicant-daw"
-version = "1.2.3"
+version = "1.3.0"
 edition = "2021"
 rust-version = "1.85"
 description = "A cyberpunk DAW prototype: real-time FM synthesis and a neon interface."
@@ -13,6 +13,8 @@ egui = "0.37"
 cpal = "0.18"
 rtrb = "0.4"
 rustfft = "6.4"
+# WAV / FLAC / MP3 decoding for the sample browser. Codec crates are pure Rust.
+symphonia = { version = "0.6", default-features = false, features = ["wav", "flac", "mp3", "pcm"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"

@@ -7,9 +7,12 @@
 use rtrb::{Consumer, Producer};
 
 use super::effects::EffectSlot;
+use std::sync::Arc;
+
 use super::messages::{
-    db_to_gain, Command, EffectKind, RecordEvent, RecordedClip, RecordedNote, Telemetry,
-    LOOP_STEPS, MAX_EFFECTS, SCENE_COUNT, STEPS_PER_BAR, TRACK_COUNT,
+    db_to_gain, Command, EffectKind, RecordEvent, RecordedClip, RecordedNote, SampleBuffer,
+    SampleUpload, Telemetry, LOOP_STEPS, MAX_EFFECTS, PREVIEW_TRACK, SCENE_COUNT, STEPS_PER_BAR,
+    TRACK_COUNT,
 };
 use super::midi::MidiMessage;
 use super::synth::{SynthParams, Voice};
@@ -38,6 +41,13 @@ fn empty_clip_grid() -> Box<[RecordedClip]> {
     clips.into_boxed_slice()
 }
 
+/// Heap-allocated sample slots, one per session clip.
+fn empty_sample_grid() -> Box<[Option<Arc<SampleBuffer>>]> {
+    let mut samples = Vec::with_capacity(TRACK_COUNT * SCENE_COUNT);
+    samples.resize_with(TRACK_COUNT * SCENE_COUNT, || None);
+    samples.into_boxed_slice()
+}
+
 struct TrackState {
     gain: Smoothed,
     pan: Smoothed,
@@ -50,6 +60,8 @@ struct TrackState {
     scene: usize,
     /// Playhead inside the launched clip's loop region.
     clip_step: u16,
+    /// Playback position of the slot's audio sample, in frames.
+    sample_pos: usize,
     peak: f32,
 }
 
@@ -67,6 +79,7 @@ impl TrackState {
             active: true,
             scene: super::tracks::DEFAULT_SCENES[index],
             clip_step: 0,
+            sample_pos: 0,
             peak: 0.0,
         }
     }
@@ -84,6 +97,8 @@ pub struct EngineIo {
     pub plugin_input: Option<Producer<PluginBlock>>,
     /// Processed audio returned by the plugin worker.
     pub plugin_output: Option<Consumer<PluginBlock>>,
+    /// Rendered samples assigned to clip slots and the editor preview.
+    pub samples: Option<Consumer<SampleUpload>>,
 }
 
 pub struct Engine {
@@ -138,6 +153,13 @@ pub struct Engine {
     plugin_offs: [(u8, u8, u16); 128],
     plugin_off_count: usize,
     last_midi_note: u8,
+    sample_rx: Option<Consumer<SampleUpload>>,
+    /// One audio sample per (track, scene) clip.
+    clip_samples: Box<[Option<Arc<SampleBuffer>>]>,
+    /// One-shot sample preview from the editor.
+    preview: Option<Arc<SampleBuffer>>,
+    preview_pos: usize,
+    preview_playing: bool,
 }
 
 impl Engine {
@@ -215,6 +237,11 @@ impl Engine {
             plugin_offs: [(0, 0, 0); 128],
             plugin_off_count: 0,
             last_midi_note: 60,
+            sample_rx: io.samples,
+            clip_samples: empty_sample_grid(),
+            preview: None,
+            preview_pos: 0,
+            preview_playing: false,
         }
         .with_default_chain()
     }
@@ -305,6 +332,7 @@ impl Engine {
     /// Render interleaved stereo audio. The slice length must be even.
     pub fn process(&mut self, out: &mut [f32]) {
         self.drain_commands();
+        self.drain_samples();
         self.drain_midi();
 
         let frames = out.len() / 2;
@@ -338,6 +366,29 @@ impl Engine {
                 if track < TRACK_COUNT {
                     track_l[track] += sample;
                     track_r[track] += sample;
+                }
+            }
+
+            // Audio samples play from their clip slot, one-shot per launch
+            // (and retriggered when the 16-bar session wraps).
+            if self.playing {
+                for index in 0..TRACK_COUNT {
+                    if !self.tracks[index].active {
+                        continue;
+                    }
+                    let scene = self.tracks[index].scene.min(SCENE_COUNT - 1);
+                    if !self.recorded_active[index][scene] {
+                        continue;
+                    }
+                    let Some(sample) = self.clip_samples[clip_index(index, scene)].as_ref() else {
+                        continue;
+                    };
+                    let position = self.tracks[index].sample_pos;
+                    if position < sample.frame_count() {
+                        track_l[index] += sample.frames[position * 2];
+                        track_r[index] += sample.frames[position * 2 + 1];
+                        self.tracks[index].sample_pos = position + 1;
+                    }
                 }
             }
 
@@ -395,6 +446,30 @@ impl Engine {
             } else {
                 self.mix_master(&track_l, &track_r)
             };
+
+            // The editor's preview is independent of the session: it is not
+            // routed through a track and is added after the master chain.
+            if self.preview_playing {
+                let frame = self.preview.as_ref().and_then(|sample| {
+                    let position = self.preview_pos;
+                    if position < sample.frame_count() {
+                        Some((sample.frames[position * 2], sample.frames[position * 2 + 1]))
+                    } else {
+                        None
+                    }
+                });
+                match frame {
+                    Some((preview_l, preview_r)) => {
+                        l += preview_l;
+                        r += preview_r;
+                        self.preview_pos += 1;
+                    }
+                    None => {
+                        self.preview_playing = false;
+                        self.preview_pos = 0;
+                    }
+                }
+            }
 
             // Third-party plugins can overshoot; keep the output guard last.
             l = if l.is_finite() {
@@ -538,6 +613,7 @@ impl Engine {
                 self.recorded.iter().map(|clip| clip.len).sum()
             },
             plugin_latency: self.plugin_latency,
+            clip_steps: std::array::from_fn(|track| self.tracks[track].clip_step),
         };
         if let Some(tx) = &mut self.telemetry_tx {
             // The UI drains at display rate. If it ever falls behind, dropping
@@ -560,6 +636,34 @@ impl Engine {
         self.command_rx = Some(rx);
     }
 
+    /// Receive rendered sample buffers from the UI.
+    ///
+    /// Replacing a slot drops the engine's handle to the previous buffer on
+    /// the audio thread, but only for an explicit UI edit.
+    fn drain_samples(&mut self) {
+        let Some(mut rx) = self.sample_rx.take() else {
+            return;
+        };
+        for _ in 0..64 {
+            match rx.pop() {
+                Ok(upload) => {
+                    if upload.track == PREVIEW_TRACK {
+                        self.preview = upload.sample;
+                        self.preview_pos = 0;
+                        self.preview_playing = self.preview.is_some();
+                    } else if (upload.track as usize) < TRACK_COUNT {
+                        let track = upload.track as usize;
+                        let scene = (upload.scene as usize).min(SCENE_COUNT - 1);
+                        self.clip_samples[clip_index(track, scene)] = upload.sample;
+                        self.tracks[track].sample_pos = 0;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        self.sample_rx = Some(rx);
+    }
+
     pub fn apply(&mut self, command: Command) {
         match command {
             Command::Play => {
@@ -577,10 +681,13 @@ impl Engine {
                 for track in 0..TRACK_COUNT {
                     let scene = self.tracks[track].scene.min(SCENE_COUNT - 1);
                     self.tracks[track].clip_step = self.clip_loop[track][scene].0;
+                    self.tracks[track].sample_pos = 0;
                 }
                 for voice in &mut self.voices {
                     voice.release();
                 }
+                self.preview_playing = false;
+                self.preview_pos = 0;
                 // Release any notes still held by a hosted instrument.
                 for index in 0..self.plugin_off_count {
                     let (bus, note, _) = self.plugin_offs[index];
@@ -625,6 +732,7 @@ impl Engine {
                         // A launched clip restarts at the beginning of its
                         // loop region, like a clip launch in any DAW.
                         t.clip_step = self.clip_loop[track as usize][scene as usize].0;
+                        t.sample_pos = 0;
                     }
                 }
             }
@@ -689,6 +797,10 @@ impl Engine {
                 let end = hi.clamp(start + 1, total);
                 self.clip_loop[track][scene] = (start, end);
                 self.tracks[track].clip_step = self.tracks[track].clip_step.clamp(start, end - 1);
+            }
+            Command::StopPreview => {
+                self.preview_playing = false;
+                self.preview_pos = 0;
             }
             Command::SetPluginMidi { enabled } => {
                 self.plugin_midi = enabled;
@@ -833,6 +945,11 @@ impl Engine {
             self.position = 0;
             self.last_step = u64::MAX;
             self.loop_step = 0;
+            // A new pass over the 16 bars retriggers sample clips, matching
+            // the MIDI clips that restart inside their loop regions.
+            for track in &mut self.tracks {
+                track.sample_pos = 0;
+            }
             for index in 0..self.plugin_off_count {
                 let (bus, note, _) = self.plugin_offs[index];
                 let offset = self.plugin_pending.frames.saturating_sub(1);
@@ -867,10 +984,10 @@ impl Engine {
             // plays inside its loop region on its own playhead.
             let scene = self.tracks[track].scene.min(SCENE_COUNT - 1);
             let clip = *self.clip(track, scene);
+            let (start, end) = self.clip_loop[track][scene];
+            let region = (end - start).max(1);
+            let phase = self.tracks[track].clip_step.clamp(start, end - 1);
             if !clip.is_empty() {
-                let (start, end) = self.clip_loop[track][scene];
-                let region = (end - start).max(1);
-                let phase = self.tracks[track].clip_step.clamp(start, end - 1);
                 let muted = !self.recorded_active[track][scene];
 
                 if !muted {
@@ -893,6 +1010,17 @@ impl Engine {
                 // Advance the clip playhead, wrapping inside the region.
                 let next = phase + 1;
                 self.tracks[track].clip_step = if next >= end { start } else { next };
+                continue;
+            }
+
+            // Empty slots can still hold an audio sample. Their playhead has
+            // to advance too, so the waveform cursor follows the audio.
+            let next = phase + 1;
+            self.tracks[track].clip_step = if next >= end { start } else { next };
+
+            // A sample slot replaces the generative pattern: otherwise the
+            // internal synth would keep playing under the dragged sample.
+            if self.clip_samples[clip_index(track, scene)].is_some() {
                 continue;
             }
 
@@ -1205,6 +1333,99 @@ mod tests {
         let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
         assert!(peak > 0.05, "peak too low: {peak}");
         assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn sample_clip_plays_when_its_slot_is_launched() {
+        let (mut sample_tx, sample_rx) = RingBuffer::new(4);
+        let mut engine = Engine::new_with_io(
+            48_000.0,
+            EngineIo {
+                samples: Some(sample_rx),
+                ..EngineIo::default()
+            },
+        );
+        // Silence the internal synths: only the sample should make sound.
+        for track in 0..TRACK_COUNT {
+            engine.apply(Command::SetTrackSynth {
+                track: track as u8,
+                enabled: false,
+            });
+        }
+        engine.apply(Command::Play);
+
+        let frames = 9_600usize;
+        let mut data = Vec::with_capacity(frames * 2);
+        for index in 0..frames {
+            let value = (std::f32::consts::TAU * 440.0 * index as f32 / 48_000.0).sin() * 0.5;
+            data.push(value);
+            data.push(value);
+        }
+        sample_tx
+            .push(SampleUpload {
+                track: 0,
+                scene: 2,
+                sample: Some(Arc::new(SampleBuffer {
+                    frames: data,
+                    sample_rate: 48_000,
+                })),
+            })
+            .expect("queue sample");
+        engine.apply(Command::LaunchClip { track: 0, scene: 2 });
+
+        let out = render(&mut engine, 1024);
+        let peak = out
+            .iter()
+            .fold(0.0_f32, |max, sample| max.max(sample.abs()));
+        assert!(peak > 0.05, "sample produced no audio: {peak}");
+        assert!(engine.tracks[0].sample_pos > 0);
+    }
+
+    #[test]
+    fn preview_plays_without_a_session_clip() {
+        let (mut sample_tx, sample_rx) = RingBuffer::new(4);
+        let mut engine = Engine::new_with_io(
+            48_000.0,
+            EngineIo {
+                samples: Some(sample_rx),
+                ..EngineIo::default()
+            },
+        );
+        for track in 0..TRACK_COUNT {
+            engine.apply(Command::SetTrackSynth {
+                track: track as u8,
+                enabled: false,
+            });
+        }
+        // Not playing: the preview must sound on its own.
+        let frames = 4_800usize;
+        let mut data = Vec::with_capacity(frames * 2);
+        for index in 0..frames {
+            let value = (std::f32::consts::TAU * 220.0 * index as f32 / 48_000.0).sin() * 0.5;
+            data.push(value);
+            data.push(value);
+        }
+        sample_tx
+            .push(SampleUpload {
+                track: PREVIEW_TRACK,
+                scene: 0,
+                sample: Some(Arc::new(SampleBuffer {
+                    frames: data,
+                    sample_rate: 48_000,
+                })),
+            })
+            .expect("queue preview");
+        let out = render(&mut engine, 512);
+        let peak = out
+            .iter()
+            .fold(0.0_f32, |max, sample| max.max(sample.abs()));
+        assert!(peak > 0.05, "preview produced no audio: {peak}");
+        engine.apply(Command::StopPreview);
+        let out = render(&mut engine, 512);
+        let peak = out
+            .iter()
+            .fold(0.0_f32, |max, sample| max.max(sample.abs()));
+        assert!(peak < 1e-4, "preview did not stop: {peak}");
     }
 
     #[test]

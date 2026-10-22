@@ -9,6 +9,7 @@ pub mod audio;
 pub mod dsp;
 pub mod plugins;
 pub mod project;
+pub mod samples;
 pub mod state;
 pub mod studio;
 pub mod theme;

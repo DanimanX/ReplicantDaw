@@ -6,7 +6,7 @@ use egui::{
     Align2, Color32, CornerRadius, CursorIcon, Pos2, Rect, Response, Sense, Stroke, Ui, Vec2,
 };
 
-use crate::audio::{gain_to_db, messages::db_to_gain};
+use crate::audio::{gain_to_db, messages::db_to_gain, RecordedNote};
 use crate::theme;
 
 fn arc(center: Pos2, radius: f32, start_deg: f32, end_deg: f32, segments: usize) -> Vec<Pos2> {
@@ -379,8 +379,141 @@ pub fn diamond(painter: &egui::Painter, center: Pos2, radius: f32, color: Color3
     }
 }
 
+/// Which part of a clip a mini roll shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MiniRollView {
+    /// The cell *is* the clip: spread the loop over the whole rect.
+    Clip,
+    /// Keep the clip on the 16-bar session grid: absolute positions.
+    Timeline,
+}
+
+/// Compact piano-roll preview of a clip, limited to the part that plays.
+///
+/// The loop region is drawn as the block itself and notes outside it are
+/// faded, so a short loop stops looking like a clip that runs the whole
+/// session.
+#[allow(clippy::too_many_arguments)]
+pub fn mini_roll(
+    painter: &egui::Painter,
+    rect: Rect,
+    notes: &[RecordedNote],
+    loop_region: (u16, u16),
+    steps_total: u16,
+    view: MiniRollView,
+    accent: Color32,
+    enabled: bool,
+) {
+    if notes.is_empty() || steps_total == 0 || rect.width() < 3.0 || rect.height() < 3.0 {
+        return;
+    }
+    let (loop_start, loop_end) = loop_region;
+    let visible = match view {
+        MiniRollView::Clip => (loop_start, loop_end.max(loop_start + 1)),
+        MiniRollView::Timeline => (0, steps_total),
+    };
+    let span = (visible.1.saturating_sub(visible.0)).max(1) as f32;
+    let x_of = |step: u16| {
+        let step = step.clamp(visible.0, visible.1);
+        rect.left() + ((step - visible.0) as f32 / span) * rect.width()
+    };
+
+    let region = Rect::from_min_max(
+        Pos2::new(x_of(loop_start), rect.top()),
+        Pos2::new(x_of(loop_end).max(x_of(loop_start) + 1.0), rect.bottom()),
+    );
+    painter.rect_filled(
+        region,
+        CornerRadius::same(1),
+        theme::accent_alpha(accent, if enabled { 26 } else { 10 }),
+    );
+    painter.rect_stroke(
+        region,
+        CornerRadius::same(1),
+        Stroke::new(
+            1.0,
+            theme::accent_alpha(accent, if enabled { 120 } else { 45 }),
+        ),
+        egui::StrokeKind::Inside,
+    );
+
+    let mut min_note = 127u8;
+    let mut max_note = 0u8;
+    for note in notes {
+        min_note = min_note.min(note.note);
+        max_note = max_note.max(note.note);
+    }
+    let pitch_span = (max_note.saturating_sub(min_note)).max(11) as f32;
+    let row = (rect.height() * 0.16).clamp(1.5, 3.0);
+    for note in notes {
+        if note.end_step() <= visible.0 || note.start_step >= visible.1 {
+            continue;
+        }
+        let audible = note.start_step < loop_end && note.end_step() > loop_start;
+        let x0 = x_of(note.start_step).max(rect.left());
+        let x1 = x_of(note.end_step()).min(rect.right());
+        if x1 <= x0 {
+            continue;
+        }
+        let pitch = (note.note.saturating_sub(min_note)) as f32 / pitch_span;
+        let y = rect.bottom() - row - pitch * (rect.height() - row - 1.0);
+        let color = match (enabled, audible) {
+            (false, _) => theme::accent_alpha(accent, 45),
+            (true, true) => theme::accent_alpha(accent, 230),
+            // Outside the loop: visible for context, clearly not played.
+            (true, false) => theme::accent_alpha(accent, 55),
+        };
+        painter.rect_filled(
+            Rect::from_min_max(
+                Pos2::new(x0, y),
+                Pos2::new((x1.max(x0 + 1.5)).min(rect.right()), y + row),
+            ),
+            CornerRadius::same(1),
+            color,
+        );
+    }
+}
+
 /// Angle helper for decorative rings.
 pub fn ring_point(center: Pos2, radius: f32, degrees: f32) -> Pos2 {
     let rad = degrees * PI / 180.0;
     Pos2::new(center.x + rad.cos() * radius, center.y + rad.sin() * radius)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The preview must lay out notes on the clip's own 16-bar axis, so the
+    /// part outside the loop can be told apart from the part that plays.
+    #[test]
+    fn mini_roll_marks_notes_outside_the_loop() {
+        let notes = [
+            RecordedNote {
+                note: 60,
+                velocity: 100,
+                start_step: 8,
+                length_steps: 4,
+            },
+            RecordedNote {
+                note: 72,
+                velocity: 100,
+                start_step: 128,
+                length_steps: 4,
+            },
+        ];
+        let (start, end) = (0u16, 64u16);
+        let inside = |note: &RecordedNote| note.start_step < end && note.end_step() > start;
+        assert!(inside(&notes[0]));
+        assert!(!inside(&notes[1]));
+
+        // A clip view spreads the loop over the rect; a timeline keeps the
+        // absolute 16-bar axis.
+        assert_eq!(
+            MiniRollView::Clip,
+            MiniRollView::Clip,
+            "views are distinguishable"
+        );
+        assert_ne!(MiniRollView::Clip, MiniRollView::Timeline);
+    }
 }

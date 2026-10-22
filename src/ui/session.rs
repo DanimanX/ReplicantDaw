@@ -8,7 +8,7 @@ use crate::audio::{
 use crate::state::UiState;
 use crate::studio::Studio;
 use crate::theme;
-use crate::ui::widgets::{fader, knob, meter, toggle_chip};
+use crate::ui::widgets::{fader, knob, meter, mini_roll, toggle_chip, MiniRollView};
 
 pub fn draw_matrix(
     ui: &mut Ui,
@@ -226,16 +226,15 @@ pub fn draw_matrix(
             );
             if wave_rect.width() > 8.0 && wave_rect.height() > 6.0 {
                 if has_clip {
-                    draw_mini_roll(
+                    mini_roll(
                         ui.painter(),
                         wave_rect,
                         notes,
-                        crate::audio::LOOP_STEPS as f32,
-                        if clip_enabled {
-                            theme::accent_alpha(accent, 225)
-                        } else {
-                            theme::accent_alpha(accent, 70)
-                        },
+                        state.clip_loop(track, scene),
+                        crate::audio::LOOP_STEPS as u16,
+                        MiniRollView::Clip,
+                        accent,
+                        clip_enabled,
                     );
                 } else {
                     let points = state.clip_waveform(track, scene, 28);
@@ -395,8 +394,6 @@ fn draw_midi_row(
         accent,
     );
 
-    let steps_total = crate::audio::LOOP_STEPS as f32;
-
     for (track, _spec) in TRACKS.iter().enumerate() {
         let track_accent = theme::track_accent(track);
         let scene = state.launched[track].unwrap_or(0) as usize;
@@ -481,16 +478,15 @@ fn draw_midi_row(
                 Pos2::new(cell.right() - 4.0, cell.bottom() - 3.0),
             );
             if roll.height() > 5.0 {
-                draw_mini_roll(
+                mini_roll(
                     ui.painter(),
                     roll,
                     notes,
-                    steps_total,
-                    if enabled {
-                        theme::accent_alpha(track_accent, 225)
-                    } else {
-                        theme::accent_alpha(track_accent, 70)
-                    },
+                    state.clip_loop(track, scene),
+                    crate::audio::LOOP_STEPS as u16,
+                    MiniRollView::Clip,
+                    track_accent,
+                    enabled,
                 );
                 if state.playing && enabled {
                     let progress = (beats / (crate::audio::LOOP_BARS as f32 * 4.0)).clamp(0.0, 1.0);
@@ -563,38 +559,6 @@ fn draw_midi_row(
         [Pos2::new(content.left(), y), Pos2::new(content.right(), y)],
         Stroke::new(1.0, theme::accent_alpha(theme::MAGENTA, 90)),
     );
-}
-
-/// Draw a compact piano-roll preview of a clip inside `rect`.
-fn draw_mini_roll(
-    painter: &egui::Painter,
-    rect: Rect,
-    notes: &[crate::audio::RecordedNote],
-    steps_total: f32,
-    color: Color32,
-) {
-    if notes.is_empty() || steps_total <= 0.0 {
-        return;
-    }
-    let mut min_note = 127u8;
-    let mut max_note = 0u8;
-    for note in notes {
-        min_note = min_note.min(note.note);
-        max_note = max_note.max(note.note);
-    }
-    let span = (max_note.saturating_sub(min_note)).max(11) as f32;
-    for note in notes {
-        let x0 = rect.left() + note.start_step as f32 / steps_total * rect.width();
-        let x1 = rect.left()
-            + note.end_step().min(steps_total as u16) as f32 / steps_total * rect.width();
-        let pitch = (note.note.saturating_sub(min_note)) as f32 / span;
-        let y = rect.bottom() - 2.0 - pitch * (rect.height() - 3.0);
-        let note_rect = Rect::from_min_max(
-            Pos2::new(x0.max(rect.left()), y),
-            Pos2::new((x1.max(x0 + 2.0)).min(rect.right()), y + 2.2),
-        );
-        painter.rect_filled(note_rect, CornerRadius::same(1), color);
-    }
 }
 
 pub fn draw_mixer(

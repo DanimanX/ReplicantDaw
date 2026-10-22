@@ -7,6 +7,7 @@ use crate::dsp::spectrum::{BINS, HISTORY};
 use crate::state::UiState;
 use crate::studio::Studio;
 use crate::theme;
+use crate::ui::widgets::{mini_roll, MiniRollView};
 
 pub const TIMELINE_BARS: usize = 16;
 
@@ -151,9 +152,13 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
         if !notes.is_empty() {
             let enabled = slot_enabled;
             let steps_total = crate::audio::LOOP_STEPS as f32;
+            let (loop_start, loop_end) = state.clip_loop(track, scene);
+            // The block is the loop region, not the whole timeline: a short
+            // loop used to be drawn as a 16-bar clip.
+            let x_at = |step: u16| lane.left() + (step as f32 / steps_total) * lane.width();
             let clip = Rect::from_min_max(
-                Pos2::new(lane.left() + 1.5, lane.top() + 1.5),
-                Pos2::new(lane.right() - 1.5, lane.bottom() - 1.5),
+                Pos2::new(x_at(loop_start) + 1.5, lane.top() + 1.5),
+                Pos2::new(x_at(loop_end) - 1.5, lane.bottom() - 1.5),
             );
             ui.painter().rect_filled(
                 clip,
@@ -201,64 +206,107 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
                 ));
             }
 
-            let header_y = clip.top() + 5.0;
-            ui.painter().text(
-                Pos2::new(clip.left() + 6.0, header_y),
-                Align2::LEFT_CENTER,
-                format!("MIDI CLIP · SLOT {:02}", scene + 1),
-                theme::display(6.0),
-                if enabled {
-                    theme::accent_alpha(accent, 230)
-                } else {
-                    theme::TEXT_DIM
-                },
+            // Header: the clip name on the left, its loop on the right, each
+            // in its own clipped box so a narrow block cannot overlap them.
+            let header = Rect::from_min_max(
+                Pos2::new(clip.left() + 6.0, clip.top() + 1.0),
+                Pos2::new(clip.right() - 5.0, clip.top() + 10.0),
             );
-            let label = if enabled {
-                format!("{} NOTES · 16 BARS", notes.len())
+            // Give the loop readout a fixed slice and let the name shrink into
+            // the rest, with shorter wording when the block is narrow.
+            let loop_w = (header.width() * 0.42).clamp(30.0, 96.0);
+            let name_rect = header.with_max_x(header.right() - loop_w - 3.0);
+            let loop_rect = header.with_min_x(header.right() - loop_w);
+            let name_text = if name_rect.width() > 96.0 {
+                format!("MIDI CLIP · SLOT {:02}", scene + 1)
+            } else if name_rect.width() > 40.0 {
+                format!("SLOT {:02}", scene + 1)
             } else {
-                format!("{} NOTES · MUTED", notes.len())
+                format!("{:02}", scene + 1)
             };
-            ui.painter().text(
-                Pos2::new(clip.right() - 5.0, header_y),
-                Align2::RIGHT_CENTER,
-                label,
-                theme::mono(5.4),
-                if enabled {
-                    theme::TEXT_DIM
-                } else {
-                    theme::AMBER
-                },
+            let name_color = if enabled {
+                theme::accent_alpha(accent, 230)
+            } else {
+                theme::TEXT_DIM
+            };
+            let name_painter = ui.painter().with_clip_rect(name_rect);
+            let name_font = theme::fitted_font(
+                &name_painter,
+                &name_text,
+                theme::display(6.0),
+                name_rect.width(),
             );
+            name_painter.text(
+                Pos2::new(name_rect.left(), name_rect.center().y),
+                Align2::LEFT_CENTER,
+                &name_text,
+                name_font,
+                name_color,
+            );
+
+            let end_inclusive = loop_end.saturating_sub(1);
+            let loop_label = format!(
+                "{}.{}–{}.{}",
+                loop_start / 16 + 1,
+                loop_start % 16 / 4 + 1,
+                end_inclusive / 16 + 1,
+                end_inclusive % 16 / 4 + 1
+            );
+            let loop_text = if !enabled {
+                "MUTED".to_string()
+            } else if loop_rect.width() > 62.0 {
+                format!("{} N · {loop_label}", notes.len())
+            } else {
+                loop_label
+            };
+            let loop_painter = ui.painter().with_clip_rect(loop_rect);
+            let loop_font = theme::fitted_font(
+                &loop_painter,
+                &loop_text,
+                theme::mono(5.4),
+                loop_rect.width(),
+            );
+            if loop_rect.width() > 18.0 {
+                loop_painter.text(
+                    Pos2::new(loop_rect.right(), loop_rect.center().y),
+                    Align2::RIGHT_CENTER,
+                    loop_text,
+                    loop_font,
+                    if enabled {
+                        theme::TEXT_DIM
+                    } else {
+                        theme::AMBER
+                    },
+                );
+            }
 
             let roll = Rect::from_min_max(
                 Pos2::new(clip.left() + 4.0, clip.top() + 10.0),
                 Pos2::new(clip.right() - 4.0, clip.bottom() - 2.0),
             );
             if roll.height() > 4.0 {
-                let mut min_note = 127u8;
-                let mut max_note = 0u8;
-                for note in &notes {
-                    min_note = min_note.min(note.note);
-                    max_note = max_note.max(note.note);
-                }
-                let span = (max_note.saturating_sub(min_note)).max(11) as f32;
-                for note in &notes {
-                    let x0 = roll.left() + note.start_step as f32 / steps_total * roll.width();
-                    let x1 = roll.left()
-                        + note.end_step().min(steps_total as u16) as f32 / steps_total
-                            * roll.width();
-                    let pitch = (note.note.saturating_sub(min_note)) as f32 / span;
-                    let top = roll.top() + (1.0 - pitch) * (roll.height() - 3.0);
-                    let rect = Rect::from_min_max(
-                        Pos2::new(x0.max(roll.left()), top),
-                        Pos2::new((x1.max(x0 + 2.5)).min(roll.right()), top + 3.0),
+                mini_roll(
+                    ui.painter(),
+                    roll,
+                    &notes,
+                    (loop_start, loop_end),
+                    crate::audio::LOOP_STEPS as u16,
+                    MiniRollView::Timeline,
+                    accent,
+                    enabled,
+                );
+                if state.playing && enabled {
+                    // Playhead inside the loop region.
+                    let progress = (state.playhead_beats()
+                        / (crate::audio::LOOP_BARS as f32 * 4.0))
+                        .clamp(0.0, 1.0);
+                    let loop_x0 = roll.left() + loop_start as f32 / steps_total * roll.width();
+                    let loop_w = (loop_end - loop_start) as f32 / steps_total * roll.width();
+                    let px = loop_x0 + progress * loop_w;
+                    ui.painter().line_segment(
+                        [Pos2::new(px, roll.top()), Pos2::new(px, roll.bottom())],
+                        Stroke::new(1.0, theme::CYAN),
                     );
-                    let color = if enabled {
-                        theme::accent_alpha(accent, 225)
-                    } else {
-                        theme::accent_alpha(accent, 60)
-                    };
-                    ui.painter().rect_filled(rect, CornerRadius::same(1), color);
                 }
             }
         }

@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.2.2** · MIT, Linux, macOS and Windows.
+**Version 1.2.3** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -24,6 +24,23 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Plugin editor at full screen](docs/plugin-editor.png)
 
 ![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
+
+## Fixes in 1.2.3
+
+- **The loop reads as the part that plays.** Notes outside the clip's loop are
+  now drawn faded in the piano roll instead of looking equally active, so a
+  short loop no longer appears to run to the end of the grid.
+- **Mini clip views show the clip, not the timeline.** The session matrix and
+  the MIDI row draw the loop region scaled to the cell (measured: a 40-step
+  loop now fills the cell with its own notes) and `MIDI · n N` summaries keep
+  their meaning. In the arrangement the block keeps its absolute position on
+  the 16-bar ruler but is drawn only as long as the loop, with the loop range
+  in its header (`SLOT 02 · 2.2–4.3`) instead of "16 BARS".
+- **No overlapping clip labels.** Narrow blocks shorten the header text
+  (`MIDI CLIP · SLOT 02` → `SLOT 02` → `02`) in clipped boxes, so the name and
+  the loop readout never collide.
+- **Loop handles stay inside the ruler** at both extremes, and the footer shows
+  the last played position (`2.2 – 4.3`), not one step past it.
 
 ## Fixes in 1.2.2
 

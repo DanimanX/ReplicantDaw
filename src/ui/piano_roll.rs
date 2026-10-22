@@ -463,9 +463,12 @@ fn draw_grid(
                     [Pos2::new(x, grid.top()), Pos2::new(x, grid.bottom())],
                     Stroke::new(1.2, theme::accent_alpha(theme::AMBER, 170)),
                 );
+                // Keep the handle fully inside the ruler at both extremes so a
+                // full-length loop does not look like it spills past the edge.
+                let handle_x = (x - 2.0).clamp(grid.left(), grid.right() - 4.0);
                 painter.rect_filled(
                     Rect::from_min_size(
-                        Pos2::new(x - 2.0, canvas.top() + 2.0),
+                        Pos2::new(handle_x, canvas.top() + 2.0),
                         Vec2::new(4.0, RULER_H - 3.0),
                     ),
                     CornerRadius::same(1),
@@ -532,10 +535,14 @@ fn draw_grid(
                 }
                 let selected = studio.roll_selected == Some(index);
                 let velocity = note.velocity as f32 / 127.0;
+                // Notes outside the loop do not play: show them, but faded, so
+                // the loop reads as the part of the clip that actually runs.
+                let audible = note.start_step < loop_end && note.end_step() > loop_start;
+                let fade = if audible { 1.0 } else { 0.35 };
                 let fill = if selected {
                     theme::accent_alpha(accent, (150.0 + 105.0 * velocity) as u8)
                 } else {
-                    theme::accent_alpha(accent, (55.0 + 110.0 * velocity) as u8)
+                    theme::accent_alpha(accent, ((55.0 + 110.0 * velocity) * fade) as u8)
                 };
                 painter.rect_filled(note_rect, CornerRadius::same(2), fill);
                 painter.rect_stroke(
@@ -546,7 +553,7 @@ fn draw_grid(
                         if selected {
                             Color32::WHITE
                         } else {
-                            theme::accent_alpha(accent, 230)
+                            theme::accent_alpha(accent, (230.0 * fade) as u8)
                         },
                     ),
                     egui::StrokeKind::Inside,
@@ -719,7 +726,7 @@ fn draw_footer(
             egui::RichText::new(format!(
                 "LOOP {} – {}",
                 bar_beat_text(loop_start),
-                bar_beat_text(loop_end)
+                bar_beat_text(loop_end.saturating_sub(1))
             ))
             .font(theme::mono(8.0))
             .color(theme::AMBER),

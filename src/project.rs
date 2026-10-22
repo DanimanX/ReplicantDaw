@@ -283,17 +283,9 @@ impl Project {
                 project.effects = legacy_chain(&legacy);
                 project.master_gain = if legacy.gain > 0.0 { legacy.gain } else { 0.90 };
             }
-            for track in &mut project.tracks {
+            for (index, track) in project.tracks.iter_mut().enumerate() {
                 if track.synth.is_none() {
-                    track.synth = Some(ProjectSynth {
-                        ratio: 1.0,
-                        index: 1.0,
-                        attack: 0.005,
-                        decay: 0.25,
-                        sustain: 0.4,
-                        release: 0.25,
-                        level: 0.9,
-                    });
+                    track.synth = Some(ProjectSynth::default_for_track(index));
                 }
             }
         }
@@ -518,6 +510,26 @@ mod tests {
         assert_eq!(kinds, vec!["DRIVE", "TONE", "FILTER", "WIDTH"]);
         assert!((project.master_gain - 0.8).abs() < 1e-6);
         assert!((project.effects[2].params[0] - 2400.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn legacy_v1_tracks_get_their_original_synth_defaults() {
+        let json = r#"{
+            "format_version": 1,
+            "name": "Old",
+            "bpm": 120.0,
+            "tracks": [
+                { "name": "SYNAPSE 01", "gain_db": -7.0, "pan": 0.0 },
+                { "name": "NEURAL BASS", "gain_db": -5.0, "pan": 0.0 }
+            ]
+        }"#;
+        let project = Project::from_json(json).expect("parse v1 project");
+        let first = project.tracks[0].synth.as_ref().unwrap();
+        let expected = crate::audio::TRACKS[0];
+        assert!((first.ratio - expected.fm_ratio).abs() < 1e-6);
+        assert!((first.index - expected.mod_index).abs() < 1e-6);
+        let bass = project.tracks[1].synth.as_ref().unwrap();
+        assert!((bass.index - crate::audio::TRACKS[1].mod_index).abs() < 1e-6);
     }
 
     #[test]

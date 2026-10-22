@@ -147,7 +147,7 @@ cargo run --release -- --devices        # list audio output devices
 cargo run --release -- --audio-check    # open the default device and verify telemetry
 cargo run --release -- --selftest       # DSP, chain, project, MIDI and clock smoke test
 cargo run --release -- --project examples/Demo.rproj
-cargo test                              # 71 unit tests
+cargo test                              # 72 unit tests
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -287,7 +287,7 @@ Keystation 49 MK3 MIDI keyboard, and third-party plugins already installed:
 
 ```
 $ cargo test
-test result: ok. 71 passed; 0 failed
+test result: ok. 72 passed; 0 failed
 
 $ cargo clippy --all-targets -- -D warnings
 Finished

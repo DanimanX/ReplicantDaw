@@ -1,18 +1,91 @@
 //! Project persistence: a JSON document describing the session.
 //!
-//! Recorded MIDI clips are stored as note lists, plugins as descriptors plus
-//! their opaque state blob (base64), and the mix as plain numbers, so a
-//! project file is human-inspectable and versionable.
+//! Recorded MIDI clips are stored as note lists, plugin state as opaque
+//! base64 blobs, and the mix as plain numbers, so a project file is
+//! human-inspectable and versionable.
+//!
+//! Format history:
+//! - v1: fixed master FX block (`fx`), generative clips only.
+//! - v2: modular effect chain, per-track synth parameters, MIDI clip state.
+//!   v1 files still load: the legacy `fx` block is translated into a chain.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio::messages::{FxParam, RecordedNote, TRACK_COUNT};
-use crate::audio::TRACKS;
+use crate::audio::messages::{EffectKind, RecordedNote, SynthParam, TRACK_COUNT};
+use crate::audio::{SynthParams, TRACKS};
 
 pub const PROJECT_EXTENSION: &str = "rproj";
-pub const PROJECT_FORMAT_VERSION: u32 = 1;
+pub const PROJECT_FORMAT_VERSION: u32 = 2;
+
+/// Editable FM synth settings stored per track.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectSynth {
+    pub ratio: f32,
+    pub index: f32,
+    pub attack: f32,
+    pub decay: f32,
+    pub sustain: f32,
+    pub release: f32,
+    pub level: f32,
+}
+
+impl ProjectSynth {
+    pub fn from_params(params: &SynthParams) -> Self {
+        Self {
+            ratio: params.fm_ratio,
+            index: params.mod_index,
+            attack: params.attack,
+            decay: params.decay,
+            sustain: params.sustain,
+            release: params.release,
+            level: params.level,
+        }
+    }
+
+    pub fn default_for_track(index: usize) -> Self {
+        let spec = &TRACKS[index.min(TRACK_COUNT - 1)];
+        Self::from_params(&SynthParams::from_spec(spec))
+    }
+
+    /// Convert to engine values, clamping anything out of range.
+    pub fn to_params(&self) -> SynthParams {
+        let mut params = SynthParams::from_spec(&TRACKS[0]);
+        params.set(SynthParam::Ratio, self.ratio);
+        params.set(SynthParam::Index, self.index);
+        params.set(SynthParam::Attack, self.attack);
+        params.set(SynthParam::Decay, self.decay);
+        params.set(SynthParam::Sustain, self.sustain);
+        params.set(SynthParam::Release, self.release);
+        params.set(SynthParam::Level, self.level);
+        params
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectEffect {
+    /// Stable module id, e.g. `DRIVE`, `FILTER`, `TONE`, `WIDTH`, `DELAY`.
+    pub kind: String,
+    #[serde(default)]
+    pub params: [f32; 3],
+    #[serde(default)]
+    pub bypass: bool,
+}
+
+impl ProjectEffect {
+    pub fn new(kind: EffectKind) -> Self {
+        Self {
+            kind: kind.id().to_string(),
+            params: kind.defaults(),
+            bypass: false,
+        }
+    }
+
+    pub fn effect_kind(&self) -> Option<EffectKind> {
+        EffectKind::from_id(&self.kind)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectTrack {
@@ -28,29 +101,48 @@ pub struct ProjectTrack {
     pub scene: Option<u8>,
     #[serde(default)]
     pub notes: Vec<RecordedNote>,
+    /// MIDI clip playback enabled.
+    #[serde(default = "default_true")]
+    pub clip_enabled: bool,
+    #[serde(default)]
+    pub synth: Option<ProjectSynth>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Legacy (v1) fixed master FX block.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProjectFx {
+    #[serde(default)]
     pub gain: f32,
+    #[serde(default)]
     pub tone: f32,
+    #[serde(default)]
     pub cutoff: f32,
+    #[serde(default)]
     pub resonance: f32,
+    #[serde(default)]
     pub drive: f32,
+    #[serde(default)]
     pub width: f32,
 }
 
-impl Default for ProjectFx {
-    fn default() -> Self {
-        Self {
-            gain: 0.90,
-            tone: 16_000.0,
-            cutoff: 5_200.0,
-            resonance: 0.18,
-            drive: 0.12,
-            width: 1.0,
-        }
-    }
+fn default_true() -> bool {
+    true
+}
+
+fn default_master_gain() -> f32 {
+    0.90
+}
+
+fn default_chain() -> Vec<ProjectEffect> {
+    [
+        EffectKind::Drive,
+        EffectKind::Tone,
+        EffectKind::Filter,
+        EffectKind::Width,
+    ]
+    .into_iter()
+    .map(ProjectEffect::new)
+    .collect()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,8 +167,13 @@ pub struct Project {
     pub app_version: String,
     pub name: String,
     pub bpm: f32,
-    #[serde(default)]
-    pub fx: ProjectFx,
+    #[serde(default = "default_chain")]
+    pub effects: Vec<ProjectEffect>,
+    #[serde(default = "default_master_gain")]
+    pub master_gain: f32,
+    /// v1 compatibility only. Ignored when `effects` is present.
+    #[serde(default, rename = "fx")]
+    pub legacy_fx: Option<ProjectFx>,
     pub tracks: Vec<ProjectTrack>,
     #[serde(default)]
     pub plugins: Vec<ProjectPlugin>,
@@ -95,6 +192,8 @@ impl Default for Project {
                 solo: false,
                 scene: Some(crate::audio::DEFAULT_SCENES[index] as u8),
                 notes: Vec::new(),
+                clip_enabled: true,
+                synth: Some(ProjectSynth::default_for_track(index)),
             })
             .collect();
 
@@ -103,7 +202,9 @@ impl Default for Project {
             app_version: crate::APP_VERSION.to_string(),
             name: "Untitled".to_string(),
             bpm: crate::audio::DEFAULT_BPM,
-            fx: ProjectFx::default(),
+            effects: default_chain(),
+            master_gain: 0.90,
+            legacy_fx: None,
             tracks,
             plugins: Vec::new(),
         }
@@ -167,7 +268,7 @@ impl Project {
     }
 
     pub fn from_json(json: &str) -> Result<Self, String> {
-        let project: Self =
+        let mut project: Self =
             serde_json::from_str(json).map_err(|error| format!("parse failed: {error}"))?;
         if project.format_version > PROJECT_FORMAT_VERSION {
             return Err(format!(
@@ -175,6 +276,29 @@ impl Project {
                 project.format_version, PROJECT_FORMAT_VERSION
             ));
         }
+
+        // A v1 file has no `effects`; translate its fixed FX block.
+        if project.format_version < 2 {
+            if let Some(legacy) = project.legacy_fx.take() {
+                project.effects = legacy_chain(&legacy);
+                project.master_gain = if legacy.gain > 0.0 { legacy.gain } else { 0.90 };
+            }
+            for track in &mut project.tracks {
+                if track.synth.is_none() {
+                    track.synth = Some(ProjectSynth {
+                        ratio: 1.0,
+                        index: 1.0,
+                        attack: 0.005,
+                        decay: 0.25,
+                        sustain: 0.4,
+                        release: 0.25,
+                        level: 0.9,
+                    });
+                }
+            }
+        }
+
+        project.format_version = PROJECT_FORMAT_VERSION;
         Ok(project)
     }
 
@@ -222,6 +346,18 @@ impl Project {
                 solo: state.solo[index],
                 scene: state.launched[index],
                 notes: state.recorded_notes(index).to_vec(),
+                clip_enabled: state.recorded_active[index],
+                synth: Some(ProjectSynth::from_params(&state.synth_params(index))),
+            })
+            .collect();
+
+        let effects = state
+            .effects
+            .iter()
+            .map(|effect| ProjectEffect {
+                kind: effect.kind.id().to_string(),
+                params: effect.params,
+                bypass: effect.bypass,
             })
             .collect();
 
@@ -230,29 +366,43 @@ impl Project {
             app_version: crate::APP_VERSION.to_string(),
             name: name.to_string(),
             bpm,
-            fx: ProjectFx {
-                gain: state.fx.gain,
-                tone: state.fx.tone,
-                cutoff: state.fx.cutoff,
-                resonance: state.fx.resonance,
-                drive: state.fx.drive,
-                width: state.fx.width,
-            },
+            effects,
+            master_gain: state.master_gain,
+            legacy_fx: None,
             tracks,
             plugins: Vec::new(),
         }
     }
+}
 
-    /// Look up a stored FX value as a typed command payload.
-    pub fn fx_value(&self, param: FxParam) -> f32 {
-        match param {
-            FxParam::Gain => self.fx.gain,
-            FxParam::Tone => self.fx.tone,
-            FxParam::Cutoff => self.fx.cutoff,
-            FxParam::Resonance => self.fx.resonance,
-            FxParam::Drive => self.fx.drive,
-            FxParam::Width => self.fx.width,
-        }
+/// Translate a v1 FX block into an explicit effect chain.
+fn legacy_chain(fx: &ProjectFx) -> Vec<ProjectEffect> {
+    let mut chain = Vec::new();
+    if fx.drive > 0.001 {
+        let mut effect = ProjectEffect::new(EffectKind::Drive);
+        effect.params[0] = fx.drive.clamp(0.0, 1.0);
+        chain.push(effect);
+    }
+    if fx.tone > 0.0 && fx.tone < 18_000.0 {
+        let mut effect = ProjectEffect::new(EffectKind::Tone);
+        effect.params[0] = fx.tone.clamp(300.0, 18_000.0);
+        chain.push(effect);
+    }
+    if fx.cutoff > 0.0 {
+        let mut effect = ProjectEffect::new(EffectKind::Filter);
+        effect.params[0] = fx.cutoff.clamp(40.0, 12_000.0);
+        effect.params[1] = fx.resonance.clamp(0.0, 1.0);
+        chain.push(effect);
+    }
+    if (fx.width - 1.0).abs() > 0.001 {
+        let mut effect = ProjectEffect::new(EffectKind::Width);
+        effect.params[0] = fx.width.clamp(0.0, 1.5);
+        chain.push(effect);
+    }
+    if chain.is_empty() {
+        default_chain()
+    } else {
+        chain
     }
 }
 
@@ -261,11 +411,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_project_has_all_tracks() {
+    fn default_project_has_all_tracks_and_a_chain() {
         let project = Project::default();
         assert_eq!(project.tracks.len(), TRACK_COUNT);
         assert_eq!(project.format_version, PROJECT_FORMAT_VERSION);
         assert!(project.tracks.iter().all(|track| track.scene.is_some()));
+        assert_eq!(project.effects.len(), 4);
+        assert!(project.tracks.iter().all(|track| track.synth.is_some()));
     }
 
     #[test]
@@ -283,6 +435,18 @@ mod tests {
             start_step: 16,
             length_steps: 2,
         });
+        project.tracks[1].clip_enabled = false;
+        project.tracks[1].synth = Some(ProjectSynth {
+            ratio: 2.5,
+            index: 4.0,
+            attack: 0.01,
+            decay: 0.2,
+            sustain: 0.3,
+            release: 0.4,
+            level: 1.2,
+        });
+        project.effects.push(ProjectEffect::new(EffectKind::Delay));
+        project.master_gain = 0.75;
         project.plugins.push(ProjectPlugin {
             slot: 0,
             name: "Dexed".into(),
@@ -298,8 +462,14 @@ mod tests {
         assert_eq!(loaded.name, "Neon Test");
         assert!((loaded.bpm - 137.5).abs() < 1e-6);
         assert!(loaded.tracks[2].mute);
+        assert!(!loaded.tracks[1].clip_enabled);
         assert_eq!(loaded.tracks[1].notes.len(), 1);
         assert_eq!(loaded.tracks[1].notes[0].start_step, 16);
+        assert_eq!(loaded.effects.len(), 5);
+        assert_eq!(loaded.effects[4].kind, "DELAY");
+        assert!((loaded.master_gain - 0.75).abs() < 1e-6);
+        let synth = loaded.tracks[1].synth.as_ref().unwrap();
+        assert!((synth.ratio - 2.5).abs() < 1e-6);
         assert_eq!(loaded.plugins[0].format, "CLAP");
     }
 
@@ -324,7 +494,30 @@ mod tests {
         let project = Project::from_json(json).expect("parse minimal project");
         assert_eq!(project.name, "Minimal");
         assert!(project.plugins.is_empty());
-        assert!((project.fx.gain - 0.9).abs() < 1e-6);
+        assert!((project.master_gain - 0.9).abs() < 1e-6);
+        assert!(!project.effects.is_empty());
+    }
+
+    #[test]
+    fn legacy_v1_fx_block_becomes_an_effect_chain() {
+        let json = r#"{
+            "format_version": 1,
+            "name": "Old",
+            "bpm": 120.0,
+            "fx": { "gain": 0.8, "tone": 9000.0, "cutoff": 2400.0,
+                    "resonance": 0.5, "drive": 0.3, "width": 1.2 },
+            "tracks": []
+        }"#;
+        let project = Project::from_json(json).expect("parse v1 project");
+        assert_eq!(project.format_version, PROJECT_FORMAT_VERSION);
+        let kinds: Vec<_> = project
+            .effects
+            .iter()
+            .map(|effect| effect.kind.as_str())
+            .collect();
+        assert_eq!(kinds, vec!["DRIVE", "TONE", "FILTER", "WIDTH"]);
+        assert!((project.master_gain - 0.8).abs() < 1e-6);
+        assert!((project.effects[2].params[0] - 2400.0).abs() < 1e-3);
     }
 
     #[test]

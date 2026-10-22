@@ -2,8 +2,65 @@
 
 use std::f32::consts::TAU;
 
+use crate::audio::messages::SynthParam;
 use crate::audio::tracks::TrackSpec;
 use crate::dsp::midi_to_hz;
+
+/// Editable FM synth settings for one track.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SynthParams {
+    pub fm_ratio: f32,
+    pub mod_index: f32,
+    pub attack: f32,
+    pub decay: f32,
+    pub sustain: f32,
+    pub release: f32,
+    pub level: f32,
+}
+
+impl SynthParams {
+    pub fn from_spec(spec: &TrackSpec) -> Self {
+        Self {
+            fm_ratio: spec.fm_ratio,
+            mod_index: spec.mod_index,
+            attack: spec.attack,
+            decay: spec.decay,
+            sustain: spec.sustain,
+            release: spec.release,
+            level: spec.level,
+        }
+    }
+
+    pub fn get(&self, param: SynthParam) -> f32 {
+        match param {
+            SynthParam::Ratio => self.fm_ratio,
+            SynthParam::Index => self.mod_index,
+            SynthParam::Attack => self.attack,
+            SynthParam::Decay => self.decay,
+            SynthParam::Sustain => self.sustain,
+            SynthParam::Release => self.release,
+            SynthParam::Level => self.level,
+        }
+    }
+
+    /// Set a parameter, clamped to the range the engine accepts.
+    pub fn set(&mut self, param: SynthParam, value: f32) {
+        if !value.is_finite() {
+            return;
+        }
+        let (min, max) = param.range();
+        let value = value.clamp(min, max);
+        match param {
+            SynthParam::Ratio => self.fm_ratio = value,
+            SynthParam::Index => self.mod_index = value,
+            SynthParam::Attack => self.attack = value,
+            SynthParam::Decay => self.decay = value,
+            SynthParam::Sustain => self.sustain = value,
+            SynthParam::Release => self.release = value,
+            SynthParam::Level => self.level = value,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -65,7 +122,7 @@ impl Voice {
     #[allow(clippy::too_many_arguments)]
     pub fn trigger(
         &mut self,
-        spec: &TrackSpec,
+        params: &SynthParams,
         track: usize,
         note: u8,
         velocity: f32,
@@ -80,15 +137,15 @@ impl Voice {
         self.freq = midi_to_hz(note as f32);
         self.phase = 0.0;
         self.mod_phase = 0.0;
-        self.ratio = spec.fm_ratio;
-        self.mod_index = spec.mod_index;
-        self.level = spec.level;
+        self.ratio = params.fm_ratio;
+        self.mod_index = params.mod_index;
+        self.level = params.level;
         self.env = 0.0;
         self.gate_left = gate_samples.max(1);
-        self.sustain = spec.sustain.clamp(0.0, 1.0);
-        self.attack_inc = 1.0 / (spec.attack.max(0.0005) * sample_rate);
-        self.decay_coef = envelope_coeff(self.sustain.max(0.0001), spec.decay, sample_rate);
-        self.release_coef = envelope_coeff(0.0001, spec.release, sample_rate);
+        self.sustain = params.sustain.clamp(0.0, 1.0);
+        self.attack_inc = 1.0 / (params.attack.max(0.0005) * sample_rate);
+        self.decay_coef = envelope_coeff(self.sustain.max(0.0001), params.decay, sample_rate);
+        self.release_coef = envelope_coeff(0.0001, params.release, sample_rate);
         self.age = age;
     }
 
@@ -201,7 +258,8 @@ mod tests {
     #[test]
     fn voice_attacks_and_releases_to_silence() {
         let mut voice = Voice::default();
-        voice.trigger(&TRACKS[0], 0, 69, 1.0, 4_800, SR, 1);
+        let params = SynthParams::from_spec(&TRACKS[0]);
+        voice.trigger(&params, 0, 69, 1.0, 4_800, SR, 1);
         let mut peak = 0.0_f32;
         for _ in 0..24_000 {
             peak = peak.max(voice.next_sample(SR).abs());
@@ -213,7 +271,8 @@ mod tests {
     #[test]
     fn voice_is_finite() {
         let mut voice = Voice::default();
-        voice.trigger(&TRACKS[4], 4, 88, 1.0, 24_000, SR, 1);
+        let params = SynthParams::from_spec(&TRACKS[4]);
+        voice.trigger(&params, 4, 88, 1.0, 24_000, SR, 1);
         for _ in 0..48_000 {
             assert!(voice.next_sample(SR).is_finite());
         }
@@ -222,10 +281,10 @@ mod tests {
     #[test]
     fn oscillator_frequency_is_accurate() {
         let mut voice = Voice::default();
-        let mut spec = TRACKS[2];
-        spec.mod_index = 0.0;
+        let mut params = SynthParams::from_spec(&TRACKS[2]);
+        params.mod_index = 0.0;
         let note = 69; // 440 Hz
-        voice.trigger(&spec, 2, note, 1.0, 48_000, SR, 1);
+        voice.trigger(&params, 2, note, 1.0, 48_000, SR, 1);
         let mut crossings = 0_i32;
         let mut prev = 0.0;
         for _ in 0..48_000 {
@@ -243,15 +302,29 @@ mod tests {
     }
 
     #[test]
+    fn synth_params_round_trip_and_clamp() {
+        let mut params = SynthParams::from_spec(&TRACKS[0]);
+        for param in SynthParam::ALL {
+            let (min, max) = param.range();
+            params.set(param, max + 100.0);
+            assert!((params.get(param) - max).abs() < 1e-5, "{param:?} max");
+            params.set(param, min - 100.0);
+            assert!((params.get(param) - min).abs() < 1e-5, "{param:?} min");
+        }
+        params.set(SynthParam::Ratio, f32::NAN);
+        assert!(params.get(SynthParam::Ratio).is_finite());
+    }
+
+    #[test]
     fn stolen_voice_reuses_pool_slot() {
         // The engine handles stealing; here we only verify that retriggering
         // resets the envelope and phase deterministically.
         let mut voice = Voice::default();
-        voice.trigger(&TRACKS[0], 0, 60, 1.0, 480, SR, 1);
+        voice.trigger(&SynthParams::from_spec(&TRACKS[0]), 0, 60, 1.0, 480, SR, 1);
         for _ in 0..200 {
             voice.next_sample(SR);
         }
-        voice.trigger(&TRACKS[1], 1, 72, 0.5, 480, SR, 2);
+        voice.trigger(&SynthParams::from_spec(&TRACKS[1]), 1, 72, 0.5, 480, SR, 2);
         assert_eq!(voice.stage, Stage::Attack);
         assert_eq!(voice.env, 0.0);
         assert_eq!(voice.note, 72);

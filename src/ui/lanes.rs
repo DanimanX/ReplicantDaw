@@ -128,29 +128,99 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState) {
         // Recorded MIDI takes over the lane when present.
         let notes = state.recorded_notes(track).to_vec();
         if !notes.is_empty() {
+            let enabled = state.recorded_active[track];
             let steps_total = crate::audio::LOOP_STEPS as f32;
-            let mut min_note = 127u8;
-            let mut max_note = 0u8;
-            for note in &notes {
-                min_note = min_note.min(note.note);
-                max_note = max_note.max(note.note);
-            }
-            let span = (max_note.saturating_sub(min_note)).max(11) as f32;
-            for note in &notes {
-                let x0 = lane.left() + note.start_step as f32 / steps_total * lane.width();
-                let x1 = lane.left()
-                    + note.end_step().min(steps_total as u16) as f32 / steps_total * lane.width();
-                let pitch = (note.note.saturating_sub(min_note)) as f32 / span;
-                let top = lane.top() + 3.0 + (1.0 - pitch) * (lane.height() - 10.0);
-                let rect = Rect::from_min_max(
-                    Pos2::new(x0.max(lane.left() + 1.0), top),
-                    Pos2::new(x1.max(x0 + 3.0).min(lane.right() - 1.0), top + 4.0),
-                );
-                ui.painter().rect_filled(
-                    rect,
-                    CornerRadius::same(1),
-                    theme::accent_alpha(accent, 210),
-                );
+            let clip = Rect::from_min_max(
+                Pos2::new(lane.left() + 1.5, lane.top() + 1.5),
+                Pos2::new(lane.right() - 1.5, lane.bottom() - 1.5),
+            );
+            ui.painter().rect_filled(
+                clip,
+                CornerRadius::same(2),
+                if enabled {
+                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 18)
+                } else {
+                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 6)
+                },
+            );
+            ui.painter().rect_stroke(
+                clip,
+                CornerRadius::same(2),
+                Stroke::new(
+                    1.0,
+                    if enabled {
+                        theme::accent_alpha(accent, 150)
+                    } else {
+                        theme::BORDER
+                    },
+                ),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().rect_filled(
+                Rect::from_min_size(clip.min, Vec2::new(2.0, clip.height())),
+                CornerRadius::same(1),
+                if enabled { accent } else { theme::BORDER },
+            );
+
+            let header_y = clip.top() + 5.0;
+            ui.painter().text(
+                Pos2::new(clip.left() + 6.0, header_y),
+                Align2::LEFT_CENTER,
+                "MIDI CLIP",
+                theme::display(6.0),
+                if enabled {
+                    theme::accent_alpha(accent, 230)
+                } else {
+                    theme::TEXT_DIM
+                },
+            );
+            let label = if enabled {
+                format!("{} NOTES · 16 BARS", notes.len())
+            } else {
+                format!("{} NOTES · MUTED", notes.len())
+            };
+            ui.painter().text(
+                Pos2::new(clip.right() - 5.0, header_y),
+                Align2::RIGHT_CENTER,
+                label,
+                theme::mono(5.4),
+                if enabled {
+                    theme::TEXT_DIM
+                } else {
+                    theme::AMBER
+                },
+            );
+
+            let roll = Rect::from_min_max(
+                Pos2::new(clip.left() + 4.0, clip.top() + 10.0),
+                Pos2::new(clip.right() - 4.0, clip.bottom() - 2.0),
+            );
+            if roll.height() > 4.0 {
+                let mut min_note = 127u8;
+                let mut max_note = 0u8;
+                for note in &notes {
+                    min_note = min_note.min(note.note);
+                    max_note = max_note.max(note.note);
+                }
+                let span = (max_note.saturating_sub(min_note)).max(11) as f32;
+                for note in &notes {
+                    let x0 = roll.left() + note.start_step as f32 / steps_total * roll.width();
+                    let x1 = roll.left()
+                        + note.end_step().min(steps_total as u16) as f32 / steps_total
+                            * roll.width();
+                    let pitch = (note.note.saturating_sub(min_note)) as f32 / span;
+                    let top = roll.top() + (1.0 - pitch) * (roll.height() - 3.0);
+                    let rect = Rect::from_min_max(
+                        Pos2::new(x0.max(roll.left()), top),
+                        Pos2::new((x1.max(x0 + 2.5)).min(roll.right()), top + 3.0),
+                    );
+                    let color = if enabled {
+                        theme::accent_alpha(accent, 225)
+                    } else {
+                        theme::accent_alpha(accent, 60)
+                    };
+                    ui.painter().rect_filled(rect, CornerRadius::same(1), color);
+                }
             }
         }
 

@@ -8,33 +8,42 @@ use rtrb::Consumer;
 
 use crate::audio::messages::RecordedNote;
 use crate::audio::{
-    gain_to_db, RecordEvent, Telemetry, DEFAULT_BPM, SCENE_COUNT, TRACKS, TRACK_COUNT,
+    gain_to_db, EffectKind, RecordEvent, SynthParams, Telemetry, DEFAULT_BPM, SCENE_COUNT, TRACKS,
+    TRACK_COUNT,
 };
 use crate::dsp::spectrum::SpectrumAnalyzer;
 
 pub const MAX_SCOPE: usize = 4096;
 
+/// One effect module mirrored from the engine chain.
 #[derive(Clone, Copy, Debug)]
-pub struct FxValues {
-    pub gain: f32,
-    pub tone: f32,
-    pub cutoff: f32,
-    pub resonance: f32,
-    pub drive: f32,
-    pub width: f32,
+pub struct UiEffect {
+    pub kind: EffectKind,
+    pub params: [f32; 3],
+    pub bypass: bool,
 }
 
-impl Default for FxValues {
-    fn default() -> Self {
+impl UiEffect {
+    pub fn new(kind: EffectKind) -> Self {
         Self {
-            gain: 0.90,
-            tone: 16_000.0,
-            cutoff: 5_200.0,
-            resonance: 0.18,
-            drive: 0.12,
-            width: 1.0,
+            kind,
+            params: kind.defaults(),
+            bypass: false,
         }
     }
+}
+
+/// The default master chain, matching the engine.
+pub fn default_chain() -> Vec<UiEffect> {
+    [
+        EffectKind::Drive,
+        EffectKind::Tone,
+        EffectKind::Filter,
+        EffectKind::Width,
+    ]
+    .into_iter()
+    .map(UiEffect::new)
+    .collect()
 }
 
 pub struct UiState {
@@ -52,7 +61,14 @@ pub struct UiState {
     pub master_peaks: [f32; 2],
     pub cpu: f32,
     pub voices: u8,
-    pub fx: FxValues,
+    pub effects: Vec<UiEffect>,
+    pub master_gain: f32,
+    pub synth: [SynthParams; TRACK_COUNT],
+    pub recorded_active: [bool; TRACK_COUNT],
+    /// Floating "add effect" menu state.
+    pub add_effect_open: bool,
+    pub add_menu_pos: egui::Pos2,
+    pub pending_chain_reset: bool,
     pub scope: VecDeque<f32>,
     scope_scratch: Vec<f32>,
     pub analyzer: SpectrumAnalyzer,
@@ -91,7 +107,13 @@ impl UiState {
             master_peaks: [0.0; 2],
             cpu: 0.0,
             voices: 0,
-            fx: FxValues::default(),
+            effects: default_chain(),
+            master_gain: 0.90,
+            synth: std::array::from_fn(|index| SynthParams::from_spec(&TRACKS[index])),
+            recorded_active: [true; TRACK_COUNT],
+            add_effect_open: false,
+            add_menu_pos: egui::Pos2::new(200.0, 200.0),
+            pending_chain_reset: false,
             scope: VecDeque::with_capacity(MAX_SCOPE),
             scope_scratch: Vec::with_capacity(8192),
             analyzer: SpectrumAnalyzer::new(48_000.0),
@@ -182,6 +204,38 @@ impl UiState {
         if let Some(slot) = self.recorded.get_mut(track) {
             *slot = notes;
         }
+    }
+
+    /// Synth parameters for the selected track.
+    pub fn synth_params(&self, track: usize) -> SynthParams {
+        self.synth[track.min(TRACK_COUNT - 1)]
+    }
+
+    /// Append an effect to the mirrored chain, bounded by the engine limit.
+    pub fn add_effect(&mut self, kind: EffectKind) -> Option<usize> {
+        if self.effects.len() >= crate::audio::MAX_EFFECTS {
+            return None;
+        }
+        self.effects.push(UiEffect::new(kind));
+        Some(self.effects.len() - 1)
+    }
+
+    pub fn remove_effect(&mut self, index: usize) {
+        if index < self.effects.len() {
+            self.effects.remove(index);
+        }
+    }
+
+    pub fn move_effect(&mut self, from: usize, to: usize) {
+        if from < self.effects.len() && to < self.effects.len() && from != to {
+            let effect = self.effects.remove(from);
+            self.effects.insert(to, effect);
+        }
+    }
+
+    pub fn reset_chain(&mut self) {
+        self.effects = default_chain();
+        self.master_gain = 0.90;
     }
 
     pub fn analyse(&mut self) {
@@ -282,6 +336,38 @@ mod tests {
             state.ingest(t, 1.0 / 60.0);
         }
         assert!(state.peaks[0] < 0.01, "peak {}", state.peaks[0]);
+    }
+
+    #[test]
+    fn effect_chain_helpers_mirror_the_engine() {
+        let mut state = UiState::new();
+        assert_eq!(state.effects.len(), 4);
+        assert_eq!(state.effects[0].kind, crate::audio::EffectKind::Drive);
+
+        let index = state
+            .add_effect(crate::audio::EffectKind::Delay)
+            .expect("append effect");
+        assert_eq!(index, 4);
+        state.move_effect(4, 0);
+        assert_eq!(state.effects[0].kind, crate::audio::EffectKind::Delay);
+
+        state.remove_effect(0);
+        assert_eq!(state.effects.len(), 4);
+
+        while state.add_effect(crate::audio::EffectKind::Filter).is_some() {}
+        assert_eq!(state.effects.len(), crate::audio::MAX_EFFECTS);
+
+        state.reset_chain();
+        assert_eq!(state.effects.len(), 4);
+        assert!((state.master_gain - 0.90).abs() < 1e-6);
+    }
+
+    #[test]
+    fn synth_params_are_editable_per_track() {
+        let mut state = UiState::new();
+        state.synth[3].set(crate::audio::SynthParam::Index, 6.0);
+        assert!((state.synth_params(3).mod_index - 6.0).abs() < 1e-6);
+        assert!((state.synth_params(2).mod_index - 6.0).abs() > 1e-3);
     }
 
     #[test]

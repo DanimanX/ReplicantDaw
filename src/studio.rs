@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
-use crate::audio::messages::{Command, FxParam, RecordedClip, RecordedNote, TRACK_COUNT};
+use crate::audio::messages::{Command, RecordedClip, RecordedNote, TRACK_COUNT};
 use crate::audio::{AudioRuntime, MidiMessage, MidiRuntime};
 use crate::plugins::{
     scan_all, ParamInfo, PluginCommand, PluginDescriptor, PluginEvent, PluginRuntime,
@@ -37,6 +37,8 @@ pub struct Studio {
     pub rack_open: bool,
     pub midi_open: bool,
     pub project_open: bool,
+    pub synth_open: bool,
+    pub zoom: f32,
 
     pub project_name: String,
     pub project_path: Option<PathBuf>,
@@ -65,6 +67,8 @@ impl Studio {
             rack_open: false,
             midi_open: false,
             project_open: false,
+            synth_open: false,
+            zoom: 1.0,
             project_name: "Untitled".to_string(),
             project_path: None,
             projects: Project::list_available(),
@@ -300,22 +304,40 @@ impl Studio {
         state.bpm = project.bpm;
         let _ = audio.command_tx.push(Command::SetBpm(project.bpm));
 
-        state.fx.gain = project.fx.gain;
-        state.fx.tone = project.fx.tone;
-        state.fx.cutoff = project.fx.cutoff;
-        state.fx.resonance = project.fx.resonance;
-        state.fx.drive = project.fx.drive;
-        state.fx.width = project.fx.width;
-        for (param, value) in [
-            (FxParam::Gain, project.fx.gain),
-            (FxParam::Tone, project.fx.tone),
-            (FxParam::Cutoff, project.fx.cutoff),
-            (FxParam::Resonance, project.fx.resonance),
-            (FxParam::Drive, project.fx.drive),
-            (FxParam::Width, project.fx.width),
-        ] {
-            let _ = audio.command_tx.push(Command::SetFx { param, value });
+        // Rebuild the modular chain from scratch and apply the master gain.
+        state.effects.clear();
+        let _ = audio.command_tx.push(Command::ClearEffects);
+        for effect in &project.effects {
+            let Some(kind) = effect.effect_kind() else {
+                self.log_error(format!("Unknown effect module '{}'", effect.kind));
+                continue;
+            };
+            if state.add_effect(kind).is_some() {
+                let index = state.effects.len() as u8 - 1;
+                let _ = audio.command_tx.push(Command::AddEffect { kind });
+                let mut effect_state = state.effects[index as usize];
+                for knob in 0..3 {
+                    effect_state.params[knob] = effect.params[knob];
+                    let _ = audio.command_tx.push(Command::SetEffectParam {
+                        index,
+                        knob: knob as u8,
+                        value: effect.params[knob],
+                    });
+                }
+                effect_state.bypass = effect.bypass;
+                state.effects[index as usize] = effect_state;
+                if effect.bypass {
+                    let _ = audio.command_tx.push(Command::SetEffectBypass {
+                        index,
+                        bypass: true,
+                    });
+                }
+            }
         }
+        state.master_gain = project.master_gain;
+        let _ = audio.command_tx.push(Command::SetMasterGain {
+            gain: project.master_gain,
+        });
 
         for (index, track) in project.tracks.iter().take(TRACK_COUNT).enumerate() {
             state.track_gain_db[index] = track.gain_db;
@@ -364,6 +386,23 @@ impl Studio {
                 track: index as u8,
                 clip,
             });
+            state.recorded_active[index] = track.clip_enabled;
+            let _ = audio.command_tx.push(Command::SetRecordedActive {
+                track: index as u8,
+                active: track.clip_enabled,
+            });
+
+            if let Some(synth) = &track.synth {
+                let params = synth.to_params();
+                state.synth[index] = params;
+                for param in crate::audio::SynthParam::ALL {
+                    let _ = audio.command_tx.push(Command::SetSynthParam {
+                        track: index as u8,
+                        param,
+                        value: params.get(param),
+                    });
+                }
+            }
         }
 
         for plugin in &project.plugins {

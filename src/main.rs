@@ -7,6 +7,8 @@ use std::time::Instant;
 
 use replicant_daw::app::ReplicantApp;
 use replicant_daw::audio::{self, Command, Engine};
+use replicant_daw::project;
+use replicant_daw::state;
 use replicant_daw::APP_VERSION;
 
 fn main() {
@@ -169,9 +171,17 @@ fn selftest() -> Result<(), String> {
     );
     command_tx.push(Command::Play).map_err(|e| e.to_string())?;
     command_tx
-        .push(Command::SetFx {
-            param: audio::FxParam::Cutoff,
+        .push(Command::SetEffectParam {
+            index: 2,
+            knob: 0,
             value: 900.0,
+        })
+        .map_err(|e| e.to_string())?;
+    command_tx
+        .push(Command::SetSynthParam {
+            track: 0,
+            param: audio::SynthParam::Index,
+            value: 2.5,
         })
         .map_err(|e| e.to_string())?;
     command_tx
@@ -192,6 +202,83 @@ fn selftest() -> Result<(), String> {
     );
     if !telemetry.playing || scope_frames == 0 {
         return Err("rtrb telemetry/scope path did not deliver data".into());
+    }
+
+    // Modular chain and editable synth through the command path.
+    let mut chain = Engine::offline(48_000.0);
+    chain.apply(Command::Play);
+    let default_effects = chain.effect_count();
+    chain.apply(Command::RemoveEffect { index: 1 });
+    chain.apply(Command::AddEffect {
+        kind: audio::EffectKind::Delay,
+    });
+    chain.apply(Command::SetEffectParam {
+        index: 0,
+        knob: 0,
+        value: 0.7,
+    });
+    chain.apply(Command::SetSynthParam {
+        track: 0,
+        param: audio::SynthParam::Index,
+        value: 3.2,
+    });
+    let mut chain_buffer = vec![0.0_f32; block * 2];
+    for _ in 0..(9_600 / block) {
+        chain.process(&mut chain_buffer);
+    }
+    println!(
+        "- chain: {default_effects} default modules -> {} after remove/add; synth index {:.1}",
+        chain.effect_count(),
+        chain.synth_params(0).mod_index
+    );
+    if chain.effect_count() != default_effects {
+        return Err("effect chain bookkeeping is inconsistent".into());
+    }
+    if !chain_buffer.iter().all(|sample| sample.is_finite()) {
+        return Err("effect chain emitted non-finite samples".into());
+    }
+
+    // Project save/load round trip, including chain, synth and MIDI state.
+    let mut ui_state = state::UiState::new();
+    ui_state.effects.clear();
+    ui_state.add_effect(audio::EffectKind::Delay);
+    ui_state.add_effect(audio::EffectKind::Filter);
+    ui_state.master_gain = 0.66;
+    ui_state.synth[0].set(audio::SynthParam::Index, 4.25);
+    ui_state.set_recorded(
+        0,
+        vec![audio::RecordedNote {
+            note: 64,
+            velocity: 99,
+            start_step: 8,
+            length_steps: 3,
+        }],
+    );
+    ui_state.recorded_active[0] = false;
+    let project = project::Project::from_session("Selftest", 137.0, &ui_state);
+    let json = project.to_json()?;
+    let reloaded = project::Project::from_json(&json)?;
+    let ok = reloaded.effects.len() == 2
+        && reloaded.effects[0].kind == "DELAY"
+        && (reloaded.master_gain - 0.66).abs() < 1e-6
+        && reloaded.tracks[0].notes.len() == 1
+        && !reloaded.tracks[0].clip_enabled
+        && reloaded.tracks[0]
+            .synth
+            .as_ref()
+            .is_some_and(|synth| (synth.index - 4.25).abs() < 1e-4);
+    println!(
+        "- project: {} module(s), {} note(s), synth index {:.2}",
+        reloaded.effects.len(),
+        reloaded.tracks[0].notes.len(),
+        reloaded.tracks[0]
+            .synth
+            .as_ref()
+            .map(|synth| synth.index)
+            .unwrap_or(f32::NAN)
+    );
+    if !ok {
+        return Err("project round trip lost chain, synth or MIDI state".into());
     }
 
     // MIDI recording through the real lock-free path.

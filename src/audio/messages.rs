@@ -85,22 +85,281 @@ pub struct RecordEvent {
     pub reset: bool,
 }
 
-/// Parameters exposed by the modular device chain.
+/// Editable parameters of the two-operator FM synth (per track).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FxParam {
-    /// Output gain, linear (0.0 ..= 1.4).
-    Gain,
-    /// High-cut tone filter in Hz (300 ..= 18_000).
-    Tone,
-    /// Resonant low-pass cutoff in Hz (40 ..= 18_000).
-    Cutoff,
-    /// Filter resonance, normalized (0.0 ..= 1.0).
-    Resonance,
-    /// Saturation drive, normalized (0.0 ..= 1.0).
-    Drive,
-    /// Stereo width, 0.0 = mono, 1.0 = normal, 1.5 = wide.
-    Width,
+pub enum SynthParam {
+    /// Modulator : carrier frequency ratio.
+    Ratio,
+    /// FM modulation index.
+    Index,
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+    Level,
 }
+
+impl SynthParam {
+    pub const ALL: [Self; 7] = [
+        Self::Ratio,
+        Self::Index,
+        Self::Attack,
+        Self::Decay,
+        Self::Sustain,
+        Self::Release,
+        Self::Level,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ratio => "RATIO",
+            Self::Index => "INDEX",
+            Self::Attack => "ATTACK",
+            Self::Decay => "DECAY",
+            Self::Sustain => "SUSTAIN",
+            Self::Release => "RELEASE",
+            Self::Level => "LEVEL",
+        }
+    }
+
+    /// Inclusive range accepted by the engine.
+    pub fn range(self) -> (f32, f32) {
+        match self {
+            Self::Ratio => (0.25, 8.0),
+            Self::Index => (0.0, 8.0),
+            Self::Attack => (0.001, 2.0),
+            Self::Decay => (0.005, 3.0),
+            Self::Sustain => (0.0, 1.0),
+            Self::Release => (0.01, 4.0),
+            Self::Level => (0.0, 1.5),
+        }
+    }
+
+    /// True when the parameter is perceptually logarithmic (time constants).
+    pub fn logarithmic(self) -> bool {
+        matches!(self, Self::Attack | Self::Decay | Self::Release)
+    }
+
+    pub fn format(self, value: f32) -> String {
+        match self {
+            Self::Ratio => format!("{value:.2}x"),
+            Self::Index => format!("{value:.2}"),
+            Self::Attack | Self::Decay | Self::Release => {
+                if value >= 1.0 {
+                    format!("{value:.2}s")
+                } else {
+                    format!("{:.0}ms", value * 1000.0)
+                }
+            }
+            Self::Sustain | Self::Level => format!("{:.0}%", value * 100.0),
+        }
+    }
+}
+
+/// Effect modules that can be inserted in the master chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EffectKind {
+    Drive,
+    Filter,
+    Tone,
+    Width,
+    Delay,
+}
+
+/// One knob exposed by an effect module.
+#[derive(Clone, Copy, Debug)]
+pub struct EffectKnob {
+    pub name: &'static str,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub logarithmic: bool,
+    pub suffix: &'static str,
+}
+
+impl EffectKind {
+    pub const ALL: [Self; 5] = [
+        Self::Drive,
+        Self::Filter,
+        Self::Tone,
+        Self::Width,
+        Self::Delay,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Drive => "SYNAPSE DRIVE",
+            Self::Filter => "QUANTUM RESONATOR",
+            Self::Tone => "NEURAL GEN V5",
+            Self::Width => "MIRROR WIDTH",
+            Self::Delay => "ECHO MEMORY",
+        }
+    }
+
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Drive => "DRIVE",
+            Self::Filter => "FILTER",
+            Self::Tone => "TONE",
+            Self::Width => "WIDTH",
+            Self::Delay => "DELAY",
+        }
+    }
+
+    /// Stable identifier used in project files.
+    pub fn id(self) -> &'static str {
+        self.short()
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|kind| kind.id().eq_ignore_ascii_case(id))
+    }
+
+    pub fn knobs(self) -> &'static [EffectKnob] {
+        match self {
+            Self::Drive => &[
+                EffectKnob {
+                    name: "DRIVE",
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.12,
+                    logarithmic: false,
+                    suffix: "%",
+                },
+                EffectKnob {
+                    name: "MIX",
+                    min: 0.0,
+                    max: 1.0,
+                    default: 1.0,
+                    logarithmic: false,
+                    suffix: "%",
+                },
+                EffectKnob {
+                    name: "OUT",
+                    min: 0.0,
+                    max: 2.0,
+                    default: 1.0,
+                    logarithmic: false,
+                    suffix: "x",
+                },
+            ],
+            Self::Filter => &[
+                EffectKnob {
+                    name: "CUTOFF",
+                    min: 40.0,
+                    max: 12_000.0,
+                    default: 5_200.0,
+                    logarithmic: true,
+                    suffix: "Hz",
+                },
+                EffectKnob {
+                    name: "RES",
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.18,
+                    logarithmic: false,
+                    suffix: "%",
+                },
+                EffectKnob {
+                    name: "MIX",
+                    min: 0.0,
+                    max: 1.0,
+                    default: 1.0,
+                    logarithmic: false,
+                    suffix: "%",
+                },
+            ],
+            Self::Tone => &[
+                EffectKnob {
+                    name: "CUT",
+                    min: 300.0,
+                    max: 18_000.0,
+                    default: 16_000.0,
+                    logarithmic: true,
+                    suffix: "Hz",
+                },
+                EffectKnob {
+                    name: "MIX",
+                    min: 0.0,
+                    max: 1.0,
+                    default: 1.0,
+                    logarithmic: false,
+                    suffix: "%",
+                },
+                EffectKnob {
+                    name: "OUT",
+                    min: 0.0,
+                    max: 2.0,
+                    default: 1.0,
+                    logarithmic: false,
+                    suffix: "x",
+                },
+            ],
+            Self::Width => &[
+                EffectKnob {
+                    name: "WIDTH",
+                    min: 0.0,
+                    max: 1.5,
+                    default: 1.0,
+                    logarithmic: false,
+                    suffix: "%",
+                },
+                EffectKnob {
+                    name: "MIX",
+                    min: 0.0,
+                    max: 1.0,
+                    default: 1.0,
+                    logarithmic: false,
+                    suffix: "%",
+                },
+                EffectKnob {
+                    name: "OUT",
+                    min: 0.0,
+                    max: 2.0,
+                    default: 1.0,
+                    logarithmic: false,
+                    suffix: "x",
+                },
+            ],
+            Self::Delay => &[
+                EffectKnob {
+                    name: "TIME",
+                    min: 0.02,
+                    max: 1.0,
+                    default: 0.28,
+                    logarithmic: true,
+                    suffix: "s",
+                },
+                EffectKnob {
+                    name: "FEEDBACK",
+                    min: 0.0,
+                    max: 0.9,
+                    default: 0.35,
+                    logarithmic: false,
+                    suffix: "%",
+                },
+                EffectKnob {
+                    name: "MIX",
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.25,
+                    logarithmic: false,
+                    suffix: "%",
+                },
+            ],
+        }
+    }
+
+    pub fn defaults(self) -> [f32; 3] {
+        let knobs = self.knobs();
+        [knobs[0].default, knobs[1].default, knobs[2].default]
+    }
+}
+
+/// Maximum number of effect modules on the master chain.
+pub const MAX_EFFECTS: usize = 6;
 
 /// Commands sent from the UI thread to the audio thread.
 ///
@@ -137,9 +396,41 @@ pub enum Command {
     StopClip {
         track: u8,
     },
-    SetFx {
-        param: FxParam,
+    /// Change one editable parameter of a track's FM synth.
+    SetSynthParam {
+        track: u8,
+        param: SynthParam,
         value: f32,
+    },
+    /// Append an effect module at the end of the master chain.
+    AddEffect {
+        kind: EffectKind,
+    },
+    RemoveEffect {
+        index: u8,
+    },
+    /// Move an effect inside the chain (indices are clamped by the engine).
+    MoveEffect {
+        from: u8,
+        to: u8,
+    },
+    SetEffectParam {
+        index: u8,
+        knob: u8,
+        value: f32,
+    },
+    SetEffectBypass {
+        index: u8,
+        bypass: bool,
+    },
+    ClearEffects,
+    SetMasterGain {
+        gain: f32,
+    },
+    /// Enable or mute a track's recorded MIDI clip.
+    SetRecordedActive {
+        track: u8,
+        active: bool,
     },
     /// Start recording incoming MIDI on `track`, replacing its clip.
     RecordStart {

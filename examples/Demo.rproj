@@ -1,0 +1,317 @@
+{
+  "format_version": 2,
+  "app_version": "1.0.2",
+  "name": "Neon Demo",
+  "bpm": 142.0,
+  "effects": [
+    {
+      "kind": "DRIVE",
+      "params": [
+        0.22,
+        1.0,
+        1.0
+      ],
+      "bypass": false
+    },
+    {
+      "kind": "TONE",
+      "params": [
+        14000.0,
+        1.0,
+        1.0
+      ],
+      "bypass": false
+    },
+    {
+      "kind": "FILTER",
+      "params": [
+        6200.0,
+        0.24,
+        1.0
+      ],
+      "bypass": false
+    },
+    {
+      "kind": "WIDTH",
+      "params": [
+        1.1,
+        1.0,
+        1.0
+      ],
+      "bypass": false
+    },
+    {
+      "kind": "DELAY",
+      "params": [
+        0.28,
+        0.32,
+        0.18
+      ],
+      "bypass": false
+    }
+  ],
+  "master_gain": 0.9,
+  "tracks": [
+    {
+      "name": "SYNAPSE 01",
+      "gain_db": -7.0,
+      "pan": -0.12,
+      "mute": false,
+      "solo": false,
+      "scene": 1,
+      "notes": [
+        {
+          "note": 60,
+          "velocity": 100,
+          "start_step": 0,
+          "length_steps": 2
+        },
+        {
+          "note": 64,
+          "velocity": 100,
+          "start_step": 4,
+          "length_steps": 2
+        },
+        {
+          "note": 67,
+          "velocity": 100,
+          "start_step": 8,
+          "length_steps": 2
+        },
+        {
+          "note": 72,
+          "velocity": 100,
+          "start_step": 12,
+          "length_steps": 2
+        },
+        {
+          "note": 67,
+          "velocity": 100,
+          "start_step": 16,
+          "length_steps": 2
+        },
+        {
+          "note": 64,
+          "velocity": 100,
+          "start_step": 20,
+          "length_steps": 2
+        },
+        {
+          "note": 62,
+          "velocity": 100,
+          "start_step": 24,
+          "length_steps": 2
+        },
+        {
+          "note": 60,
+          "velocity": 100,
+          "start_step": 28,
+          "length_steps": 2
+        },
+        {
+          "note": 60,
+          "velocity": 100,
+          "start_step": 32,
+          "length_steps": 2
+        },
+        {
+          "note": 64,
+          "velocity": 100,
+          "start_step": 36,
+          "length_steps": 2
+        },
+        {
+          "note": 67,
+          "velocity": 100,
+          "start_step": 40,
+          "length_steps": 2
+        },
+        {
+          "note": 72,
+          "velocity": 100,
+          "start_step": 44,
+          "length_steps": 2
+        },
+        {
+          "note": 67,
+          "velocity": 100,
+          "start_step": 48,
+          "length_steps": 2
+        },
+        {
+          "note": 64,
+          "velocity": 100,
+          "start_step": 52,
+          "length_steps": 2
+        },
+        {
+          "note": 62,
+          "velocity": 100,
+          "start_step": 56,
+          "length_steps": 2
+        },
+        {
+          "note": 60,
+          "velocity": 100,
+          "start_step": 60,
+          "length_steps": 2
+        }
+      ],
+      "clip_enabled": true,
+      "synth": {
+        "ratio": 1.0,
+        "index": 2.4,
+        "attack": 0.004,
+        "decay": 0.18,
+        "sustain": 0.25,
+        "release": 0.25,
+        "level": 0.9
+      }
+    },
+    {
+      "name": "BIOLINK",
+      "gain_db": -10.0,
+      "pan": 0.22,
+      "mute": false,
+      "solo": false,
+      "scene": 1,
+      "notes": [],
+      "clip_enabled": true
+    },
+    {
+      "name": "NEURAL BASS",
+      "gain_db": -5.0,
+      "pan": 0.0,
+      "mute": false,
+      "solo": false,
+      "scene": 1,
+      "notes": [
+        {
+          "note": 36,
+          "velocity": 110,
+          "start_step": 0,
+          "length_steps": 3
+        },
+        {
+          "note": 41,
+          "velocity": 110,
+          "start_step": 8,
+          "length_steps": 3
+        },
+        {
+          "note": 46,
+          "velocity": 110,
+          "start_step": 16,
+          "length_steps": 3
+        },
+        {
+          "note": 36,
+          "velocity": 110,
+          "start_step": 24,
+          "length_steps": 3
+        },
+        {
+          "note": 41,
+          "velocity": 110,
+          "start_step": 32,
+          "length_steps": 3
+        },
+        {
+          "note": 46,
+          "velocity": 110,
+          "start_step": 40,
+          "length_steps": 3
+        },
+        {
+          "note": 36,
+          "velocity": 110,
+          "start_step": 48,
+          "length_steps": 3
+        },
+        {
+          "note": 41,
+          "velocity": 110,
+          "start_step": 56,
+          "length_steps": 3
+        }
+      ],
+      "clip_enabled": true
+    },
+    {
+      "name": "SUB-QUANT 04",
+      "gain_db": -4.0,
+      "pan": 0.0,
+      "mute": false,
+      "solo": false,
+      "scene": 0,
+      "notes": [],
+      "clip_enabled": true
+    },
+    {
+      "name": "AI VOICELET",
+      "gain_db": -12.0,
+      "pan": 0.28,
+      "mute": false,
+      "solo": false,
+      "scene": 2,
+      "notes": [],
+      "clip_enabled": true
+    },
+    {
+      "name": "QUANTUM PAD",
+      "gain_db": -14.0,
+      "pan": -0.35,
+      "mute": false,
+      "solo": false,
+      "scene": 1,
+      "notes": [
+        {
+          "note": 48,
+          "velocity": 80,
+          "start_step": 0,
+          "length_steps": 12
+        },
+        {
+          "note": 51,
+          "velocity": 80,
+          "start_step": 16,
+          "length_steps": 12
+        },
+        {
+          "note": 54,
+          "velocity": 80,
+          "start_step": 32,
+          "length_steps": 12
+        },
+        {
+          "note": 57,
+          "velocity": 80,
+          "start_step": 48,
+          "length_steps": 12
+        }
+      ],
+      "clip_enabled": true
+    },
+    {
+      "name": "GHOSTWIRE",
+      "gain_db": -15.0,
+      "pan": 0.32,
+      "mute": false,
+      "solo": false,
+      "scene": 2,
+      "notes": [],
+      "clip_enabled": true
+    },
+    {
+      "name": "MIRROR CORE",
+      "gain_db": -13.0,
+      "pan": 0.12,
+      "mute": false,
+      "solo": false,
+      "scene": 1,
+      "notes": [],
+      "clip_enabled": true
+    }
+  ],
+  "plugins": []
+}

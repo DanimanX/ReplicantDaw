@@ -6,14 +6,15 @@
 
 use rtrb::{Consumer, Producer};
 
+use super::effects::EffectSlot;
 use super::messages::{
-    db_to_gain, Command, FxParam, RecordEvent, RecordedClip, RecordedNote, Telemetry, LOOP_STEPS,
-    STEPS_PER_BAR, TRACK_COUNT,
+    db_to_gain, Command, EffectKind, RecordEvent, RecordedClip, RecordedNote, Telemetry,
+    LOOP_STEPS, MAX_EFFECTS, STEPS_PER_BAR, TRACK_COUNT,
 };
 use super::midi::MidiMessage;
-use super::synth::Voice;
+use super::synth::{SynthParams, Voice};
 use super::tracks::{note_at, TrackSpec, TRACKS};
-use crate::dsp::{soft_clip, DcBlocker, OnePole, Smoothed, Svf};
+use crate::dsp::{soft_clip, DcBlocker, Smoothed};
 use crate::plugins::{PluginBlock, PLUGIN_BLOCK_FRAMES};
 
 pub const MAX_VOICES: usize = 32;
@@ -46,28 +47,6 @@ impl TrackState {
     }
 }
 
-struct FxState {
-    gain: Smoothed,
-    tone: Smoothed,
-    cutoff: Smoothed,
-    resonance: Smoothed,
-    drive: Smoothed,
-    width: Smoothed,
-}
-
-impl FxState {
-    fn new(sample_rate: f32) -> Self {
-        Self {
-            gain: Smoothed::new(0.90, sample_rate, 0.02),
-            tone: Smoothed::new(16_000.0, sample_rate, 0.05),
-            cutoff: Smoothed::new(5_200.0, sample_rate, 0.04),
-            resonance: Smoothed::new(0.18, sample_rate, 0.04),
-            drive: Smoothed::new(0.12, sample_rate, 0.03),
-            width: Smoothed::new(1.0, sample_rate, 0.03),
-        }
-    }
-}
-
 /// Optional ring-buffer endpoints and side channels for the engine.
 #[derive(Default)]
 pub struct EngineIo {
@@ -89,13 +68,12 @@ pub struct Engine {
     position: u64,
     last_step: u64,
     tracks: [TrackState; TRACK_COUNT],
+    synth: [SynthParams; TRACK_COUNT],
     voices: [Voice; MAX_VOICES],
     voice_age: u64,
-    fx: FxState,
-    filter_l: Svf,
-    filter_r: Svf,
-    tone_l: OnePole,
-    tone_r: OnePole,
+    effects: [EffectSlot; MAX_EFFECTS],
+    effect_count: u8,
+    master_gain: Smoothed,
     dc_l: DcBlocker,
     dc_r: DcBlocker,
     command_rx: Option<Consumer<Command>>,
@@ -107,6 +85,7 @@ pub struct Engine {
     midi_rx: Option<Consumer<MidiMessage>>,
     record_tx: Option<Producer<RecordEvent>>,
     recorded: [RecordedClip; TRACK_COUNT],
+    recorded_active: [bool; TRACK_COUNT],
     recording: bool,
     record_track: u8,
     record_pending: Option<RecordedNote>,
@@ -160,13 +139,12 @@ impl Engine {
             position: 0,
             last_step: u64::MAX,
             tracks: std::array::from_fn(|i| TrackState::new(i, sample_rate)),
+            synth: std::array::from_fn(|i| SynthParams::from_spec(&TRACKS[i])),
             voices: [Voice::default(); MAX_VOICES],
             voice_age: 0,
-            fx: FxState::new(sample_rate),
-            filter_l: Svf::default(),
-            filter_r: Svf::default(),
-            tone_l: OnePole::default(),
-            tone_r: OnePole::default(),
+            effects: std::array::from_fn(|_| EffectSlot::new(sample_rate)),
+            effect_count: 0,
+            master_gain: Smoothed::new(0.90, sample_rate, 0.02),
             dc_l: DcBlocker::default(),
             dc_r: DcBlocker::default(),
             command_rx: io.commands,
@@ -178,6 +156,7 @@ impl Engine {
             midi_rx: io.midi,
             record_tx: io.record_events,
             recorded: [RecordedClip::default(); TRACK_COUNT],
+            recorded_active: [true; TRACK_COUNT],
             recording: false,
             record_track: 0,
             record_pending: None,
@@ -192,6 +171,56 @@ impl Engine {
             plugin_latency: 0,
             last_midi_note: 60,
         }
+        .with_default_chain()
+    }
+
+    /// Default master chain: the three "signature" devices from the original
+    /// design, now as removable modules.
+    fn with_default_chain(mut self) -> Self {
+        for kind in [
+            EffectKind::Drive,
+            EffectKind::Tone,
+            EffectKind::Filter,
+            EffectKind::Width,
+        ] {
+            self.add_effect(kind);
+        }
+        self
+    }
+
+    fn add_effect(&mut self, kind: EffectKind) {
+        let index = self.effect_count as usize;
+        if index < MAX_EFFECTS {
+            self.effects[index].set_kind(Some(kind));
+            self.effect_count += 1;
+        }
+    }
+
+    /// Number of effect modules currently in the chain.
+    pub fn effect_count(&self) -> usize {
+        self.effect_count as usize
+    }
+
+    /// Kind of the effect at `index`, if any.
+    pub fn effect_kind(&self, index: usize) -> Option<EffectKind> {
+        if index < self.effect_count as usize {
+            self.effects[index].kind()
+        } else {
+            None
+        }
+    }
+
+    /// Current knob value of an effect module.
+    pub fn effect_parameter(&self, index: usize, knob: usize) -> f32 {
+        self.effects
+            .get(index)
+            .map(|slot| slot.parameter(knob))
+            .unwrap_or(0.0)
+    }
+
+    /// Editable synth parameters for a track.
+    pub fn synth_params(&self, track: usize) -> SynthParams {
+        self.synth[track.min(TRACK_COUNT - 1)]
     }
 
     /// Engine without any ring-buffer endpoints; used by tests and `--selftest`.
@@ -287,32 +316,15 @@ impl Engine {
                 }
             }
 
-            // ---- Master FX chain ----------------------------------------
-            let drive = self.fx.drive.tick();
-            if drive > 0.001 {
-                let pre = 1.0 + drive * 6.0;
-                let post = 1.0 / (1.0 + drive * 1.1);
-                l = (l * pre).tanh() * post;
-                r = (r * pre).tanh() * post;
+            // ---- Modular master effect chain -----------------------------
+            let effect_count = self.effect_count as usize;
+            for slot in &mut self.effects[..effect_count] {
+                let (wet_l, wet_r) = slot.process(l, r);
+                l = wet_l;
+                r = wet_r;
             }
 
-            let tone = self.fx.tone.tick();
-            l = self.tone_l.process(l, tone, self.sample_rate);
-            r = self.tone_r.process(r, tone, self.sample_rate);
-
-            let cutoff = self.fx.cutoff.tick();
-            let resonance = self.fx.resonance.tick();
-            let (g, k) = Svf::coefficients(cutoff, resonance, self.sample_rate);
-            l = self.filter_l.process(l, g, k);
-            r = self.filter_r.process(r, g, k);
-
-            let width = self.fx.width.tick();
-            let mid = (l + r) * 0.5;
-            let side = (l - r) * 0.5 * width;
-            l = mid + side;
-            r = mid - side;
-
-            let gain = self.fx.gain.tick();
+            let gain = self.master_gain.tick();
             l = soft_clip(l * gain);
             r = soft_clip(r * gain);
 
@@ -504,17 +516,65 @@ impl Engine {
             Command::SetInputTrack { track } => {
                 self.record_track = (track as usize).min(TRACK_COUNT - 1) as u8;
             }
-            Command::SetFx { param, value } => {
-                if !value.is_finite() {
-                    return;
+            Command::SetSynthParam {
+                track,
+                param,
+                value,
+            } => {
+                if let Some(params) = self.synth.get_mut(track as usize) {
+                    params.set(param, value);
                 }
-                match param {
-                    FxParam::Gain => self.fx.gain.set(value.clamp(0.0, 1.4)),
-                    FxParam::Tone => self.fx.tone.set(value.clamp(300.0, 18_000.0)),
-                    FxParam::Cutoff => self.fx.cutoff.set(value.clamp(40.0, 18_000.0)),
-                    FxParam::Resonance => self.fx.resonance.set(value.clamp(0.0, 1.0)),
-                    FxParam::Drive => self.fx.drive.set(value.clamp(0.0, 1.0)),
-                    FxParam::Width => self.fx.width.set(value.clamp(0.0, 1.5)),
+            }
+            Command::AddEffect { kind } => self.add_effect(kind),
+            Command::RemoveEffect { index } => {
+                let index = index as usize;
+                let count = self.effect_count as usize;
+                if index < count {
+                    self.effects[index..count].rotate_left(1);
+                    self.effects[count - 1].set_kind(None);
+                    self.effect_count -= 1;
+                }
+            }
+            Command::MoveEffect { from, to } => {
+                let count = self.effect_count as usize;
+                let from = from as usize;
+                let to = (to as usize).min(count.saturating_sub(1));
+                if count > 1 && from < count && from != to {
+                    if from < to {
+                        self.effects[from..=to].rotate_left(1);
+                    } else {
+                        self.effects[to..=from].rotate_right(1);
+                    }
+                }
+            }
+            Command::SetEffectParam { index, knob, value } => {
+                if let Some(slot) = self.effects.get_mut(index as usize) {
+                    if (index as usize) < self.effect_count as usize {
+                        slot.set_parameter(knob as usize, value);
+                    }
+                }
+            }
+            Command::SetEffectBypass { index, bypass } => {
+                if (index as usize) < self.effect_count as usize {
+                    if let Some(slot) = self.effects.get_mut(index as usize) {
+                        slot.set_bypass(bypass);
+                    }
+                }
+            }
+            Command::ClearEffects => {
+                for slot in &mut self.effects {
+                    slot.set_kind(None);
+                }
+                self.effect_count = 0;
+            }
+            Command::SetMasterGain { gain } => {
+                if gain.is_finite() {
+                    self.master_gain.set(gain.clamp(0.0, 2.0));
+                }
+            }
+            Command::SetRecordedActive { track, active } => {
+                if let Some(flag) = self.recorded_active.get_mut(track as usize) {
+                    *flag = active;
                 }
             }
         }
@@ -567,6 +627,9 @@ impl Engine {
             // Recorded MIDI takes precedence over the generative pattern.
             let clip = self.recorded[track];
             if !clip.is_empty() {
+                if !self.recorded_active[track] {
+                    continue;
+                }
                 for note in clip.as_slice() {
                     if note.start_step != loop_step {
                         continue;
@@ -758,7 +821,15 @@ impl Engine {
         self.recording
     }
 
-    fn trigger_note(&mut self, track: usize, note: u8, velocity: f32, gate: u32, spec: &TrackSpec) {
+    fn trigger_note(
+        &mut self,
+        track: usize,
+        note: u8,
+        velocity: f32,
+        gate: u32,
+        _spec: &TrackSpec,
+    ) {
+        let params = self.synth[track.min(TRACK_COUNT - 1)];
         // Prefer a free voice; otherwise steal the quietest, then oldest.
         let slot = self.voices.iter().position(|v| !v.is_active()).or_else(|| {
             self.voices
@@ -775,7 +846,7 @@ impl Engine {
         if let Some(index) = slot {
             self.voice_age = self.voice_age.wrapping_add(1);
             self.voices[index].trigger(
-                spec,
+                &params,
                 track,
                 note,
                 velocity,
@@ -806,7 +877,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::messages::SCENE_COUNT;
+    use crate::audio::messages::{SynthParam, SCENE_COUNT};
     use rtrb::RingBuffer;
 
     fn render(engine: &mut Engine, frames: usize) -> Vec<f32> {
@@ -895,9 +966,10 @@ mod tests {
         cmd_tx.push(Command::Play).unwrap();
         cmd_tx.push(Command::SetBpm(128.0)).unwrap();
         cmd_tx
-            .push(Command::SetFx {
-                param: FxParam::Cutoff,
-                value: 900.0,
+            .push(Command::SetEffectParam {
+                index: 0,
+                knob: 0,
+                value: 0.4,
             })
             .unwrap();
 
@@ -1057,26 +1129,119 @@ mod tests {
     }
 
     #[test]
-    fn extreme_fx_parameters_stay_stable() {
+    fn default_chain_is_present_and_removable() {
+        let mut engine = Engine::offline(48_000.0);
+        assert_eq!(engine.effect_count(), 4);
+        assert_eq!(engine.effect_kind(0), Some(crate::audio::EffectKind::Drive));
+
+        engine.apply(Command::RemoveEffect { index: 1 });
+        assert_eq!(engine.effect_count(), 3);
+        assert_eq!(
+            engine.effect_kind(1),
+            Some(crate::audio::EffectKind::Filter)
+        );
+
+        engine.apply(Command::MoveEffect { from: 2, to: 0 });
+        assert_eq!(engine.effect_kind(0), Some(crate::audio::EffectKind::Width));
+
+        engine.apply(Command::ClearEffects);
+        assert_eq!(engine.effect_count(), 0);
+
+        for kind in crate::audio::EffectKind::ALL {
+            engine.apply(Command::AddEffect { kind });
+        }
+        assert_eq!(engine.effect_count(), crate::audio::EffectKind::ALL.len());
+    }
+
+    #[test]
+    fn chain_can_exceed_the_slot_limit_without_panicking() {
+        let mut engine = Engine::offline(48_000.0);
+        for _ in 0..MAX_EFFECTS * 3 {
+            engine.apply(Command::AddEffect {
+                kind: EffectKind::Delay,
+            });
+        }
+        assert_eq!(engine.effect_count(), MAX_EFFECTS);
+        let out = render(&mut engine, 4_800);
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn extreme_chain_parameters_stay_stable() {
         let mut engine = Engine::offline(48_000.0);
         engine.apply(Command::Play);
-        engine.apply(Command::SetFx {
-            param: FxParam::Resonance,
-            value: 1.0,
-        });
-        engine.apply(Command::SetFx {
-            param: FxParam::Drive,
-            value: 1.0,
-        });
-        engine.apply(Command::SetFx {
-            param: FxParam::Gain,
-            value: 1.4,
-        });
-        engine.apply(Command::SetFx {
-            param: FxParam::Cutoff,
-            value: 40.0,
-        });
+        engine.apply(Command::ClearEffects);
+        for kind in crate::audio::EffectKind::ALL {
+            engine.apply(Command::AddEffect { kind });
+        }
+        for index in 0..engine.effect_count() {
+            for knob in 0..3 {
+                engine.apply(Command::SetEffectParam {
+                    index: index as u8,
+                    knob,
+                    value: 1.0e6,
+                });
+            }
+        }
+        engine.apply(Command::SetMasterGain { gain: 1.6 });
         let out = render(&mut engine, 96_000);
         assert!(out.iter().all(|s| s.is_finite() && s.abs() <= 1.0));
+    }
+
+    #[test]
+    fn synth_parameters_change_the_voice() {
+        let mut bright = Engine::offline(48_000.0);
+        bright.apply(Command::SetSynthParam {
+            track: 0,
+            param: SynthParam::Index,
+            value: 6.0,
+        });
+        bright.apply(Command::Play);
+        let bright_out = render(&mut bright, 24_000);
+        let bright_energy: f32 = bright_out.iter().map(|s| s * s).sum();
+
+        let mut mellow = Engine::offline(48_000.0);
+        mellow.apply(Command::SetSynthParam {
+            track: 0,
+            param: SynthParam::Index,
+            value: 0.0,
+        });
+        mellow.apply(Command::Play);
+        let mellow_out = render(&mut mellow, 24_000);
+        let mellow_energy: f32 = mellow_out.iter().map(|s| s * s).sum();
+
+        assert!(bright_energy.is_finite() && mellow_energy.is_finite());
+        assert!(
+            (bright_energy - mellow_energy).abs() > 1.0,
+            "synth parameter had no audible effect ({bright_energy} vs {mellow_energy})"
+        );
+        assert!((bright.synth_params(0).mod_index - 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn disabled_recorded_clip_is_silent() {
+        let mut engine = Engine::offline(48_000.0);
+        let mut clip = RecordedClip::default();
+        clip.push(RecordedNote {
+            note: 72,
+            velocity: 120,
+            start_step: 0,
+            length_steps: 8,
+        });
+        engine.apply(Command::SetRecordedClip { track: 0, clip });
+        engine.apply(Command::SetRecordedActive {
+            track: 0,
+            active: false,
+        });
+        for track in 1..TRACK_COUNT {
+            engine.apply(Command::SetTrackMute {
+                track: track as u8,
+                mute: true,
+            });
+        }
+        engine.apply(Command::Play);
+        let out = render(&mut engine, 48_000);
+        let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(peak < 1e-3, "disabled MIDI clip still sounded ({peak})");
     }
 }

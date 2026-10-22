@@ -73,6 +73,23 @@ Routing rules:
 - **MIDI → PLUGINS** in the MIDI window forwards live notes, CC and pitch bend
   to plugins. It is on by default.
 
+## Unloading and teardown
+
+CLAP instances are destroyed normally when a slot is closed. Some third-party
+VST3s crash asynchronously inside their own destructor (verified with OB-Xd:
+the process segfaults shortly after `Plugin::drop`). To keep the DAW stable,
+closing a VST3 slot:
+
+1. stops the plugin's DSP, and
+2. parks the instance in the plugin worker for the lifetime of the process
+   instead of destroying it.
+
+The slot disappears from the audio path immediately, but its memory is only
+reclaimed on exit. This is a pragmatic crash guard, not a fix; process
+isolation (`vst3_host::simple::load_plugin_isolated`, which needs the
+`vst3-host-helper` binary shipped alongside the app) is the proper solution and
+is planned.
+
 ## Real-time model and limitations
 
 - Plugin handles are not `Send`, so they live on a worker thread created for

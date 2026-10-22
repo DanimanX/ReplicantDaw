@@ -120,6 +120,15 @@ impl Vst3Instance {
         }
     }
 
+    /// Stop DSP without destroying the component.
+    ///
+    /// Used when a slot is closed: some third-party VST3s (verified with
+    /// OB-Xd) crash asynchronously inside their own teardown, so the worker
+    /// parks the instance instead of dropping it.
+    pub fn stop(&mut self) {
+        let _ = self.plugin.stop_processing();
+    }
+
     pub fn save_state(&mut self) -> Result<Vec<u8>, String> {
         self.plugin
             .save_state()
@@ -181,8 +190,7 @@ impl Vst3Instance {
     }
 }
 
-impl Drop for Vst3Instance {
-    fn drop(&mut self) {
-        let _ = self.plugin.stop_processing();
-    }
-}
+// Teardown is handled inside `vst3_host::Plugin::drop`, which stops
+// processing, deactivates the component and terminates it in the order the
+// VST3 SDK requires. Calling `stop_processing` here as well crashes some
+// plugins (verified with OB-Xd) on unload.

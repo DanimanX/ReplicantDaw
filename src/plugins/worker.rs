@@ -131,6 +131,10 @@ impl Instance {
         }
     }
 
+    fn is_vst3(&self) -> bool {
+        matches!(self, Self::Vst3(_))
+    }
+
     fn set_param(&mut self, id: u32, value: f32) {
         match self {
             Self::Clap(plugin) => plugin.set_param(id, value),
@@ -173,6 +177,30 @@ struct Worker {
     event_tx: Producer<PluginEvent>,
     sample_rate: f32,
     midi_enabled: bool,
+    /// VST3 instances removed from their slot. Some vendors crash inside
+    /// their own destructor, so they are stopped and kept alive instead of
+    /// being dropped. The OS reclaims them when the process exits.
+    retired: Vec<Instance>,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // Never tear down VST3 components during shutdown either: the crash
+        // would turn a normal quit into a core dump.
+        for slot in self.slots.iter_mut() {
+            if let Some(slot) = slot.take() {
+                match slot.instance {
+                    Instance::Vst3(plugin) => std::mem::forget(plugin),
+                    Instance::Clap(plugin) => drop(plugin),
+                }
+            }
+        }
+        for instance in std::mem::take(&mut self.retired) {
+            if let Instance::Vst3(plugin) = instance {
+                std::mem::forget(plugin);
+            }
+        }
+    }
 }
 
 impl Worker {
@@ -252,8 +280,16 @@ impl Worker {
                 self.emit_slots();
             }
             PluginCommand::Unload { slot } => {
-                if let Some(slot) = self.slots.get_mut(slot as usize) {
-                    *slot = None;
+                if let Some(entry) = self.slots.get_mut(slot as usize) {
+                    if let Some(mut removed) = entry.take() {
+                        if removed.instance.is_vst3() {
+                            if let Instance::Vst3(plugin) = &mut removed.instance {
+                                plugin.stop();
+                            }
+                            self.retired.push(removed.instance);
+                        }
+                        // CLAP instances drop normally.
+                    }
                 }
                 self.emit_slots();
             }
@@ -405,6 +441,7 @@ impl PluginRuntime {
                     event_tx,
                     sample_rate,
                     midi_enabled: true,
+                    retired: Vec::new(),
                 };
                 worker.run(stop_flag);
             })

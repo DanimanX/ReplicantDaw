@@ -2,19 +2,39 @@
 
 A cyberpunk DAW prototype in Rust: a real-time FM synthesizer and stereo mix bus
 driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
-lock-free `rtrb` queues between the threads, MIDI recording, project files and
-in-process CLAP/VST3 plugin hosting.
+lock-free `rtrb` queues between the threads, MIDI recording, project files, a
+modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.0.0** · MIT · Linux, macOS and Windows.
+**Version 1.0.2** · MIT · Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
-> Screenshot captured headlessly from the real application with the silent
-> fallback clock (no audio device attached), so the badges show `SILENT FALLBACK`.
+> Captured headlessly from the real release binary with the silent fallback
+> clock (no audio device attached), so the badges show `SILENT FALLBACK`.
+> The session shows recorded MIDI clips in the matrix and arrangement, and a
+> five-module effect chain.
+
+![FM synth editor at 125% UI zoom](docs/synth.png)
 
 ![Plugin rack hosting a real VST3 instrument](docs/plugins.png)
 
-## What is implemented
+## What's new in 1.0.2
+
+- **MIDI clips everywhere** — recorded MIDI now appears in the session matrix
+  (dedicated MIDI row with a mini piano roll per track) and as a labelled
+  `MIDI CLIP` container in the arrangement. Click the matrix row to mute or
+  re-enable a clip.
+- **Editable FM synth** — every track exposes RATIO, INDEX, ATTACK, DECAY,
+  SUSTAIN, RELEASE and LEVEL. Edit them in the chain's synth module or in the
+  larger `SYNTH` editor window; values are saved with the project.
+- **Modular device chain** — the bottom panel is now a user-built chain. Add any
+  of five effect modules from `+ ADD FX`, reorder with `‹ ›`, bypass with `b`,
+  and close with `X`. Modules can be chained in any order, up to six.
+- **UI zoom** — a `ZOOM` menu in the menu bar (75–150%) plus `Ctrl` +/‑/0.
+  The window grows with the scale, so the layout keeps its proportions and the
+  text is physically larger.
+
+## Features
 
 - **Two-thread audio architecture**
   - Audio thread: the `cpal` output callback renders stereo at 48 kHz, 32-bit
@@ -24,27 +44,32 @@ in-process CLAP/VST3 plugin hosting.
     recording events and plugin audio blocks.
 - **Synthesis**
   - 8 tracks with a 32-voice polyphonic two-operator FM engine.
-  - Sample-accurate ADSR envelopes and gate lengths per track.
+  - Per-track editable FM ratio, modulation index and ADSR envelope.
   - Per-track gain, pan, mute and solo; equal-power stereo bus.
   - Generative 16-step clip patterns across 8 scenes in a 16-bar loop.
-- **Master FX (device chain)**
-  - `NEURAL GEN V5`: drive/colour gain and a high-cut tone filter.
+- **Modular master chain**
+  - `SYNAPSE DRIVE`: saturation, wet mix and output trim.
+  - `NEURAL GEN V5`: high-cut tone filter.
   - `QUANTUM RESONATOR`: resonant topology-preserving state-variable low-pass.
-  - `SYNAPSE DRIVE`: saturation drive and mid/side stereo width.
-  - Soft clipping, DC blocking and a hard output guard.
-- **Project save / load**
-  - Versioned JSON `.rproj` files: tempo, mix, scenes, FX, recorded MIDI and
-    plugin descriptors with their opaque state (base64).
-  - `Ctrl+S` quick save, a project browser, and `--project <path>` on startup.
-  - Unknown plugins are reported instead of silently dropped.
+  - `MIRROR WIDTH`: mid/side stereo width.
+  - `ECHO MEMORY`: stereo delay with feedback and wet mix.
+  - Add, reorder, bypass and close modules; master gain, soft clip, DC blocking
+    and a hard output guard stay fixed at the end of the chain.
 - **MIDI recording**
-  - Live MIDI input through `midir` (ALSA, CoreMIDI, WinMM), with hot-plug
-    rescan and device selection.
+  - Live MIDI input through `midir` (ALSA, CoreMIDI, WinMM), with rescan and
+    device selection.
   - Arm a track, hit `REC`, and play: notes are captured at 16th-note
     resolution into a clip that replaces the generative pattern for that track.
-  - An on-screen two-octave keyboard feeds the exact same MIDI path, so the
-    workflow is testable without hardware.
-  - Recorded clips are drawn as note blocks in the arrangement lanes.
+  - An on-screen two-octave keyboard feeds the same MIDI path, so the workflow
+    is testable without hardware.
+  - Clips are visible in the session matrix and the arrangement, and can be
+    muted without deleting them.
+- **Project save / load**
+  - Versioned JSON `.rproj` files: tempo, mix, scenes, synth parameters, effect
+    chain, master gain, recorded MIDI and plugin state (base64).
+  - `Ctrl+S` quick save, a project browser, and `--project <path>` on startup.
+  - Format v1 files still load; the legacy fixed FX block becomes a chain.
+  - `examples/Demo.rproj` ships with MIDI clips and a five-module chain.
 - **Plugin hosting**
   - **CLAP**: in-process hosting with audio, note/parameter events and state.
   - **VST3**: in-process hosting with audio, MIDI, parameters and state.
@@ -54,12 +79,14 @@ in-process CLAP/VST3 plugin hosting.
   - Four insert slots on the master bus, bypass, per-slot parameter knobs and
     latency reporting.
 - **Session UI**
-  - Menu bar, transport with bar/beat/step counter, editable BPM, play/stop,
-    REC, audio callback CPU meter, master meter and link status.
-  - Clip matrix (8 × 8) with live step progress and scene launch.
+  - Menu bar with project, plugin, synth, MIDI and zoom controls.
+  - Transport with bar/beat/step counter, editable BPM, play/stop, REC, audio
+    callback CPU meter, master meter and link status.
+  - Clip matrix (8 × 8) plus a MIDI clip row, with live step progress and
+    scene launch.
   - Mixer strips with vertical faders, LED dB meters, pan and mute/solo.
-  - Arrangement lanes with a 16-bar ruler, animated playhead and recorded-note
-    blocks.
+  - Arrangement lanes with a 16-bar ruler, animated playhead and MIDI clip
+    containers.
   - Live spectral waterfall computed with a 1024-point Hann-windowed FFT and
     rendered as a coloured 3D mesh with `egui::Painter`.
 - **Robust host handling**
@@ -79,9 +106,13 @@ in-process CLAP/VST3 plugin hosting.
 
 Plugins run on a dedicated worker thread, exchanging 512-frame stereo blocks
 with the engine through lock-free rings. This keeps `!Send` plugin handles out
-of the audio callback and isolates load/state cost from the UI. The trade-off is
-one block of latency and the fact that a crashing third-party plugin still
-crashes the process: there is no out-of-process sandbox yet.
+of the audio callback and isolates load/state cost from the UI.
+
+**VST3 unload workaround:** some third-party VST3s (verified with OB-Xd) crash
+asynchronously inside their own teardown. Closing such a slot stops its DSP and
+parks the instance for the lifetime of the process instead of destroying it, so
+the application stays stable. The trade-off is that the parked plugin's memory
+is only reclaimed when the app exits; CLAP instances are destroyed normally.
 
 Details, scan paths and troubleshooting: [docs/PLUGINS.md](docs/PLUGINS.md).
 
@@ -114,9 +145,9 @@ cargo run --release
 ```bash
 cargo run --release -- --devices        # list audio output devices
 cargo run --release -- --audio-check    # open the default device and verify telemetry
-cargo run --release -- --selftest       # DSP, MIDI, plugin-ring and clock smoke test
-cargo run --release -- --project session.rproj
-cargo test                              # 54 unit tests
+cargo run --release -- --selftest       # DSP, chain, project, MIDI and clock smoke test
+cargo run --release -- --project examples/Demo.rproj
+cargo test                              # 71 unit tests
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -125,13 +156,14 @@ Environment variables:
 ```bash
 REPLICANT_DAW_NO_AUDIO=1        # force the silent fallback clock
 REPLICANT_DAW_SIZE=1200x760     # initial window size (clamped to the minimum)
+REPLICANT_DAW_ZOOM=125          # UI scale at startup (75..150)
 REPLICANT_DAW_PROJECT=x.rproj   # load a project at startup
 REPLICANT_DAW_PROJECTS=dir      # override the projects directory
 REPLICANT_DAW_PLUGIN_PATH=a:b   # extra plugin scan roots
-REPLICANT_DAW_OPEN_PLUGIN=/path/to/plugin.vst3   # demo/QA: load into slot 1
+REPLICANT_DAW_OPEN_PLUGIN=/path/to/plugin.vst3   # QA: load into slot 1
 REPLICANT_DAW_SMOKE=docs/screenshot.png
 REPLICANT_DAW_SMOKE_SECS=4      # auto-play, wait, screenshot, exit
-REPLICANT_DAW_SMOKE_WINDOWS=rack,midi            # open utility windows
+REPLICANT_DAW_SMOKE_WINDOWS=rack,midi,synth      # open utility windows
 REPLICANT_DAW_SMOKE_SAVE=/tmp/demo.rproj         # save a project before exiting
 WGPU_BACKEND=gl|vulkan|metal|dx12
 ```
@@ -146,15 +178,23 @@ Default project directory:
 
 - **Space** — play / stop. **Esc** — stop and rewind.
 - **Ctrl+S** — save. **Ctrl+O** — project window. **Ctrl+P** — plugin browser.
+- **Ctrl + / Ctrl − / Ctrl 0** — zoom in / out / reset. The `ZOOM` menu offers
+  75%, 90%, 100%, 110%, 125% and 150%.
 - **Play / Stop / REC** — transport and MIDI recording on the selected track.
 - **BPM** — click to type, drag vertically, or use `-` / `+`.
+- **MIDI row** — click a track's clip to mute/unmute it; empty slots prompt to
+  arm REC. The row also shows a live loop position.
 - **Clip slot** — click to launch, click again (or right-click) to stop. The
   triangle at the left of a row launches the whole scene.
-- **Track header** — selects the track (also the MIDI input/record target).
+- **Track header** — selects the track (also the MIDI input/record target and
+  the track edited by the synth module).
 - **Fader** — drag vertically, double-click for 0 dB.
 - **Pan knob** — drag vertically, double-click to centre.
 - **M / S** — mute and solo.
-- **Device knobs** — drag vertically, double-click resets.
+- **SYNTH module** — click its track strip to cycle tracks; drag its seven
+  knobs. `SYNTH` in the menu opens the larger editor with RESET.
+- **Effect module** — drag knobs; `b` bypasses, `X` closes, `‹ ›` reorders.
+  `+ ADD FX` opens the module menu (and `RESET CHAIN`).
 - **Rack** — load, bypass or remove plugins; up to 16 parameters per slot.
 - **MIDI** — connect an input, play the on-screen keyboard, arm REC, clear a
   clip, toggle MIDI to plugins.
@@ -163,57 +203,68 @@ Default project directory:
 
 ```
 ┌────────────────────────── UI thread (eframe / egui / wgpu) ─────────────────────────┐
-│ menu · transport · clip matrix · mixer · lanes · FFT · device chain · rack · midi    │
-│    │ Command              ▲ Telemetry / scope / record events                       │
-└────┼──────────────────────┼────────────────────────────────────────────────────────┘
+│ menu+zoom · transport · clip matrix+MIDI row · mixer · lanes · FFT · chain · windows  │
+│    │ Command              ▲ Telemetry / scope / record events                        │
+└────┼──────────────────────┼─────────────────────────────────────────────────────────┘
      │ rtrb                 │ rtrb
-┌────▼──────────────────────┴────────────────────────────────────────────────────────┐
-│ Audio thread: cpal callback (or paced silent clock)                                 │
-│ sequencer → FM voices → track mix → drive/tone/SVF/width → master guard             │
-│      │ dry blocks                                                ▲ processed blocks │
-└──────┼───────────────────────────────────────────────────────────┼──────────────────┘
+┌────▼──────────────────────┴─────────────────────────────────────────────────────────┐
+│ Audio thread: cpal callback (or paced silent clock)                                  │
+│ sequencer → FM voices (per-track params) → track mix → modular FX chain → master      │
+│      │ dry blocks                                                ▲ processed blocks  │
+└──────┼───────────────────────────────────────────────────────────┼───────────────────┘
        │ rtrb                                                      │ rtrb
-┌──────▼───────────────────────────────────────────────────────────┴──────────────────┐
-│ Plugin worker thread: CLAP + VST3 instances, params, state                          │
-└─────────────────────────────────────────────────────────────────────────────────────┘
+┌──────▼───────────────────────────────────────────────────────────┴───────────────────┐
+│ Plugin worker thread: CLAP + VST3 instances, params, state                           │
+└──────────────────────────────────────────────────────────────────────────────────────┘
 
 MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring ──▶ engine (voices + record)
 ```
 
 - `src/audio/engine.rs` renders audio. It never allocates, locks or calls into
   third-party code; the plugin chain only moves blocks between rings.
+- `src/audio/effects.rs` implements the chain modules with fixed state and
+  smoothed parameters.
 - `src/plugins/worker.rs` owns all plugin handles. It is created inside its own
   thread because plugin instances are not `Send`.
-- `src/studio.rs` owns MIDI, plugins and projects on the UI side.
+- `src/studio.rs` owns MIDI, plugins, zoom and projects on the UI side.
 - `src/project.rs` is the serialized session model.
 
 ## DSP details
 
 - Two-operator phase-modulation voice: `sin(phase + index * env * sin(mod_phase))`,
-  with per-track ratio, index and ADSR.
+  with per-track ratio, index and ADSR edited live from the UI.
 - The sequencer derives the current 16th note from a sample-accurate transport
   position, so tempo changes and loops stay tight.
-- Master chain order: saturation → one-pole high-cut → TPT state-variable
-  low-pass → mid/side width → gain → soft clip → DC blocker → guard.
-- Live parameters are smoothed to avoid zipper noise.
+- Chain order is user-defined; master gain, soft clip, DC blocker and output
+  guard always come last, followed by the plugin inserts.
+- Effect parameters are clamped to their module ranges and smoothed to avoid
+  zipper noise. Delay runs a 1.05 s stereo line.
 - `src/dsp/spectrum.rs` uses `rustfft` with a 1024-point Hann window and
   log-spaced display bins from 30 Hz to 16 kHz.
 
 ## Project format
 
-`.rproj` is versioned JSON:
+`.rproj` is versioned JSON (format 2):
 
 ```json
 {
-  "format_version": 1,
-  "app_version": "1.0.0",
-  "name": "Demo",
+  "format_version": 2,
+  "app_version": "1.0.2",
+  "name": "Neon Demo",
   "bpm": 142.0,
-  "fx": { "gain": 0.9, "tone": 16000.0, "cutoff": 5200.0,
-          "resonance": 0.18, "drive": 0.12, "width": 1.0 },
+  "effects": [
+    { "kind": "DRIVE",  "params": [0.22, 1.0, 1.0], "bypass": false },
+    { "kind": "FILTER", "params": [6200.0, 0.24, 1.0], "bypass": false },
+    { "kind": "DELAY",  "params": [0.28, 0.32, 0.18], "bypass": false }
+  ],
+  "master_gain": 0.9,
   "tracks": [
     { "name": "SYNAPSE 01", "gain_db": -7.0, "pan": -0.12,
       "mute": false, "solo": false, "scene": 1,
+      "clip_enabled": true,
+      "synth": { "ratio": 1.0, "index": 2.4, "attack": 0.004,
+                 "decay": 0.18, "sustain": 0.25, "release": 0.25,
+                 "level": 0.9 },
       "notes": [ { "note": 60, "velocity": 100,
                    "start_step": 0, "length_steps": 2 } ] }
   ],
@@ -226,7 +277,8 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
 ```
 
 Unknown fields are ignored (forward compatible), while a newer
-`format_version` is rejected with a clear error.
+`format_version` is rejected with a clear error. Loading a v1 file translates
+its `fx` block into chain modules.
 
 ## Verification
 
@@ -235,7 +287,7 @@ Keystation 49 MK3 MIDI keyboard, and third-party plugins already installed:
 
 ```
 $ cargo test
-test result: ok. 54 passed; 0 failed
+test result: ok. 71 passed; 0 failed
 
 $ cargo clippy --all-targets -- -D warnings
 Finished
@@ -243,10 +295,12 @@ Finished
 $ ./target/release/replicant-daw --selftest
 - rendered 8.0 s of audio in 0.106 s (75.7x realtime)
 - lock-free path: telemetry playing=true peaks=0.442 | scope frames=32768
+- chain: 4 default modules -> 4 after remove/add; synth index 3.2
+- project: 2 module(s), 1 note(s), synth index 4.25
 - midi recording: 1 note(s), 2 UI event(s)
 - midi inputs available: 5
 - midi input opened: Midi Through:Midi Through Port-0 14:0
-- silent clock: peak 0.646, playing=true
+- silent clock: peak 0.577, playing=true
 SELFTEST OK
 
 $ ./target/release/replicant-daw --audio-check
@@ -255,18 +309,20 @@ AUDIO OK: Alsa | Default Audio Device | 48000 Hz | ... telemetry frames | stoppe
 
 Additional manual checks:
 
-- VST3: `OB-Xd 3.vst3` loads on the worker thread, exposes 16 parameters,
-  reports latency and produces audio from MIDI.
-- CLAP: `Dexed.clap` loads, exposes parameters and processes audio.
-- Projects: saved a session with a 250 KB VST3 state blob and loaded it back in
-  a fresh process; the plugin and its parameters were restored.
-- Screenshots: `docs/screenshot.png` and `docs/plugins.png` are captured from
-  the release binary running under Xvfb.
+- **VST3**: `OB-Xd 3.vst3` loads on the worker thread, exposes its parameters,
+  reports latency and produces audio from MIDI; closing the slot no longer
+  crashes thanks to the parked-instance workaround.
+- **CLAP**: `Dexed.clap` loads, exposes parameters and processes audio.
+- **Projects**: saved a session with chain, synth parameters and MIDI clips,
+  then loaded it in a fresh process; `examples/Demo.rproj` is the same file.
+- **UI zoom**: captured at 125% (`docs/synth.png`), with the logical layout
+  preserved and the synth editor open.
+- **Screenshots**: `docs/screenshot.png`, `docs/synth.png` and
+  `docs/plugins.png` are captured from the release binary under Xvfb.
 
 The CI matrix runs tests and the self-test on Ubuntu, macOS and Windows. The
-release workflows cross-build both macOS architectures and publish platform
-packages for Linux, macOS and Windows on every tag
-(`.github/workflows/release-*.yml`).
+release workflows cross-build both macOS architectures and publish packages for
+Linux, macOS and Windows on every tag (`.github/workflows/release-*.yml`).
 
 ## Limitations / next steps
 
@@ -275,12 +331,14 @@ This is a prototype, not a production DAW:
 - Plugin hosting is in-process: a crashing plugin takes the app down, and the
   plugin worker adds one block of latency. An out-of-process sandbox is the
   natural next step.
+- The VST3 workaround parks closed instances instead of destroying them, so
+  their memory is held until exit.
 - No plugin GUI embedding; parameters are edited with the rack knobs.
 - VST2 and Audio Unit hosting are not implemented (see the matrix above).
-- No MIDI export, no automation lanes, no undo, no clip editing after
-  recording (clear and re-record only).
-- Recording replaces the target track's clip; it does not overdub.
-- One 16-bar loop and one master insert chain.
+- The modular chain is a master chain only; there are no per-track inserts.
+- No MIDI export, automation lanes, undo, or note editing after recording
+  (clear and re-record only). Recording replaces the target clip, no overdub.
+- One 16-bar loop.
 - Windows and macOS are covered by CI builds but were not manually auditioned
   for this release; Linux/ALSA, MIDI input, CLAP and VST3 were verified on
   hardware.

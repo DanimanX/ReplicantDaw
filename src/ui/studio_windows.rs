@@ -45,6 +45,7 @@ pub fn draw_menu_bar(ui: &mut Ui, rect: Rect, studio: &mut Studio, state: &mut U
         ui.add(button).clicked()
     };
 
+    let mut pending_zoom: Option<u32> = None;
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect.shrink2(Vec2::new(8.0, 3.0)))
@@ -64,6 +65,38 @@ pub fn draw_menu_bar(ui: &mut Ui, rect: Rect, studio: &mut Studio, state: &mut U
     }
     if button(&mut child, "MIDI", studio.midi_open) {
         studio.midi_open = !studio.midi_open;
+    }
+    if button(&mut child, "SYNTH", studio.synth_open) {
+        studio.synth_open = !studio.synth_open;
+    }
+
+    // Zoom control: the whole UI scales, and the window grows with it so the
+    // layout keeps its proportions while the text becomes physically larger.
+    child.add_space(8.0);
+    child.label(
+        RichText::new("ZOOM")
+            .font(theme::display(7.5))
+            .color(theme::TEXT_FAINT),
+    );
+    let current = (studio.zoom * 100.0).round() as u32;
+    ComboBox::from_id_salt("ui_zoom")
+        .selected_text(RichText::new(format!("{current}%")).font(theme::mono(8.5)))
+        .width(62.0)
+        .show_ui(&mut child, |ui| {
+            for step in ZOOM_STEPS {
+                if ui
+                    .selectable_label(step == current, format!("{step}%"))
+                    .clicked()
+                {
+                    pending_zoom = Some(step);
+                }
+            }
+        });
+    if button(&mut child, "-", false) {
+        pending_zoom = Some(previous_zoom(current));
+    }
+    if button(&mut child, "+", false) {
+        pending_zoom = Some(next_zoom(current));
     }
 
     child.add_space(6.0);
@@ -107,6 +140,52 @@ pub fn draw_menu_bar(ui: &mut Ui, rect: Rect, studio: &mut Studio, state: &mut U
         theme::mono(7.5),
         theme::TEXT_FAINT,
     );
+
+    if let Some(percent) = pending_zoom {
+        set_zoom(ui.ctx(), studio, percent);
+    }
+}
+
+/// Zoom presets available from the menu.
+pub const ZOOM_STEPS: [u32; 6] = [75, 90, 100, 110, 125, 150];
+
+fn next_zoom(current: u32) -> u32 {
+    ZOOM_STEPS
+        .into_iter()
+        .find(|step| *step > current)
+        .unwrap_or(*ZOOM_STEPS.last().unwrap())
+}
+
+fn previous_zoom(current: u32) -> u32 {
+    ZOOM_STEPS
+        .into_iter()
+        .rev()
+        .find(|step| *step < current)
+        .unwrap_or(ZOOM_STEPS[0])
+}
+
+/// Apply a UI scale and resize the window so the logical layout is preserved.
+pub fn set_zoom(ctx: &egui::Context, studio: &mut Studio, percent: u32) {
+    let zoom = (percent as f32 / 100.0).clamp(0.75, 1.5);
+    if (studio.zoom - zoom).abs() < 0.001 {
+        return;
+    }
+    studio.zoom = zoom;
+    ctx.set_zoom_factor(zoom);
+    let base = Vec2::new(1660.0, 1000.0);
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(base * zoom));
+    studio.notify(format!("UI zoom {percent}%"));
+    ctx.request_repaint();
+}
+
+/// Keyboard zoom (Ctrl +/-/0) used by the app shortcut handler.
+pub fn zoom_step(ctx: &egui::Context, studio: &mut Studio, direction: i32) {
+    let current = (studio.zoom * 100.0).round() as u32;
+    match direction {
+        0 => set_zoom(ctx, studio, 100),
+        d if d > 0 => set_zoom(ctx, studio, next_zoom(current)),
+        _ => set_zoom(ctx, studio, previous_zoom(current)),
+    }
 }
 
 /// Draw all utility windows.
@@ -120,6 +199,7 @@ pub fn draw_windows(
     draw_browser(ctx, studio, state);
     draw_midi(ctx, studio, state, audio);
     draw_project(ctx, studio, state, audio);
+    draw_synth_editor(ctx, studio, state, audio);
 }
 
 fn window_frame() -> Frame {
@@ -929,4 +1009,171 @@ fn draw_project(
             );
         });
     studio.project_open = open;
+}
+
+fn draw_synth_editor(
+    ctx: &egui::Context,
+    studio: &mut Studio,
+    state: &mut UiState,
+    audio: &mut AudioRuntime,
+) {
+    if !studio.synth_open {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("SYNTH // FM VOICE EDITOR")
+        .open(&mut open)
+        .frame(window_frame())
+        .default_pos(Pos2::new(430.0, 170.0))
+        .default_width(520.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("TRACK")
+                        .font(theme::mono(8.0))
+                        .color(theme::TEXT_FAINT),
+                );
+                ComboBox::from_id_salt("synth_editor_track")
+                    .selected_text(format!(
+                        "{:02} {}",
+                        state.selected_track + 1,
+                        crate::audio::TRACKS[state.selected_track].name
+                    ))
+                    .width(190.0)
+                    .show_ui(ui, |ui| {
+                        for track in 0..crate::audio::TRACK_COUNT {
+                            if ui
+                                .selectable_label(
+                                    state.selected_track == track,
+                                    format!(
+                                        "{:02} {}",
+                                        track + 1,
+                                        crate::audio::TRACKS[track].name
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                state.selected_track = track;
+                            }
+                        }
+                    });
+                if ui
+                    .add(
+                        Button::new(
+                            RichText::new("RESET TRACK")
+                                .font(theme::display(8.0))
+                                .color(theme::TEXT),
+                        )
+                        .fill(theme::PANEL_SUNK)
+                        .stroke(Stroke::new(1.0, theme::BORDER)),
+                    )
+                    .clicked()
+                {
+                    let track = state.selected_track;
+                    let defaults =
+                        crate::audio::SynthParams::from_spec(&crate::audio::TRACKS[track]);
+                    state.synth[track] = defaults;
+                    for param in crate::audio::SynthParam::ALL {
+                        let _ = audio.command_tx.push(Command::SetSynthParam {
+                            track: track as u8,
+                            param,
+                            value: defaults.get(param),
+                        });
+                    }
+                }
+                ui.label(
+                    RichText::new("2-op FM · 32 voices")
+                        .font(theme::mono(7.0))
+                        .color(theme::TEXT_FAINT),
+                );
+            });
+
+            ui.add_space(6.0);
+            let accent = theme::track_accent(state.selected_track);
+            let track = state.selected_track;
+            let params = state.synth[track];
+            let columns = 4usize;
+            let cell = Vec2::new(104.0, 86.0);
+            let mut changes = Vec::new();
+            Grid::new("synth_editor_grid")
+                .num_columns(columns)
+                .spacing(Vec2::new(6.0, 6.0))
+                .show(ui, |ui| {
+                    for (index, param) in crate::audio::SynthParam::ALL.iter().enumerate() {
+                        let (rect, _) = ui.allocate_exact_size(cell, Sense::hover());
+                        let (min, max) = param.range();
+                        let log = param.logarithmic();
+                        let mut norm = synth_norm(params.get(*param), min, max, log);
+                        let default_norm = synth_norm(
+                            match param {
+                                crate::audio::SynthParam::Ratio => 1.0,
+                                crate::audio::SynthParam::Index => 1.15,
+                                crate::audio::SynthParam::Attack => 0.006,
+                                crate::audio::SynthParam::Decay => 0.22,
+                                crate::audio::SynthParam::Sustain => 0.30,
+                                crate::audio::SynthParam::Release => 0.22,
+                                crate::audio::SynthParam::Level => 0.9,
+                            },
+                            min,
+                            max,
+                            log,
+                        );
+                        if knob(
+                            ui,
+                            rect,
+                            ui.scope_id().with(("synth_editor_knob", track, index)),
+                            &mut norm,
+                            0.0..=1.0,
+                            default_norm,
+                            param.label(),
+                            &param.format(params.get(*param)),
+                            accent,
+                        ) {
+                            changes.push((*param, synth_denorm(norm, min, max, log)));
+                        }
+                        if (index + 1) % columns == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+            for (param, value) in changes {
+                state.synth[track].set(param, value);
+                let _ = audio.command_tx.push(Command::SetSynthParam {
+                    track: track as u8,
+                    param,
+                    value,
+                });
+            }
+
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new(
+                    "RATIO/INDEX shape the FM timbre; ATTACK→RELEASE shape the envelope. Changes apply to new notes.",
+                )
+                .font(theme::mono(7.5))
+                .color(theme::TEXT_FAINT),
+            );
+        });
+    studio.synth_open = open;
+}
+
+fn synth_norm(value: f32, min: f32, max: f32, log: bool) -> f32 {
+    if log {
+        ((value.max(1.0e-6).ln() - min.max(1.0e-6).ln())
+            / (max.max(1.0e-6).ln() - min.max(1.0e-6).ln()))
+        .clamp(0.0, 1.0)
+    } else {
+        ((value - min) / (max - min).max(1.0e-9)).clamp(0.0, 1.0)
+    }
+}
+
+fn synth_denorm(norm: f32, min: f32, max: f32, log: bool) -> f32 {
+    if log {
+        let lo = min.max(1.0e-6).ln();
+        let hi = max.max(1.0e-6).ln();
+        (lo + (hi - lo) * norm.clamp(0.0, 1.0)).exp()
+    } else {
+        min + (max - min) * norm.clamp(0.0, 1.0)
+    }
 }

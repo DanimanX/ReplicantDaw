@@ -76,6 +76,13 @@ impl ReplicantApp {
             });
 
         // Optional demo hooks used by the headless screenshot harness.
+        if let Ok(path) = std::env::var("REPLICANT_DAW_PROJECT") {
+            match studio.load_project(std::path::Path::new(&path), &mut state, &mut audio) {
+                Ok(()) => log::info!("Loaded project {path}"),
+                Err(error) => log::warn!("Could not load project {path}: {error}"),
+            }
+        }
+
         if let Ok(path) = std::env::var("REPLICANT_DAW_OPEN_PLUGIN") {
             let format = if path.to_lowercase().ends_with(".clap") {
                 crate::plugins::PluginFormat::Clap
@@ -104,15 +111,20 @@ impl ReplicantApp {
                     "midi" => studio.midi_open = true,
                     "project" => studio.project_open = true,
                     "browser" => studio.browser_open = true,
+                    "synth" => studio.synth_open = true,
+                    "add" => state.add_effect_open = true,
                     _ => {}
                 }
             }
         }
-
-        if let Ok(path) = std::env::var("REPLICANT_DAW_PROJECT") {
-            match studio.load_project(std::path::Path::new(&path), &mut state, &mut audio) {
-                Ok(()) => log::info!("Loaded project {path}"),
-                Err(error) => log::warn!("Could not load project {path}: {error}"),
+        if let Ok(zoom) = std::env::var("REPLICANT_DAW_ZOOM") {
+            if let Ok(percent) = zoom.parse::<u32>() {
+                studio.zoom = (percent as f32 / 100.0).clamp(0.75, 1.5);
+                cc.egui_ctx.set_zoom_factor(studio.zoom);
+                cc.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                        Vec2::new(1660.0, 1000.0) * studio.zoom,
+                    ));
             }
         }
 
@@ -186,15 +198,29 @@ impl ReplicantApp {
         if ctx.egui_wants_keyboard_input() {
             return;
         }
-        let (space, stop, save, open_project, plugins) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::Space),
-                i.key_pressed(egui::Key::Escape),
-                i.modifiers.command && i.key_pressed(egui::Key::S),
-                i.modifiers.command && i.key_pressed(egui::Key::O),
-                i.modifiers.command && i.key_pressed(egui::Key::P),
-            )
-        });
+        let (space, stop, save, open_project, plugins, zoom_in, zoom_out, zoom_reset) =
+            ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Space),
+                    i.key_pressed(egui::Key::Escape),
+                    i.modifiers.command && i.key_pressed(egui::Key::S),
+                    i.modifiers.command && i.key_pressed(egui::Key::O),
+                    i.modifiers.command && i.key_pressed(egui::Key::P),
+                    i.modifiers.command
+                        && (i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)),
+                    i.modifiers.command && i.key_pressed(egui::Key::Minus),
+                    i.modifiers.command && i.key_pressed(egui::Key::Num0),
+                )
+            });
+        if zoom_in {
+            ui::studio_windows::zoom_step(ctx, &mut self.studio, 1);
+        }
+        if zoom_out {
+            ui::studio_windows::zoom_step(ctx, &mut self.studio, -1);
+        }
+        if zoom_reset {
+            ui::studio_windows::zoom_step(ctx, &mut self.studio, 0);
+        }
         if save {
             match self.studio.save_project(&self.state) {
                 Ok(path) => self.studio.notify(format!("Saved {}", path.display())),
@@ -284,6 +310,7 @@ impl ReplicantApp {
             &mut self.state,
             &mut self.audio,
         );
+        ui::devices::draw_add_menu(ui.ctx(), &mut self.state, &mut self.audio);
     }
 
     fn maybe_screenshot(&mut self, ctx: &egui::Context) {

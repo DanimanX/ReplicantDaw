@@ -80,10 +80,18 @@ The DAW hosts the plugin's real editor, not a reimplementation:
 
 - **CLAP** — the host creates an X11 toplevel, hands its id to the plugin's
   `clap.gui` extension (`create` → `set_parent` → `show`) and answers
-  `clap_host_gui` (resize/show/hide/closed) plus `clap_host_thread-check`.
-  Plugins that only support floating windows are created floating instead.
-- **VST3** — the editor is opened through the VST3 host's own window and its
-  platform events are pumped from the plugin worker.
+  `clap_host_gui` (resize/show/hide/closed), `clap_host_thread-check`,
+  `clap_host_timer_support` and `clap_host_posix_fd_support`. Plugins that only
+  support floating windows are created floating instead.
+- **VST3** — the editor is opened through the VST3 host's own window; the worker
+  pumps `service_platform_events` and `service_run_loop` (the Linux `IRunLoop`
+  that plugins register their X11 socket and timers with).
+- **Servicing** — both paths are serviced every ~4 ms by the plugin worker,
+  independently of the audio stream, so the editor stays interactive while
+  playing.
+- **Sizing** — the host window is created at the plugin's reported size, then
+  kept in sync: plugin-driven resizes are applied to the window, user resizes
+  are pushed to the plugin when it can resize, and reversed when it cannot.
 
 Known limits:
 

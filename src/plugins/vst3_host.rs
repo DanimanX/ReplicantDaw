@@ -115,6 +115,24 @@ impl Vst3Instance {
             || self.category.to_lowercase().contains("synth")
     }
 
+    /// Re-read every parameter from the plugin.
+    pub fn refresh_params(&mut self) {
+        let plugin = lock(&self.plugin);
+        if let Ok(params) = plugin.get_parameters() {
+            self.params = params
+                .iter()
+                .map(|param| ParamInfo {
+                    id: param.id,
+                    name: param.name.clone(),
+                    value: param.value as f32,
+                    text: plugin
+                        .format_parameter(param.id, param.value)
+                        .unwrap_or_default(),
+                })
+                .collect();
+        }
+    }
+
     pub fn set_param(&mut self, id: u32, value: f32) {
         let normalized = value.clamp(0.0, 1.0) as f64;
         let mut plugin = lock(&self.plugin);
@@ -157,15 +175,29 @@ impl Vst3Instance {
         }
     }
 
-    /// Pump the editor's platform events. Called from the worker's idle loop.
+    /// Pump the editor: platform events, the plugin's Linux run loop and any
+    /// resize request it made.
+    ///
+    /// VST3 editors on Linux register their X11 socket and timers through
+    /// `IPlugFrame`/`IRunLoop`; the host has to call `service_run_loop`
+    /// regularly or the editor draws once and then ignores every click.
     pub fn service_gui(&mut self) {
-        if let Some(window) = self.window.as_mut() {
-            if window.is_open() {
+        let open = match self.window.as_mut() {
+            Some(window) if window.is_open() => {
                 let _ = window.service_platform_events();
-            } else {
-                window.close();
-                self.window = None;
+                true
             }
+            Some(_) => false,
+            None => false,
+        };
+        if !open {
+            if self.window.is_some() {
+                self.close_gui();
+            }
+            return;
+        }
+        if let Ok(mut plugin) = self.plugin.try_lock() {
+            plugin.service_run_loop();
         }
     }
 

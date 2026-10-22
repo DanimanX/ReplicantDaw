@@ -92,6 +92,8 @@ pub struct Studio {
 
     pub virtual_keys: [bool; 24],
     pub next_request: u64,
+    /// Last time plugin parameters were re-read from the plugins.
+    last_param_refresh: Instant,
 }
 
 impl Studio {
@@ -137,6 +139,7 @@ impl Studio {
             logs: Vec::new(),
             virtual_keys: [false; 24],
             next_request: 1,
+            last_param_refresh: Instant::now(),
         };
         studio.status = format!(
             "{} MIDI input(s) · {} project(s)",
@@ -169,6 +172,15 @@ impl Studio {
     /// Per-frame service pump.
     pub fn pump(&mut self) {
         self.midi.pump();
+
+        // While a plugin's own window is open, it is the user editing the
+        // parameters: keep the host's mirrored values fresh.
+        if self.last_param_refresh.elapsed() >= Duration::from_millis(400)
+            && self.slots.iter().flatten().any(|slot| slot.gui_open)
+        {
+            self.last_param_refresh = Instant::now();
+            self.plugins.send(PluginCommand::RefreshParams);
+        }
 
         for _ in 0..32 {
             let event = match self.plugins.event_rx.pop() {

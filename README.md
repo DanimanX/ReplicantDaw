@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.1.1** · MIT, Linux, macOS and Windows.
+**Version 1.1.2** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -22,6 +22,25 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Per-track plugin rack hosting a real CLAP instrument](docs/plugins.png)
 
 ![Plugin editor at full screen](docs/plugin-editor.png)
+
+![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
+
+## Fixes in 1.1.2
+
+- **Plugin windows respond to the mouse.** The host now registers the CLAP
+  `timer` and `posix_fd` extensions and drives the VST3 Linux run loop, and the
+  plugin worker services them on every tick instead of only when idle. GUI
+  toolkits such as JUCE (Dexed, JC303, TAL) build their editor loop on those
+  callbacks, so without them the editor drew once and then ignored every click.
+  Verified: dragging knobs changes real parameters in Dexed (2 of 128) and in a
+  VST3 instrument (9 of 2097), and hover repaints in both.
+- **Editor windows are sized and kept in sync.** The host window is created at
+  the plugin's own canvas size, centered, focused and raised; it follows the
+  plugin when it re-lays out, and pushes user resizes down to resizable editors
+  or snaps back for fixed-size ones. Nothing is clipped.
+- **Host knobs follow the plugin window.** While an editor is open, the worker
+  re-reads the plugin's parameters every 400 ms, so changes made in the
+  vendor's window show up in the rack and the parameter editor.
 
 ## Fixes in 1.1.1
 
@@ -47,9 +66,10 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
   VST3 locations (42 plugins on the test machine).
 - **Native plugin windows** — `PLUGIN GUI` opens the plugin's own window instead
   of only the parameter surface. CLAP editors are embedded into a host-owned
-  X11 window with the `clap.gui` and `clap.thread-check` host extensions
-  registered; VST3 editors use the editor window provided by the VST3 host.
-  The button lives in the instrument module, the rack row and the plugin editor.
+  X11 window with the `clap.gui`, `clap.thread-check`, `clap.timer` and
+  `clap.posix-fd` host extensions registered; VST3 editors use the editor window
+  provided by the VST3 host and its Linux run loop. The button lives in the
+  instrument module, the rack row and the plugin editor.
 - **Instrument source is explicit** — each track records whether it plays
   nothing, the FM synth, or the plugin, and project format v5 stores it. v4
   files keep playing their synth.
@@ -367,7 +387,7 @@ Keystation 49 MK3 MIDI keyboard, and third-party plugins already installed:
 
 ```
 $ cargo test
-test result: ok. 90 passed; 0 failed
+test result: ok. 92 passed; 0 failed
 
 $ cargo clippy --all-targets -- -D warnings
 Finished

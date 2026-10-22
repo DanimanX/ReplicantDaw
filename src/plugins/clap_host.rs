@@ -15,8 +15,11 @@ use clack_extensions::gui::{
     GuiApiType, GuiConfiguration, GuiSize, HostGui, HostGuiImpl, PluginGui,
 };
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
+#[cfg(unix)]
+use clack_extensions::posix_fd::{FdFlags, HostPosixFd, HostPosixFdImpl, PluginPosixFd};
 use clack_extensions::state::PluginState;
 use clack_extensions::thread_check::{HostThreadCheck, HostThreadCheckImpl};
+use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
 use clack_host::prelude::*;
 use clack_host::process::PluginAudioProcessor;
 use clack_host::utils::ClapId;
@@ -28,9 +31,97 @@ use super::{BlockEvent, ParamInfo, PLUGIN_BLOCK_FRAMES};
 /// Registering the `clap.gui` host extension is mandatory for plugins that
 /// embed their editor: u-he instruments abort when `host.get_extension("clap.gui")`
 /// returns null, and several others silently refuse to draw.
+/// A timer the plugin registered through `clap_host_timer_support`.
+struct HostTimerEntry {
+    id: TimerId,
+    period: std::time::Duration,
+    next: std::time::Instant,
+}
+
+/// Mutable registries the host keeps for one plugin instance.
+#[derive(Default)]
+pub struct HostReactor {
+    timers: std::sync::Mutex<Vec<HostTimerEntry>>,
+    next_timer: std::sync::atomic::AtomicU32,
+    #[cfg(unix)]
+    fds: std::sync::Mutex<Vec<(std::os::unix::io::RawFd, FdFlags)>>,
+}
+
+impl HostReactor {
+    /// Timer ids whose period elapsed; reschedules them.
+    fn due_timers(&self) -> Vec<TimerId> {
+        let Ok(mut timers) = self.timers.lock() else {
+            return Vec::new();
+        };
+        let now = std::time::Instant::now();
+        let mut due = Vec::new();
+        for timer in timers.iter_mut() {
+            if timer.next <= now {
+                due.push(timer.id);
+                // Keep the cadence but never pile up if we were stalled.
+                timer.next = now + timer.period;
+            }
+        }
+        due
+    }
+
+    /// File descriptors that are ready for the events the plugin asked for.
+    #[cfg(unix)]
+    fn ready_fds(&self) -> Vec<(std::os::unix::io::RawFd, FdFlags)> {
+        let Ok(fds) = self.fds.lock() else {
+            return Vec::new();
+        };
+        if fds.is_empty() {
+            return Vec::new();
+        }
+        let mut pollfds: Vec<libc::pollfd> = fds
+            .iter()
+            .map(|(fd, flags)| libc::pollfd {
+                fd: *fd,
+                events: {
+                    let mut events = 0;
+                    if flags.contains(FdFlags::READ) {
+                        events |= libc::POLLIN;
+                    }
+                    if flags.contains(FdFlags::WRITE) {
+                        events |= libc::POLLOUT;
+                    }
+                    events
+                },
+                revents: 0,
+            })
+            .collect();
+        // Non-blocking: the worker calls this on every tick.
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 0) };
+        if ready <= 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (index, pollfd) in pollfds.iter().enumerate() {
+            if pollfd.revents == 0 {
+                continue;
+            }
+            let mut flags = FdFlags::empty();
+            if pollfd.revents & (libc::POLLIN | libc::POLLPRI) != 0 {
+                flags |= FdFlags::READ;
+            }
+            if pollfd.revents & libc::POLLOUT != 0 {
+                flags |= FdFlags::WRITE;
+            }
+            if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                flags |= FdFlags::ERROR;
+            }
+            out.push((fds[index].0, flags));
+        }
+        out
+    }
+}
+
 pub struct HostShared {
     /// Thread that owns the plugin instance (this build's audio + main thread).
     owner: std::thread::ThreadId,
+    /// Timers and file descriptors the plugin registered with the host.
+    reactor: std::sync::Arc<HostReactor>,
     /// Pending resize request encoded as `width << 32 | height` (0 = none).
     resize: std::sync::atomic::AtomicU64,
     show: std::sync::atomic::AtomicBool,
@@ -43,6 +134,7 @@ impl Default for HostShared {
     fn default() -> Self {
         Self {
             owner: std::thread::current().id(),
+            reactor: Default::default(),
             resize: Default::default(),
             show: Default::default(),
             hide: Default::default(),
@@ -117,17 +209,86 @@ impl HostGuiImpl for HostShared {
     }
 }
 
+/// The host's `[main-thread]` data: it only needs the reactor the plugin
+/// registers its timers and file descriptors into.
+pub struct HostMainThread<'a> {
+    reactor: std::sync::Arc<HostReactor>,
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> MainThreadHandler<'a> for HostMainThread<'a> {}
+
+impl HostTimerImpl for HostMainThread<'_> {
+    fn register_timer(&self, period_ms: u32) -> Result<TimerId, HostError> {
+        let period = std::time::Duration::from_millis(u64::from(period_ms.clamp(1, 1000)));
+        let id = TimerId(
+            self.reactor
+                .next_timer
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
+        if let Ok(mut timers) = self.reactor.timers.lock() {
+            timers.push(HostTimerEntry {
+                id,
+                period,
+                next: std::time::Instant::now() + period,
+            });
+        }
+        Ok(id)
+    }
+
+    fn unregister_timer(&self, timer_id: TimerId) -> Result<(), HostError> {
+        if let Ok(mut timers) = self.reactor.timers.lock() {
+            timers.retain(|timer| timer.id != timer_id);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl HostPosixFdImpl for HostMainThread<'_> {
+    fn register_fd(&self, fd: std::os::unix::io::RawFd, flags: FdFlags) -> Result<(), HostError> {
+        if let Ok(mut fds) = self.reactor.fds.lock() {
+            fds.retain(|(existing, _)| *existing != fd);
+            fds.push((fd, flags));
+        }
+        Ok(())
+    }
+
+    fn modify_fd(&self, fd: std::os::unix::io::RawFd, flags: FdFlags) -> Result<(), HostError> {
+        if let Ok(mut fds) = self.reactor.fds.lock() {
+            match fds.iter_mut().find(|(existing, _)| *existing == fd) {
+                Some(entry) => entry.1 = flags,
+                None => fds.push((fd, flags)),
+            }
+        }
+        Ok(())
+    }
+
+    fn unregister_fd(&self, fd: std::os::unix::io::RawFd) -> Result<(), HostError> {
+        if let Ok(mut fds) = self.reactor.fds.lock() {
+            fds.retain(|(existing, _)| *existing != fd);
+        }
+        Ok(())
+    }
+}
+
 /// The host type handed to CLAP plugins.
 pub struct ReplicantHost;
 
 impl HostHandlers for ReplicantHost {
     type Shared<'a> = HostShared;
-    type MainThread<'a> = ();
+    type MainThread<'a> = HostMainThread<'a>;
     type AudioProcessor<'a> = ();
 
     fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
         builder.register::<HostGui>();
         builder.register::<HostThreadCheck>();
+        // GUI toolkits (JUCE among others) drive their editor from a timer and
+        // from the X11 socket: without these the plugin draws once and then
+        // ignores every click.
+        builder.register::<HostTimer>();
+        #[cfg(unix)]
+        builder.register::<HostPosixFd>();
     }
 }
 
@@ -169,6 +330,48 @@ fn preferred_gui_api() -> GuiApiType<'static> {
     }
 }
 
+/// What the host should do to keep the editor and its window the same size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SizeAction {
+    /// Both sides already agree.
+    None,
+    /// The plugin wants a different canvas: resize the host window.
+    ResizeHost((u16, u16)),
+    /// The user resized the host window: ask the plugin to re-layout.
+    ResizePlugin((u16, u16)),
+}
+
+/// Decide how to reconcile the host window, the plugin's canvas and the size
+/// they last agreed on.
+///
+/// - the plugin reporting a new size wins (it may re-layout on preset change);
+/// - otherwise a changed host window is pushed to the plugin when it can
+///   resize, and undone when it cannot (fixed-size editors would be clipped).
+fn size_action(
+    parent: Option<(u16, u16)>,
+    reported: Option<(u16, u16)>,
+    agreed: Option<(u16, u16)>,
+    can_resize: bool,
+) -> SizeAction {
+    let (Some(parent), Some(reported)) = (parent, reported) else {
+        return SizeAction::None;
+    };
+    match agreed {
+        // First measurement: adopt the plugin's size.
+        None if parent != reported => SizeAction::ResizeHost(reported),
+        None => SizeAction::None,
+        Some(agreed) if reported != agreed => SizeAction::ResizeHost(reported),
+        Some(agreed) if parent != agreed => {
+            if can_resize {
+                SizeAction::ResizePlugin(parent)
+            } else {
+                SizeAction::ResizeHost(agreed)
+            }
+        }
+        _ => SizeAction::None,
+    }
+}
+
 /// A plugin editor window the host owns and hands to the plugin.
 ///
 /// CLAP plugins overwhelmingly implement *embedded* GUIs only (Dexed, TAL and
@@ -183,6 +386,9 @@ struct ClapGui {
     created: bool,
     floating: bool,
     title: String,
+    /// Last size the plugin reported or that we pushed to it. Lets the host
+    /// tell "the plugin changed size" from "the user resized our window".
+    last_size: Option<(u16, u16)>,
 }
 
 impl ClapGui {
@@ -195,6 +401,7 @@ impl ClapGui {
             created: false,
             floating: false,
             title,
+            last_size: None,
         }
     }
 
@@ -240,6 +447,26 @@ impl ClapGui {
                 r#type: xcb::x::ATOM_STRING,
                 data: self.title.as_bytes(),
             });
+            // Give the window an identity so window managers decorate, focus
+            // and place it like a normal application window instead of an
+            // anonymous override window.
+            connection.send_request(&xcb::x::ChangeProperty {
+                mode: xcb::x::PropMode::Replace,
+                window,
+                property: xcb::x::ATOM_WM_CLASS,
+                r#type: xcb::x::ATOM_STRING,
+                data: b"replicant-daw\0ReplicantDaw\0",
+            });
+            // Center it on the screen, and keep it fully visible when the editor
+            // is smaller than the display.
+            let screen_w = screen.width_in_pixels();
+            let screen_h = screen.height_in_pixels();
+            let x = ((screen_w as i32 - width as i32) / 2).max(0);
+            let y = ((screen_h as i32 - height as i32) / 2).max(0);
+            connection.send_request(&xcb::x::ConfigureWindow {
+                window,
+                value_list: &[xcb::x::ConfigWindow::X(x), xcb::x::ConfigWindow::Y(y)],
+            });
             let _ = connection.flush();
             self.connection = Some(connection);
             self.window = Some(window);
@@ -273,11 +500,20 @@ impl ClapGui {
         }
     }
 
-    /// Map (show) the parent window.
+    /// Map (show) the parent window, raise it and give it keyboard focus.
     fn map_parent(&self) {
         #[cfg(target_os = "linux")]
         if let (Some(connection), Some(window)) = (&self.connection, self.window) {
             connection.send_request(&xcb::x::MapWindow { window });
+            connection.send_request(&xcb::x::ConfigureWindow {
+                window,
+                value_list: &[xcb::x::ConfigWindow::StackMode(xcb::x::StackMode::Above)],
+            });
+            connection.send_request(&xcb::x::SetInputFocus {
+                revert_to: xcb::x::InputFocus::Parent,
+                focus: window,
+                time: xcb::x::CURRENT_TIME,
+            });
             let _ = connection.flush();
         }
     }
@@ -292,7 +528,7 @@ impl ClapGui {
     }
 
     /// Resize the parent so an embedded editor fits exactly.
-    fn resize_parent(&self, width: u16, height: u16) {
+    fn resize_parent(&mut self, width: u16, height: u16) {
         #[cfg(target_os = "linux")]
         if let (Some(connection), Some(window)) = (&self.connection, self.window) {
             connection.send_request(&xcb::x::ConfigureWindow {
@@ -306,6 +542,24 @@ impl ClapGui {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = (width, height);
+    }
+
+    /// Current size of the host window, in pixels.
+    fn parent_size(&self) -> Option<(u16, u16)> {
+        #[cfg(target_os = "linux")]
+        {
+            let connection = self.connection.as_ref()?;
+            let window = self.window?;
+            let cookie = connection.send_request(&xcb::x::GetGeometry {
+                drawable: xcb::x::Drawable::Window(window),
+            });
+            let reply = connection.wait_for_reply(cookie).ok()?;
+            Some((reply.width(), reply.height()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     /// Unmap and destroy the parent window. Must run after the plugin's
@@ -369,7 +623,10 @@ impl ClapInstance {
         .map_err(|error| format!("CLAP host info failed: {error}"))?;
         let mut instance = PluginInstance::<ReplicantHost>::new(
             |_| HostShared::default(),
-            |_| (),
+            |shared| HostMainThread {
+                reactor: std::sync::Arc::clone(&shared.reactor),
+                _lifetime: std::marker::PhantomData,
+            },
             &entry,
             &id,
             &host_info,
@@ -498,6 +755,14 @@ impl ClapInstance {
         !self.has_audio_input
     }
 
+    /// Re-read every parameter from the plugin.
+    ///
+    /// The cached list is only a mirror: a plugin can change its own values from
+    /// its editor, so the host refreshes before displaying or saving them.
+    pub fn refresh_params(&mut self) {
+        self.params = Self::read_params(&mut self.instance);
+    }
+
     pub fn set_param(&mut self, id: u32, value: f32) {
         if let Some(param) = self.params.iter_mut().find(|param| param.id == id) {
             param.value = value.clamp(0.0, 1.0);
@@ -578,10 +843,23 @@ impl ClapInstance {
             let title = std::ffi::CString::new(gui.title.clone()).unwrap_or_default();
             gui_ext.suggest_title(&handle, &title);
         } else {
-            if let Err(error) = gui.create_parent(900, 620) {
+            // Ask for the size *after* create and build the parent at exactly
+            // that size: a host window smaller than the plugin's canvas is what
+            // makes the editor look cut off.
+            let reported = gui_ext.get_size(&handle);
+            let width = reported
+                .map(|size| size.width)
+                .unwrap_or(900)
+                .clamp(160, 4096) as u16;
+            let height = reported
+                .map(|size| size.height)
+                .unwrap_or(620)
+                .clamp(120, 4096) as u16;
+            if let Err(error) = gui.create_parent(width, height) {
                 fail(&mut gui, &gui_ext, &handle);
                 return Err(error);
             }
+            gui.last_size = Some((width, height));
             // Some toolkits query the parent's attributes while attaching, so
             // it must be a real, mapped window before `set_parent`.
             gui.map_parent();
@@ -594,14 +872,6 @@ impl ClapInstance {
             }
         }
 
-        // Only now is `size` legal. Let the plugin tell us how big it drew and
-        // resize the host window to match exactly.
-        if let Some(size) = gui_ext.get_size(&handle) {
-            let width = size.width.clamp(160, 4096) as u16;
-            let height = size.height.clamp(120, 4096) as u16;
-            gui.resize_parent(width, height);
-        }
-
         if let Err(error) = gui_ext.show(&handle) {
             fail(&mut gui, &gui_ext, &handle);
             return Err(format!("CLAP GUI show failed: {error:?}"));
@@ -611,12 +881,53 @@ impl ClapInstance {
         Ok(())
     }
 
+    /// Drive what the plugin registered with the host: its timers and the file
+    /// descriptors it wants to watch.
+    ///
+    /// GUI toolkits on Linux run their editor loop from these two callbacks, so
+    /// a plugin whose editor is drawn but ignores every click is almost always
+    /// missing them.
+    pub fn service_host_events(&mut self) {
+        let reactor = self
+            .instance
+            .access_shared_handler(|shared| std::sync::Arc::clone(&shared.reactor));
+        let due = reactor.due_timers();
+        #[cfg(unix)]
+        let ready = reactor.ready_fds();
+        #[cfg(not(unix))]
+        let ready: Vec<()> = Vec::new();
+        if due.is_empty() && ready.is_empty() {
+            return;
+        }
+
+        let handle = self.instance.plugin_handle();
+        if !due.is_empty() {
+            if let Some(timers) = handle.get_extension::<PluginTimer>() {
+                for id in due {
+                    timers.on_timer(&handle, id);
+                }
+            }
+        }
+        #[cfg(unix)]
+        if !ready.is_empty() {
+            if let Some(fds) = handle.get_extension::<PluginPosixFd>() {
+                for (fd, flags) in ready {
+                    fds.on_fd(&handle, fd, flags);
+                }
+            }
+        }
+    }
+
     /// Answer the requests the plugin made through `clap_host_gui`.
     ///
     /// Runs on the worker thread while the editor is open: a resize request
     /// grows/shrinks our parent window, `hide` unmaps it and a destroyed
     /// window tears the editor down.
     pub fn service_gui(&mut self) {
+        // Timers and file descriptors must run even before a GUI exists: some
+        // plugins drive preset loading and meters from them.
+        self.service_host_events();
+
         let Some(gui) = self.gui.as_ref() else {
             return;
         };
@@ -642,13 +953,18 @@ impl ClapInstance {
             .access_shared_handler(|shared| shared.is_closed());
 
         if let Some((width, height)) = resize {
-            if let Some(gui) = self.gui.as_ref() {
+            if let Some(gui) = self.gui.as_mut() {
                 gui.resize_parent(
                     width.clamp(160, 4096) as u16,
                     height.clamp(120, 4096) as u16,
                 );
             }
         }
+
+        // Follow the plugin's own size, and let it follow ours when the user
+        // resizes the window: an editor that reports a size bigger than the
+        // host window is what makes it look cut off.
+        self.sync_gui_size();
         if hide {
             if let Some(gui) = self.gui.as_ref() {
                 gui.unmap_parent();
@@ -656,6 +972,59 @@ impl ClapInstance {
         }
         if closed {
             self.destroy_gui();
+        }
+    }
+
+    /// Keep the host window and the plugin's canvas the same size.
+    ///
+    /// Two directions, decided by comparing the plugin's reported size with the
+    /// last size both sides agreed on:
+    /// - the plugin changed size → grow/shrink the host window to fit;
+    /// - the host window changed (the user dragged its border) → tell the
+    ///   plugin to lay out at the new size.
+    fn sync_gui_size(&mut self) {
+        let Some(gui) = self.gui.as_ref() else {
+            return;
+        };
+        if !gui.created || gui.floating {
+            return;
+        }
+        let parent = gui.parent_size();
+        let handle = self.instance.plugin_handle();
+        let Some(gui_ext) = handle.get_extension::<PluginGui>() else {
+            return;
+        };
+        let reported = gui_ext.get_size(&handle).map(|size| {
+            (
+                size.width.clamp(160, 4096) as u16,
+                size.height.clamp(120, 4096) as u16,
+            )
+        });
+
+        let action = size_action(parent, reported, gui.last_size, gui_ext.can_resize(&handle));
+        match action {
+            SizeAction::None => {}
+            SizeAction::ResizeHost(size) => {
+                if let Some(gui) = self.gui.as_mut() {
+                    gui.resize_parent(size.0, size.1);
+                }
+            }
+            SizeAction::ResizePlugin(size) => {
+                let wanted = clack_extensions::gui::GuiSize {
+                    width: size.0 as u32,
+                    height: size.1 as u32,
+                };
+                if gui_ext.set_size(&handle, wanted).is_ok() {
+                    if let Some(gui) = self.gui.as_mut() {
+                        gui.last_size = Some(size);
+                    }
+                } else if let Some(gui) = self.gui.as_mut() {
+                    // A fixed-size editor that refused the request: undo.
+                    if let Some(previous) = gui.last_size {
+                        gui.resize_parent(previous.0, previous.1);
+                    }
+                }
+            }
         }
     }
 
@@ -834,20 +1203,73 @@ mod tests {
             .find("gui_ext.create(&handle, configuration)")
             .expect("create call not found");
         for call in ["gui_ext.get_size(&handle)", "gui_ext.set_size("] {
-            let Some(position) = source.find(call) else {
-                continue;
-            };
-            assert!(
-                position > create,
-                "{call} appears before `create`; CLAP forbids sizing first"
-            );
+            let mut cursor = 0;
+            while let Some(offset) = source[cursor..].find(call) {
+                let position = cursor + offset;
+                assert!(
+                    position > create,
+                    "{call} appears before `create`; CLAP forbids sizing first"
+                );
+                cursor = position + call.len();
+            }
         }
-        // `get_size` must appear exactly once, after `create`.
-        assert_eq!(
-            source.matches("gui_ext.get_size(&handle)").count(),
-            1,
-            "expected a single, post-create size query"
+        assert!(
+            source.matches("gui_ext.get_size(&handle)").count() >= 1,
+            "the host must size the window from the plugin's reported size"
         );
+    }
+
+    #[test]
+    fn sizing_follows_the_plugin_and_respects_fixed_size_editors() {
+        use super::{size_action, SizeAction};
+        let plugin = Some((866, 674));
+        let bigger = Some((1000, 700));
+
+        // First measurement adopts the plugin's canvas.
+        assert_eq!(
+            size_action(Some((900, 620)), plugin, None, false),
+            SizeAction::ResizeHost((866, 674))
+        );
+        // Agreement is stable.
+        assert_eq!(size_action(plugin, plugin, plugin, true), SizeAction::None);
+        // The plugin re-laid out: follow it, even if the user resized earlier.
+        assert_eq!(
+            size_action(bigger, Some((1200, 680)), plugin, true),
+            SizeAction::ResizeHost((1200, 680))
+        );
+        // The user resized a resizable editor: push the new size down.
+        assert_eq!(
+            size_action(bigger, plugin, plugin, true),
+            SizeAction::ResizePlugin((1000, 700))
+        );
+        // The user resized a fixed-size editor: snap the window back.
+        assert_eq!(
+            size_action(bigger, plugin, plugin, false),
+            SizeAction::ResizeHost((866, 674))
+        );
+        // Nothing known yet: leave it alone.
+        assert_eq!(size_action(None, None, None, true), SizeAction::None);
+    }
+
+    #[test]
+    fn reactor_schedules_and_reschedules_timers() {
+        use clack_extensions::timer::HostTimerImpl;
+
+        let reactor = std::sync::Arc::new(super::HostReactor::default());
+        let main_thread = super::HostMainThread {
+            reactor: std::sync::Arc::clone(&reactor),
+            _lifetime: std::marker::PhantomData,
+        };
+        let id = main_thread.register_timer(1).expect("register timer");
+        // Nothing is due immediately after registration…
+        assert!(reactor.due_timers().is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        // …but it fires once the period elapsed, and then reschedules itself.
+        assert_eq!(reactor.due_timers(), vec![id]);
+        assert!(reactor.due_timers().is_empty());
+        main_thread.unregister_timer(id).expect("unregister");
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        assert!(reactor.due_timers().is_empty());
     }
 
     #[test]

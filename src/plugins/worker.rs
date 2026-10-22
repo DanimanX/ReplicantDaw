@@ -70,6 +70,11 @@ pub enum PluginCommand {
     OpenGui {
         slot: u8,
     },
+    /// Re-read the parameters of every loaded plugin.
+    ///
+    /// Editing inside the plugin's own window changes values the host never
+    /// sees otherwise, so the rack's knobs would drift.
+    RefreshParams,
     CloseGui {
         slot: u8,
     },
@@ -157,6 +162,13 @@ impl Instance {
         }
     }
 
+    fn refresh_params(&mut self) {
+        match self {
+            Self::Clap(plugin) => plugin.refresh_params(),
+            Self::Vst3(plugin) => plugin.refresh_params(),
+        }
+    }
+
     fn save_state(&mut self) -> Result<Vec<u8>, String> {
         match self {
             Self::Clap(plugin) => plugin.save_state(),
@@ -227,8 +239,16 @@ impl Drop for Worker {
 
 impl Worker {
     fn run(mut self, stop: Arc<AtomicBool>) {
+        // Editor event loops need frequent servicing, but not on every audio
+        // block; ~250 Hz is plenty for GUI input and plugin timers.
+        let mut last_gui_service = std::time::Instant::now();
         while !stop.load(Ordering::Relaxed) {
             let mut did_work = false;
+
+            if last_gui_service.elapsed() >= Duration::from_millis(4) {
+                last_gui_service = std::time::Instant::now();
+                self.service_gui_windows();
+            }
 
             for _ in 0..16 {
                 match self.command_rx.pop() {
@@ -249,9 +269,6 @@ impl Worker {
                     }
                 }
                 Err(_) => {
-                    // Plugin editors pump their own platform events; do it
-                    // here, on the thread that owns the plugin instances.
-                    self.service_gui_windows();
                     if !did_work {
                         thread::sleep(Duration::from_micros(150));
                     }
@@ -366,6 +383,12 @@ impl Worker {
                     open: opened,
                     message,
                 });
+                self.emit_slots();
+            }
+            PluginCommand::RefreshParams => {
+                for slot in self.slots.iter_mut().flatten() {
+                    slot.instance.refresh_params();
+                }
                 self.emit_slots();
             }
             PluginCommand::CloseGui { slot } => {

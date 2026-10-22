@@ -474,6 +474,9 @@ impl Engine {
                 self.record_track = track as u8;
                 self.recorded[track].clear();
                 self.recording = true;
+                // A recorded clip must be audible even if the clip slot was
+                // previously stopped.
+                self.tracks[track].active = true;
                 self.record_pending = None;
                 if !self.playing {
                     self.playing = true;
@@ -721,7 +724,7 @@ impl Engine {
             }
             if let Some(rx) = &mut self.plugin_output {
                 if let Ok(block) = rx.pop() {
-                    self.plugin_latency = (PLUGIN_BLOCK_FRAMES * 2) as u16;
+                    self.plugin_latency = PLUGIN_BLOCK_FRAMES as u16;
                     self.plugin_ready = block;
                     self.plugin_ready_len = block.frames;
                     self.plugin_ready_pos = 0;

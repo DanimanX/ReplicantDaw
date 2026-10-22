@@ -393,6 +393,12 @@ impl Studio {
                 descriptor,
                 state: state_bytes,
             });
+            if plugin.bypass {
+                self.plugins.send(PluginCommand::Bypass {
+                    slot: plugin.slot,
+                    bypass: true,
+                });
+            }
         }
 
         self.project_name = project.name;

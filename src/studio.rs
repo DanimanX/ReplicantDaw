@@ -28,6 +28,17 @@ pub enum RollDragMode {
     Resize,
 }
 
+/// Which edge of the clip loop is being dragged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoopEdge {
+    /// The start handle.
+    Start,
+    /// The end handle.
+    End,
+    /// Empty ruler: build a new region from this anchor step.
+    New(u16),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RollDrag {
     pub note_index: usize,
@@ -35,6 +46,9 @@ pub struct RollDrag {
     pub original_note: u8,
     pub original_length: u16,
     pub mode: RollDragMode,
+    /// Pointer position when the drag began. Absolute, because egui's
+    /// `drag_delta` is per-frame and cannot drive an absolute edit.
+    pub pointer_origin: egui::Pos2,
 }
 
 pub struct Studio {
@@ -68,8 +82,8 @@ pub struct Studio {
     pub roll_base_note: i32,
     pub roll_selected: Option<usize>,
     pub roll_drag: Option<RollDrag>,
-    /// Step where the user started dragging a loop region in the ruler.
-    pub roll_loop_anchor: Option<u16>,
+    /// Which edge of the clip loop the user is dragging, if any.
+    pub roll_loop_drag: Option<LoopEdge>,
 
     /// Audio-clip envelope editor.
     pub audio_editor_open: bool,
@@ -127,7 +141,7 @@ impl Studio {
             roll_base_note: 36,
             roll_selected: None,
             roll_drag: None,
-            roll_loop_anchor: None,
+            roll_loop_drag: None,
             audio_editor_open: false,
             audio_editor_track: 0,
             plugin_editor_open: false,

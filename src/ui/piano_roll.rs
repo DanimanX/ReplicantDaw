@@ -6,7 +6,7 @@ use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use crate::audio::{AudioRuntime, Command, LOOP_STEPS, SCENE_COUNT, TRACK_COUNT};
 use crate::state::UiState;
-use crate::studio::{sync_clip_loop, sync_track_notes, RollDrag, RollDragMode, Studio};
+use crate::studio::{sync_clip_loop, sync_track_notes, LoopEdge, RollDrag, RollDragMode, Studio};
 use crate::theme;
 
 const KEY_W: f32 = 42.0;
@@ -192,7 +192,7 @@ fn draw_header(
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new(
-                "CLICK GRID = ADD · DRAG BODY = MOVE · DRAG EDGE = LENGTH · RIGHT-CLICK = DELETE",
+                "CLICK GRID = ADD · DRAG NOTE = MOVE · DRAG ITS RIGHT EDGE = LENGTH · RIGHT-CLICK = DELETE · DRAG THE RULER = LOOP",
             )
             .font(theme::mono(6.8))
             .color(theme::TEXT_FAINT),
@@ -366,46 +366,86 @@ fn draw_grid(
                 );
             }
 
-            // The ruler band doubles as the loop selector.
+            // The ruler band is the loop selector: grab an edge to resize the
+            // region, or drag on empty ruler to draw a new one.
             let ruler = Rect::from_min_max(
                 Pos2::new(grid.left(), canvas.top()),
                 Pos2::new(grid.right(), grid.top()),
             );
+            let step_at = |x: f32| -> u16 {
+                (((x - grid.left()) / STEP_W).floor().max(0.0) as i32).min(LOOP_STEPS as i32 - 1)
+                    as u16
+            };
+            let edge_w = 9.0;
+            let start_handle = Rect::from_min_max(
+                Pos2::new(loop_x0 - edge_w, canvas.top()),
+                Pos2::new(loop_x0 + edge_w, grid.top()),
+            );
+            let end_handle = Rect::from_min_max(
+                Pos2::new(loop_x1 - edge_w, canvas.top()),
+                Pos2::new(loop_x1 + edge_w, grid.top()),
+            );
+
+            // Registered before the handles so the handles sit on top of it.
             let ruler_response = ui.interact(
                 ruler,
                 ui.scope_id().with(("piano_roll_loop", track, scene)),
                 Sense::click_and_drag(),
             );
-            if ruler_response.hovered() {
+            let start_response = ui.interact(
+                start_handle,
+                ui.scope_id().with(("piano_roll_loop_start", track, scene)),
+                Sense::click_and_drag(),
+            );
+            let end_response = ui.interact(
+                end_handle,
+                ui.scope_id().with(("piano_roll_loop_end", track, scene)),
+                Sense::click_and_drag(),
+            );
+
+            let on_edge = start_response.hovered() || end_response.hovered();
+            if on_edge || ruler_response.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
             }
-            let step_at = |x: f32| -> u16 {
-                (((x - grid.left()) / STEP_W).floor().max(0.0) as i32).min(LOOP_STEPS as i32 - 1)
-                    as u16
-            };
-            if ruler_response.drag_started() {
-                if let Some(pos) = ruler_response.interact_pointer_pos() {
+
+            if start_response.drag_started() {
+                studio.roll_loop_drag = Some(LoopEdge::Start);
+            } else if end_response.drag_started() {
+                studio.roll_loop_drag = Some(LoopEdge::End);
+            } else if ruler_response.drag_started() {
+                // Use the press position, not the first motion sample: a new
+                // region must start exactly where the user pressed.
+                let origin = ui.ctx().input(|i| i.pointer.press_origin());
+                if let Some(pos) = origin.or_else(|| ruler_response.interact_pointer_pos()) {
                     let anchor = step_at(pos.x);
-                    studio.roll_loop_anchor = Some(anchor);
+                    studio.roll_loop_drag = Some(LoopEdge::New(anchor));
                     state.set_clip_loop(track, scene, anchor, anchor + 1);
+                    sync_clip_loop(state, audio, track, scene);
                 }
             }
-            if ruler_response.dragged() {
-                if let (Some(anchor), Some(pos)) = (
-                    studio.roll_loop_anchor,
-                    ruler_response.interact_pointer_pos(),
-                ) {
-                    let current = step_at(pos.x);
-                    if current != anchor {
-                        state.set_clip_loop(track, scene, anchor, current);
-                        sync_clip_loop(state, audio, track, scene);
-                    }
+
+            // Absolute positions: egui's drag delta is per frame, so every
+            // edit is recomputed from where the pointer is right now.
+            if let Some(edge) = studio.roll_loop_drag {
+                if let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos()) {
+                    let step = step_at(pos.x);
+                    let (lo, hi) = state.clip_loop(track, scene);
+                    let (lo, hi) = loop_after_drag(edge, step, lo, hi);
+                    state.set_clip_loop(track, scene, lo, hi);
+                    sync_clip_loop(state, audio, track, scene);
+                }
+                if ui.ctx().input(|i| i.pointer.any_released()) {
+                    studio.roll_loop_drag = None;
                 }
             }
-            if ruler_response.drag_stopped() {
-                studio.roll_loop_anchor = None;
-            }
-            if ruler_response.hovered() {
+
+            if on_edge {
+                if start_response.hovered() {
+                    start_response.on_hover_text("Drag to move the loop start");
+                } else {
+                    end_response.on_hover_text("Drag to move the loop end");
+                }
+            } else if ruler_response.hovered() {
                 ruler_response.on_hover_text("Drag to set the clip's loop start and end");
             }
 
@@ -440,6 +480,26 @@ fn draw_grid(
                 [Pos2::new(px, grid.top()), Pos2::new(px, grid.bottom())],
                 Stroke::new(1.4, theme::accent_alpha(theme::CYAN, 220)),
             );
+
+            // Debug aid for the headless UI harness: dump the geometry once.
+            if std::env::var_os("REPLICANT_DEBUG_ROLL").is_some() {
+                let key = egui::Id::unique(("roll_debug_dump", track, scene));
+                ui.ctx().data_mut(|d| {
+                    if d.get_temp::<bool>(key).is_none() {
+                        d.insert_temp(key, true);
+                        eprintln!(
+                            "ROLLDBG grid={:?} loop=({},{}) notes={:?}",
+                            grid,
+                            loop_start,
+                            loop_end,
+                            notes
+                                .iter()
+                                .map(|n| (n.note, n.start_step, n.length_steps))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                });
+            }
 
             // Interaction surface below the notes.
             let grid_response = ui.interact(
@@ -518,28 +578,36 @@ fn draw_grid(
                     delete_note = Some(index);
                 }
                 if body.drag_started() {
-                    studio.roll_selected = Some(index);
-                    studio.roll_drag = Some(RollDrag {
-                        note_index: index,
-                        original_start: note.start_step,
-                        original_note: note.note,
-                        original_length: note.length_steps,
-                        mode: RollDragMode::Move,
-                    });
+                    if let Some(pos) = body.interact_pointer_pos() {
+                        studio.roll_selected = Some(index);
+                        studio.roll_drag = Some(RollDrag {
+                            note_index: index,
+                            original_start: note.start_step,
+                            original_note: note.note,
+                            original_length: note.length_steps,
+                            mode: RollDragMode::Move,
+                            pointer_origin: pos,
+                        });
+                    }
                 }
                 if body.dragged() {
-                    if let Some(drag) = studio.roll_drag {
+                    if let (Some(drag), Some(pos)) = (studio.roll_drag, body.interact_pointer_pos())
+                    {
                         if drag.note_index == index && drag.mode == RollDragMode::Move {
-                            let delta = body.drag_delta();
-                            let steps = (delta.x / STEP_W).round() as i32;
-                            let pitch = (-delta.y / ROW_H).round() as i32;
-                            state.move_note(
-                                track,
-                                scene,
-                                index,
-                                drag.original_start as i32 + steps,
-                                drag.original_note as i32 + pitch,
+                            // Offset from the grab point, not the last frame's
+                            // motion: egui's `drag_delta` is per-frame.
+                            let (start, note) = dragged_note(
+                                drag.pointer_origin,
+                                pos,
+                                drag.original_start,
+                                drag.original_note,
                             );
+                            let before = state.recorded_notes(track, scene).get(index).copied();
+                            state.move_note(track, scene, index, start, note);
+                            let after = state.recorded_notes(track, scene).get(index).copied();
+                            if after != before {
+                                changed = true;
+                            }
                         }
                     }
                 }
@@ -558,26 +626,31 @@ fn draw_grid(
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                 }
                 if handle.drag_started() {
-                    studio.roll_selected = Some(index);
-                    studio.roll_drag = Some(RollDrag {
-                        note_index: index,
-                        original_start: note.start_step,
-                        original_note: note.note,
-                        original_length: note.length_steps,
-                        mode: RollDragMode::Resize,
-                    });
+                    if let Some(pos) = handle.interact_pointer_pos() {
+                        studio.roll_selected = Some(index);
+                        studio.roll_drag = Some(RollDrag {
+                            note_index: index,
+                            original_start: note.start_step,
+                            original_note: note.note,
+                            original_length: note.length_steps,
+                            mode: RollDragMode::Resize,
+                            pointer_origin: pos,
+                        });
+                    }
                 }
                 if handle.dragged() {
-                    if let Some(drag) = studio.roll_drag {
+                    if let (Some(drag), Some(pos)) =
+                        (studio.roll_drag, handle.interact_pointer_pos())
+                    {
                         if drag.note_index == index && drag.mode == RollDragMode::Resize {
-                            let steps = (handle.drag_delta().x / STEP_W).round() as i32;
-                            state.resize_note(
-                                track,
-                                scene,
-                                index,
-                                drag.original_length as i32 + steps,
-                            );
-                            changed = true;
+                            let length =
+                                dragged_length(drag.pointer_origin, pos, drag.original_length);
+                            let before = state.recorded_notes(track, scene).get(index).copied();
+                            state.resize_note(track, scene, index, length);
+                            let after = state.recorded_notes(track, scene).get(index).copied();
+                            if after != before {
+                                changed = true;
+                            }
                         }
                     }
                 }
@@ -700,6 +773,45 @@ fn sync_notes(state: &UiState, audio: &mut AudioRuntime, track: usize, scene: us
     sync_track_notes(state, audio, track, scene);
 }
 
+/// Where a dragged note goes: offset from the grab point, in steps and
+/// semitones. Absolute, so repeated frames of the same drag agree.
+fn dragged_note(
+    pointer_origin: egui::Pos2,
+    pointer: egui::Pos2,
+    original_start: u16,
+    original_note: u8,
+) -> (i32, i32) {
+    let offset = pointer - pointer_origin;
+    let steps = (offset.x / STEP_W).round() as i32;
+    let semitones = (-offset.y / ROW_H).round() as i32;
+    (
+        original_start as i32 + steps,
+        original_note as i32 + semitones,
+    )
+}
+
+/// Length a dragged note should have, from the grab point to the pointer.
+fn dragged_length(pointer_origin: egui::Pos2, pointer: egui::Pos2, original_length: u16) -> i32 {
+    let offset = pointer - pointer_origin;
+    let steps = (offset.x / STEP_W).round() as i32;
+    original_length as i32 + steps
+}
+
+/// The loop region after dragging one of its edges to `step`.
+///
+/// Each edge only moves itself and can never cross the other one, so dragging
+/// the start handle can never invert or collapse the region.
+fn loop_after_drag(edge: LoopEdge, step: u16, lo: u16, hi: u16) -> (u16, u16) {
+    match edge {
+        LoopEdge::Start => (step.min(hi.saturating_sub(1)), hi),
+        LoopEdge::End => (lo, step.max(lo + 1)),
+        LoopEdge::New(anchor) => {
+            let lo = anchor.min(step);
+            (lo, anchor.max(step).max(lo + 1))
+        }
+    }
+}
+
 /// "bar.beat" label for a 16th-note step.
 fn bar_beat_text(step: u16) -> String {
     format!("{}.{}", step / 16 + 1, step % 16 / 4 + 1)
@@ -725,6 +837,76 @@ mod tests {
         assert_eq!(note_name(60), "C4");
         assert_eq!(note_name(69), "A4");
         assert_eq!(note_name(36), "C2");
+    }
+
+    #[test]
+    fn a_dragged_note_follows_the_pointer_absolutely() {
+        let origin = egui::Pos2::new(100.0, 200.0);
+        // Three steps to the right, two semitones up.
+        let (start, note) = dragged_note(
+            origin,
+            origin + Vec2::new(3.0 * STEP_W, -2.0 * ROW_H),
+            8,
+            60,
+        );
+        assert_eq!((start, note), (11, 62));
+
+        // Repeated frames with the same pointer must give the same answer
+        // (the bug was recomputing from a per-frame delta).
+        for _ in 0..5 {
+            assert_eq!(
+                dragged_note(
+                    origin,
+                    origin + Vec2::new(3.0 * STEP_W, -2.0 * ROW_H),
+                    8,
+                    60
+                ),
+                (11, 62)
+            );
+        }
+
+        // Small jitter stays on the same step.
+        assert_eq!(
+            dragged_note(origin, origin + Vec2::new(2.0, 1.0), 8, 60),
+            (8, 60)
+        );
+    }
+
+    #[test]
+    fn a_resized_note_follows_the_pointer_absolutely() {
+        let origin = egui::Pos2::new(100.0, 200.0);
+        assert_eq!(
+            dragged_length(origin, origin + Vec2::new(4.0 * STEP_W, 0.0), 2),
+            6
+        );
+        assert_eq!(
+            dragged_length(origin, origin + Vec2::new(-3.0 * STEP_W, 0.0), 4),
+            1
+        );
+        // Never collapses to zero steps.
+        assert_eq!(
+            dragged_length(origin, origin + Vec2::new(-40.0 * STEP_W, 0.0), 2),
+            -38
+        );
+    }
+
+    #[test]
+    fn loop_edges_move_independently() {
+        use crate::studio::LoopEdge;
+        let (lo, hi) = (32u16, 64u16);
+
+        // Dragging the start keeps the end, and cannot pass it.
+        assert_eq!(loop_after_drag(LoopEdge::Start, 40, lo, hi), (40, 64));
+        assert_eq!(loop_after_drag(LoopEdge::Start, 200, lo, hi), (63, 64));
+
+        // Dragging the end keeps the start, and cannot pass it.
+        assert_eq!(loop_after_drag(LoopEdge::End, 80, lo, hi), (32, 80));
+        assert_eq!(loop_after_drag(LoopEdge::End, 3, lo, hi), (32, 33));
+
+        // Drawing a new region works in either direction.
+        assert_eq!(loop_after_drag(LoopEdge::New(10), 20, lo, hi), (10, 20));
+        assert_eq!(loop_after_drag(LoopEdge::New(20), 10, lo, hi), (10, 20));
+        assert_eq!(loop_after_drag(LoopEdge::New(10), 10, lo, hi), (10, 11));
     }
 
     #[test]

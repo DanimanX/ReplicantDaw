@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.2.1** · MIT, Linux, macOS and Windows.
+**Version 1.2.2** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -24,6 +24,24 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Plugin editor at full screen](docs/plugin-editor.png)
 
 ![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
+
+## Fixes in 1.2.2
+
+- **Moving and resizing notes works after inserting them.** The drag handlers
+  used egui's `drag_delta`, which is the pointer motion of the *last frame*, as
+  if it were the offset since the drag started: every frame recomputed the note
+  from its original position plus one frame of movement, so the note snapped
+  back and appeared stuck. Dragging is now absolute — the offset from where you
+  grabbed the note — which makes moving, lengthening and shortening reliable.
+  Verified end to end: a drag of +3 steps / +2 semitones produced exactly
+  `(60, step 0)` → `(62, step 3)`, and a right-edge drag of 4 steps changed a
+  2-step note into a 5-step one.
+- **Loop edges resize independently.** The ruler had a single drag handler, so
+  grabbing a loop handle started a brand-new region instead of moving that
+  edge. Start and end now have their own hit areas (9 px), each edge only moves
+  itself and can never cross the other, and dragging empty ruler still draws a
+  new region — snapped to where you pressed. Verified: start handle 0 → 32 with
+  the end untouched; a fresh region drawn 20 → 60.
 
 ## Fixes in 1.2.1
 
@@ -176,8 +194,9 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
     muted without deleting them.
 - **Piano roll and audio clip editing**
   - Double-click a session or arrangement clip to program MIDI for that slot.
-  - Drag on the ruler to set the clip's loop start/end; playback repeats that
-    region only, and notes outside it stay silent.
+  - Drag on the ruler to draw a loop region; drag either amber handle to move
+    that edge. Playback repeats the region only, and notes outside it stay
+    silent.
   - 16-bar grid at 16th-note resolution, four-octave view with octave shift.
   - Add, move, resize, delete, mute and set velocity per note.
   - Each session slot is independent; the editor has a slot selector.

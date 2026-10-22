@@ -415,9 +415,9 @@ impl ClapInstance {
 
     /// Ask the plugin whether it exposes a GUI extension.
     ///
-    /// Deliberately does not call `is_api_supported`: u-he instruments answer
-    /// that by querying their own size before `create`, which aborts some of
-    /// them. The real negotiation happens in [`ClapInstance::open_gui`].
+    /// Only the extension is probed, never the size: CLAP only allows `get_size`
+    /// after `create`, and u-he plugins abort the process when it is called
+    /// earlier. The real negotiation happens in [`ClapInstance::open_gui`].
     fn probe_gui(instance: &mut PluginInstance<ReplicantHost>) -> bool {
         instance
             .plugin_handle()
@@ -510,24 +510,6 @@ impl ClapInstance {
         self.gui_supported
     }
 
-    /// Can this plugin draw a GUI on the current platform?
-    pub fn supports_gui(&mut self) -> bool {
-        let api = preferred_gui_api();
-        let handle = self.instance.plugin_handle();
-        let Some(gui) = handle.get_extension::<PluginGui>() else {
-            return false;
-        };
-        let embedded = GuiConfiguration {
-            api_type: api,
-            is_floating: false,
-        };
-        let floating = GuiConfiguration {
-            api_type: api,
-            is_floating: true,
-        };
-        gui.is_api_supported(&handle, embedded) || gui.is_api_supported(&handle, floating)
-    }
-
     pub fn is_gui_open(&self) -> bool {
         self.gui.as_ref().is_some_and(ClapGui::is_open)
     }
@@ -551,16 +533,19 @@ impl ClapInstance {
             is_floating: true,
         };
 
-        let (use_floating, size) = {
+        // Negotiate the mode with `is_api_supported` only. Sizing must wait:
+        // CLAP forbids calling `size` before `create`, and plugins that check
+        // it (u-he prints a warning and then aborts) treat the violation as
+        // fatal, so no `get_size` may happen here.
+        let use_floating = {
             let handle = self.instance.plugin_handle();
             let gui_ext = handle
                 .get_extension::<PluginGui>()
                 .ok_or_else(|| format!("{} exposes no CLAP GUI extension", self.name))?;
             if gui_ext.is_api_supported(&handle, embedded) {
-                let size = gui_ext.get_size(&handle);
-                (false, size)
+                false
             } else if gui_ext.is_api_supported(&handle, floating) {
-                (true, gui_ext.get_size(&handle))
+                true
             } else {
                 return Err(format!(
                     "{} does not support a {} GUI in this build",
@@ -570,25 +555,22 @@ impl ClapInstance {
             }
         };
 
-        let width = size.map(|size| size.width).unwrap_or(900).clamp(320, 2400) as u16;
-        let height = size.map(|size| size.height).unwrap_or(620).clamp(240, 1600) as u16;
-
-        // Embedded editors are sensitive to the parent being mapped *before*
-        // `set_parent`: several toolkits (JUCE, among others) query the window
-        // attributes on attach and stay black if it is still unmapped.
-        if !use_floating {
-            gui.create_parent(width, height)?;
-            gui.map_parent();
-        }
-
+        // One handle for the whole sequence: `create` → (embed) → `size` → `show`.
         let handle = self.instance.plugin_handle();
         let gui_ext = handle
             .get_extension::<PluginGui>()
             .ok_or_else(|| format!("{} exposes no CLAP GUI extension", self.name))?;
         let configuration = if use_floating { floating } else { embedded };
-        gui_ext
-            .create(&handle, configuration)
-            .map_err(|error| format!("CLAP GUI create failed: {error:?}"))?;
+
+        fn fail(gui: &mut ClapGui, gui_ext: &PluginGui, handle: &PluginMainThreadHandle<'_>) {
+            gui_ext.destroy(handle);
+            gui.created = false;
+            gui.teardown();
+        }
+
+        if let Err(error) = gui_ext.create(&handle, configuration) {
+            return Err(format!("CLAP GUI create failed: {error:?}"));
+        }
         gui.created = true;
 
         if use_floating {
@@ -596,37 +578,32 @@ impl ClapInstance {
             let title = std::ffi::CString::new(gui.title.clone()).unwrap_or_default();
             gui_ext.suggest_title(&handle, &title);
         } else {
-            // Deliberately minimal: CLAP only guarantees `create`, `set_parent`
-            // and `show` for embedded editors. Sizing calls before the parent
-            // exists crash some plugins (Dexed segfaults inside `set_scale`),
-            // so the parent is created at a sane default and resized later from
-            // the size the plugin reports.
             if let Err(error) = gui.create_parent(900, 620) {
-                gui_ext.destroy(&handle);
-                gui.created = false;
-                gui.teardown();
+                fail(&mut gui, &gui_ext, &handle);
                 return Err(error);
             }
+            // Some toolkits query the parent's attributes while attaching, so
+            // it must be a real, mapped window before `set_parent`.
             gui.map_parent();
 
             let parent = gui.parent_handle()?;
             // SAFETY: the X11 window lives in `gui` until after `destroy`.
             if let Err(error) = unsafe { gui_ext.set_parent(&handle, parent) } {
-                gui_ext.destroy(&handle);
-                gui.created = false;
-                gui.teardown();
+                fail(&mut gui, &gui_ext, &handle);
                 return Err(format!("CLAP GUI set_parent failed: {error:?}"));
-            }
-
-            if let Some(size) = gui_ext.get_size(&handle) {
-                gui.resize_parent(size.width as u16, size.height as u16);
             }
         }
 
+        // Only now is `size` legal. Let the plugin tell us how big it drew and
+        // resize the host window to match exactly.
+        if let Some(size) = gui_ext.get_size(&handle) {
+            let width = size.width.clamp(160, 4096) as u16;
+            let height = size.height.clamp(120, 4096) as u16;
+            gui.resize_parent(width, height);
+        }
+
         if let Err(error) = gui_ext.show(&handle) {
-            gui_ext.destroy(&handle);
-            gui.created = false;
-            gui.teardown();
+            fail(&mut gui, &gui_ext, &handle);
             return Err(format!("CLAP GUI show failed: {error:?}"));
         }
 
@@ -839,5 +816,48 @@ impl ClapInstance {
         left[..frames].copy_from_slice(&self.output[0][..frames]);
         right[..frames].copy_from_slice(&self.output[1][..frames]);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// CLAP requires `create` before any sizing call; u-he plugins abort the
+    /// process otherwise ("clap_plugin_gui.size() was called without a prior
+    /// call to clap_plugin_gui.create()"). Guard the call order in the source
+    /// so a future refactor cannot reintroduce it.
+    #[test]
+    fn gui_sizing_never_precedes_create() {
+        // Only the non-test half: this file contains its own search strings.
+        let source = include_str!("clap_host.rs");
+        let source = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
+        let create = source
+            .find("gui_ext.create(&handle, configuration)")
+            .expect("create call not found");
+        for call in ["gui_ext.get_size(&handle)", "gui_ext.set_size("] {
+            let Some(position) = source.find(call) else {
+                continue;
+            };
+            assert!(
+                position > create,
+                "{call} appears before `create`; CLAP forbids sizing first"
+            );
+        }
+        // `get_size` must appear exactly once, after `create`.
+        assert_eq!(
+            source.matches("gui_ext.get_size(&handle)").count(),
+            1,
+            "expected a single, post-create size query"
+        );
+    }
+
+    #[test]
+    fn preferred_api_matches_the_platform() {
+        let api = super::preferred_gui_api();
+        #[cfg(target_os = "linux")]
+        assert_eq!(api.0.to_string_lossy(), "x11");
+        #[cfg(target_os = "windows")]
+        assert_eq!(api.0.to_string_lossy(), "win32");
+        #[cfg(target_os = "macos")]
+        assert_eq!(api.0.to_string_lossy(), "cocoa");
     }
 }

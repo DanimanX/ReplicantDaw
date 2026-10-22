@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.1.0** · MIT · Linux, macOS and Windows.
+**Version 1.1.1** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -22,6 +22,19 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Per-track plugin rack hosting a real CLAP instrument](docs/plugins.png)
 
 ![Plugin editor at full screen](docs/plugin-editor.png)
+
+## Fixes in 1.1.1
+
+- **CLAP plugin windows no longer abort the app.** The editor setup called
+  `clap_plugin_gui.get_size()` while negotiating the window mode, before
+  `create()` — which CLAP forbids. Plugins that validate the sequence (u-he
+  prints `clap_plugin_gui.size() was called without a prior call to
+  clap_plugin_gui.create()` and then calls `terminate`) killed the process.
+  Sizing now happens strictly after `create`, and a regression test fails the
+  build if a sizing call ever moves ahead of it again.
+- Verified opening and closing the native window of **Bazille, Diva, Zebra3,
+  Dexed, JC303, TAL-Sampler (CLAP)** and **Replicant303, Scyllascope (VST3)**
+  without crashes.
 
 ## What's new in 1.1.0
 
@@ -354,7 +367,7 @@ Keystation 49 MK3 MIDI keyboard, and third-party plugins already installed:
 
 ```
 $ cargo test
-test result: ok. 88 passed; 0 failed
+test result: ok. 90 passed; 0 failed
 
 $ cargo clippy --all-targets -- -D warnings
 Finished
@@ -410,10 +423,8 @@ This is a prototype, not a production DAW:
 - The VST3 workaround parks closed instances instead of destroying them, so
   their memory is held until exit.
 - Native plugin windows are experimental. CLAP editors are embedded on
-  Linux/X11; Windows and macOS fall back with a clear message. u-he CLAP
-  plugins (Bazille) abort the process when their window is requested, so save
-  before opening a plugin GUI and use the parameter editor if it fails.
-  Rendering of plugin windows could not be verified headlessly (Xvfb has no
+  Linux/X11; Windows and macOS fall back with a clear message.
+- Rendering of plugin windows could not be verified headlessly (Xvfb has no
   compositor), only that they are created, sized, mapped and closed cleanly.
 - VST2 and Audio Unit hosting are not implemented (see the matrix above).
 - The modular effects are still a master chain; per-track inserts host one

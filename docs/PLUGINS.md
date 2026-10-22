@@ -89,9 +89,9 @@ Known limits:
 
 - Linux/X11 is the tested path. On Windows and macOS the CLAP path reports
   that native windows are only wired for X11; the parameter editor still works.
-- Some plugins are badly behaved when hosted in-process: **u-he CLAP builds
-  (verified with Bazille) abort the process** when their window is requested.
-  Save first, and use the parameter editor for those.
+- The editor sequence follows the CLAP specification strictly: `create`, then
+  embedding, then `get_size`, then `show`. Calling `size` before `create` made
+  u-he plugins abort the process; a regression test now guards the order.
 - No window embedding into the DAW's own canvas: each plugin editor is its own
   OS window.
 

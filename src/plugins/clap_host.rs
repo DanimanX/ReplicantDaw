@@ -389,6 +389,8 @@ struct ClapGui {
     /// Last size the plugin reported or that we pushed to it. Lets the host
     /// tell "the plugin changed size" from "the user resized our window".
     last_size: Option<(u16, u16)>,
+    /// X11 window of the DAW, used as the floating window's transient parent.
+    transient_for: Option<u64>,
 }
 
 impl ClapGui {
@@ -402,12 +404,23 @@ impl ClapGui {
             floating: false,
             title,
             last_size: None,
+            transient_for: None,
         }
     }
 
-    /// Create the native parent window the plugin will draw into.
+    /// Create the native window the plugin draws into.
+    ///
+    /// It is a *floating utility window*: transient for the DAW, kept above it
+    /// and movable on its own, which is what users expect from a plugin editor
+    /// and what a bare toplevel fails to be under Wayland/XWayland.
     #[allow(unused_variables)]
-    fn create_parent(&mut self, width: u16, height: u16) -> Result<(), String> {
+    fn create_parent(
+        &mut self,
+        width: u16,
+        height: u16,
+        transient_for: Option<u64>,
+        resizable: bool,
+    ) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         {
             let (connection, screen_number) = xcb::Connection::connect(None)
@@ -457,6 +470,69 @@ impl ClapGui {
                 r#type: xcb::x::ATOM_STRING,
                 data: b"replicant-daw\0ReplicantDaw\0",
             });
+            // Window-manager hints: a floating utility dialog that belongs to
+            // the DAW window, stays above it and can be moved freely.
+            let atom = |name: &[u8]| -> xcb::x::Atom {
+                let cookie = connection.send_request(&xcb::x::InternAtom {
+                    only_if_exists: false,
+                    name,
+                });
+                connection
+                    .wait_for_reply(cookie)
+                    .map(|reply| reply.atom())
+                    .unwrap_or(xcb::x::ATOM_NONE)
+            };
+            let window_type = atom(b"_NET_WM_WINDOW_TYPE");
+            let utility = atom(b"_NET_WM_WINDOW_TYPE_UTILITY");
+            if window_type != xcb::x::ATOM_NONE && utility != xcb::x::ATOM_NONE {
+                connection.send_request(&xcb::x::ChangeProperty {
+                    mode: xcb::x::PropMode::Replace,
+                    window,
+                    property: window_type,
+                    r#type: xcb::x::ATOM_ATOM,
+                    data: &[utility],
+                });
+            }
+            let state = atom(b"_NET_WM_STATE");
+            let above = atom(b"_NET_WM_STATE_ABOVE");
+            if state != xcb::x::ATOM_NONE && above != xcb::x::ATOM_NONE {
+                connection.send_request(&xcb::x::ChangeProperty {
+                    mode: xcb::x::PropMode::Replace,
+                    window,
+                    property: state,
+                    r#type: xcb::x::ATOM_ATOM,
+                    data: &[above],
+                });
+            }
+            if let Some(parent) = transient_for {
+                connection.send_request(&xcb::x::ChangeProperty {
+                    mode: xcb::x::PropMode::Replace,
+                    window,
+                    property: xcb::x::ATOM_WM_TRANSIENT_FOR,
+                    r#type: xcb::x::ATOM_WINDOW,
+                    data: &[parent as u32],
+                });
+            }
+
+            // Size hints so the window manager honours the editor's size.
+            // Flags: USPosition | USSize | PMinSize | PMaxSize (and PResizeInc
+            // is left off), i.e. a fixed-size dialog when the plugin is fixed.
+            let mut hints = [0u32; 18];
+            hints[0] = if resizable { 0x33 } else { 0x3f };
+            hints[3] = width as u32;
+            hints[4] = height as u32;
+            hints[5] = width as u32;
+            hints[6] = height as u32;
+            hints[7] = if resizable { 4096 } else { width as u32 };
+            hints[8] = if resizable { 4096 } else { height as u32 };
+            connection.send_request(&xcb::x::ChangeProperty {
+                mode: xcb::x::PropMode::Replace,
+                window,
+                property: xcb::x::ATOM_WM_NORMAL_HINTS,
+                r#type: xcb::x::ATOM_WM_SIZE_HINTS,
+                data: &hints,
+            });
+
             // Center it on the screen, and keep it fully visible when the editor
             // is smaller than the display.
             let screen_w = screen.width_in_pixels();
@@ -780,7 +856,7 @@ impl ClapInstance {
     }
 
     /// Create the plugin's editor window and show it.
-    pub fn open_gui(&mut self) -> Result<(), String> {
+    pub fn open_gui(&mut self, transient_for: Option<u64>) -> Result<(), String> {
         if self.is_gui_open() {
             return Ok(());
         }
@@ -788,6 +864,7 @@ impl ClapInstance {
 
         let api = preferred_gui_api();
         let mut gui = ClapGui::new(format!("{} — {}", self.name, self.vendor));
+        gui.transient_for = transient_for;
 
         let embedded = GuiConfiguration {
             api_type: api,
@@ -807,10 +884,14 @@ impl ClapInstance {
             let gui_ext = handle
                 .get_extension::<PluginGui>()
                 .ok_or_else(|| format!("{} exposes no CLAP GUI extension", self.name))?;
-            if gui_ext.is_api_supported(&handle, embedded) {
-                false
-            } else if gui_ext.is_api_supported(&handle, floating) {
+            // Prefer the plugin's own floating window when it supports one: it
+            // is a real OS window the user can move and stack, which is what
+            // "floating" means in every DAW. Embedded editors get a host window
+            // configured as a floating utility instead.
+            if gui_ext.is_api_supported(&handle, floating) {
                 true
+            } else if gui_ext.is_api_supported(&handle, embedded) {
+                false
             } else {
                 return Err(format!(
                     "{} does not support a {} GUI in this build",
@@ -855,7 +936,8 @@ impl ClapInstance {
                 .map(|size| size.height)
                 .unwrap_or(620)
                 .clamp(120, 4096) as u16;
-            if let Err(error) = gui.create_parent(width, height) {
+            let resizable = gui_ext.can_resize(&handle);
+            if let Err(error) = gui.create_parent(width, height, transient_for, resizable) {
                 fail(&mut gui, &gui_ext, &handle);
                 return Err(error);
             }

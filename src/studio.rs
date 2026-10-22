@@ -68,6 +68,8 @@ pub struct Studio {
     pub roll_base_note: i32,
     pub roll_selected: Option<usize>,
     pub roll_drag: Option<RollDrag>,
+    /// Step where the user started dragging a loop region in the ruler.
+    pub roll_loop_anchor: Option<u16>,
 
     /// Audio-clip envelope editor.
     pub audio_editor_open: bool,
@@ -94,6 +96,8 @@ pub struct Studio {
     pub next_request: u64,
     /// Last time plugin parameters were re-read from the plugins.
     last_param_refresh: Instant,
+    /// The DAW's own native window, used as the plugin editor's parent.
+    host_window: Option<u64>,
 }
 
 impl Studio {
@@ -123,6 +127,7 @@ impl Studio {
             roll_base_note: 36,
             roll_selected: None,
             roll_drag: None,
+            roll_loop_anchor: None,
             audio_editor_open: false,
             audio_editor_track: 0,
             plugin_editor_open: false,
@@ -140,6 +145,7 @@ impl Studio {
             virtual_keys: [false; 24],
             next_request: 1,
             last_param_refresh: Instant::now(),
+            host_window: None,
         };
         studio.status = format!(
             "{} MIDI input(s) · {} project(s)",
@@ -327,13 +333,20 @@ impl Studio {
         self.slot_pending[slot] = false;
     }
 
+    /// Remember the DAW's native window so plugin editors float above it.
+    pub fn set_host_window(&mut self, window: Option<u64>) {
+        self.host_window = window;
+    }
+
     /// Ask the worker to open the plugin's own editor window.
     pub fn open_plugin_gui(&mut self, slot: usize) {
         if slot >= MAX_PLUGIN_SLOTS {
             return;
         }
-        self.plugins
-            .send(PluginCommand::OpenGui { slot: slot as u8 });
+        self.plugins.send(PluginCommand::OpenGui {
+            slot: slot as u8,
+            transient_for: self.host_window,
+        });
         self.notify(format!(
             "Opening the plugin editor on track {:02}",
             slot + 1
@@ -536,6 +549,13 @@ impl Studio {
             }
             for entry in &track.clips {
                 let scene = (entry.scene as usize).min(crate::audio::SCENE_COUNT - 1);
+                state.set_clip_loop(
+                    index,
+                    scene,
+                    entry.loop_start.unwrap_or(0),
+                    entry.loop_end.unwrap_or(crate::audio::LOOP_STEPS as u16),
+                );
+                sync_clip_loop(state, audio, index, scene);
                 state.set_recorded(index, scene, entry.notes.clone());
                 state.recorded_active[index][scene] = entry.enabled;
                 let _ = audio.command_tx.push(Command::SetRecordedClip {
@@ -773,6 +793,20 @@ pub fn sync_track_notes(state: &UiState, audio: &mut AudioRuntime, track: usize,
         track: track as u8,
         scene: scene as u8,
         clip,
+    });
+}
+
+/// Push one clip's loop region to the audio engine.
+pub fn sync_clip_loop(state: &UiState, audio: &mut AudioRuntime, track: usize, scene: usize) {
+    if track >= TRACK_COUNT || scene >= crate::audio::SCENE_COUNT {
+        return;
+    }
+    let (start, end) = state.clip_loop(track, scene);
+    let _ = audio.command_tx.push(Command::SetClipLoop {
+        track: track as u8,
+        scene: scene as u8,
+        start,
+        end,
     });
 }
 

@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.1.3** · MIT, Linux, macOS and Windows.
+**Version 1.2.0** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -24,6 +24,21 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Plugin editor at full screen](docs/plugin-editor.png)
 
 ![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
+
+## What's new in 1.2.0
+
+- **Clip loops in the piano roll** — drag on the ruler to set a loop start and
+  end; the region is highlighted, everything outside it is dimmed, and playback
+  repeats only that region while the rest of the session keeps its own timeline.
+  `LOOP ALL` resets it to the whole 16 bars, and the loop is saved with the
+  project (format v6).
+- **Floating plugin windows** — plugin editors are now real floating utility
+  windows: transient for the DAW, kept above it, movable on their own, and
+  carrying the editor's exact size hints so nothing is clipped. Plugins that
+  expose their own floating window are asked for it first.
+- **The plugin picker closes when you choose** — selecting a plugin (or the
+  internal synth) closes the browser immediately instead of leaving it open on
+  top of the new instrument.
 
 ## Fixes in 1.1.3
 
@@ -109,6 +124,9 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 - **Project format v4** — stores per-slot MIDI clips, track names and the
   instrument-slot choice. v3 files migrate their single clip into the slot they
   played from; v1/v2 files still load.
+- **Project format v6** — adds each clip's loop region (`loop_start`,
+  `loop_end`). Older files load with the full 16-bar loop, i.e. unchanged
+  playback.
 
 ## Features
 
@@ -152,6 +170,8 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
     muted without deleting them.
 - **Piano roll and audio clip editing**
   - Double-click a session or arrangement clip to program MIDI for that slot.
+  - Drag on the ruler to set the clip's loop start/end; playback repeats that
+    region only, and notes outside it stay silent.
   - 16-bar grid at 16th-note resolution, four-octave view with octave shift.
   - Add, move, resize, delete, mute and set velocity per note.
   - Each session slot is independent; the editor has a slot selector.
@@ -343,12 +363,12 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
 
 ## Project format
 
-`.rproj` is versioned JSON (format 5):
+`.rproj` is versioned JSON (format 6):
 
 ```json
 {
-  "format_version": 5,
-  "app_version": "1.1.0",
+  "format_version": 6,
+  "app_version": "1.2.0",
   "name": "Neon Demo",
   "bpm": 142.0,
   "effects": [
@@ -367,6 +387,7 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
                  "level": 0.9 },
       "clips": [
         { "scene": 1, "enabled": true,
+          "loop_start": 0, "loop_end": 256,
           "notes": [ { "note": 60, "velocity": 100,
                        "start_step": 0, "length_steps": 2 } ] }
       ] }

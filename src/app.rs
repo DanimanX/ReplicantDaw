@@ -54,6 +54,7 @@ impl ReplicantApp {
             sample_rate: audio.sample_rate as f32,
         });
         let mut studio = Studio::new(midi, plugins);
+        studio.set_host_window(host_window_id(cc));
 
         let mut state = UiState::new();
         state.sample_rate = audio.sample_rate;
@@ -419,6 +420,20 @@ impl eframe::App for ReplicantApp {
 
     fn on_exit(&mut self) {
         log::info!("Replicant DAW shutting down");
+    }
+}
+
+/// The DAW's native window handle, for parenting plugin editors.
+///
+/// Only X11 has a hand-off we can use today: a floating plugin window is
+/// declared transient for this one so it behaves like a child dialog.
+fn host_window_id(cc: &eframe::CreationContext<'_>) -> Option<u64> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = cc.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Xlib(window) => Some(window.window),
+        RawWindowHandle::Xcb(window) => Some(u64::from(window.window.get())),
+        _ => None,
     }
 }
 

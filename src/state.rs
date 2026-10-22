@@ -131,6 +131,8 @@ pub struct UiState {
     pub hovered_scene: Option<usize>,
     /// Mirror of the engine's session clips, one per (track, scene).
     pub recorded: [[Vec<RecordedNote>; SCENE_COUNT]; TRACK_COUNT],
+    /// Loop region of each clip, as `(start, end)` in 16th notes.
+    pub clip_loop: [[(u16, u16); SCENE_COUNT]; TRACK_COUNT],
     pub recording: bool,
     pub record_track: u8,
     pub input_track: u8,
@@ -183,6 +185,7 @@ impl UiState {
             selected_track: 0,
             hovered_scene: None,
             recorded: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
+            clip_loop: [[(0, crate::audio::LOOP_STEPS as u16); SCENE_COUNT]; TRACK_COUNT],
             recording: false,
             record_track: 0,
             input_track: 0,
@@ -248,6 +251,36 @@ impl UiState {
         }
         if self.recorded[track][scene].len() < crate::audio::messages::MAX_RECORDED_NOTES {
             self.recorded[track][scene].push(event.note);
+        }
+    }
+
+    /// Loop region of a clip, never empty and always inside the 16-bar loop.
+    pub fn clip_loop(&self, track: usize, scene: usize) -> (u16, u16) {
+        let total = crate::audio::LOOP_STEPS as u16;
+        let (start, end) = self
+            .clip_loop
+            .get(track)
+            .and_then(|slots| slots.get(scene))
+            .copied()
+            .unwrap_or((0, total));
+        let start = start.min(total - 1);
+        let end = end.clamp(start + 1, total);
+        (start, end)
+    }
+
+    /// Set the loop region of one clip. `start`/`end` are dragged by the user,
+    /// so they are ordered and clamped rather than trusted.
+    pub fn set_clip_loop(&mut self, track: usize, scene: usize, start: u16, end: u16) {
+        let total = crate::audio::LOOP_STEPS as u16;
+        let (lo, hi) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let lo = lo.min(total - 1);
+        let hi = hi.clamp(lo + 1, total);
+        if let Some(slot) = self.clip_loop.get_mut(track).and_then(|s| s.get_mut(scene)) {
+            *slot = (lo, hi);
         }
     }
 
@@ -599,6 +632,26 @@ mod tests {
         assert_eq!(state.track_label(0), TRACKS[0].name);
         state.rename_track(1, &"X".repeat(80));
         assert_eq!(state.track_label(1).chars().count(), 24);
+    }
+
+    #[test]
+    fn clip_loop_is_ordered_and_clamped() {
+        let mut state = UiState::new();
+        let total = crate::audio::LOOP_STEPS as u16;
+        assert_eq!(state.clip_loop(0, 0), (0, total));
+
+        state.set_clip_loop(0, 0, 32, 16);
+        assert_eq!(state.clip_loop(0, 0), (16, 32));
+
+        state.set_clip_loop(0, 0, 250, 400);
+        assert_eq!(state.clip_loop(0, 0), (250, total));
+
+        // A zero-width drag still has to play something.
+        state.set_clip_loop(0, 0, 40, 40);
+        assert_eq!(state.clip_loop(0, 0), (40, 41));
+
+        // Slots are independent.
+        assert_eq!(state.clip_loop(0, 1), (0, total));
     }
 
     #[test]

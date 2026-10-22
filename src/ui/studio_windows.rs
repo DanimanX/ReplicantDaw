@@ -547,6 +547,9 @@ fn draw_browser(
     audio: &mut AudioRuntime,
 ) {
     let mut open = studio.browser_open;
+    // Selecting something must close the picker; `open` is captured before the
+    // click is handled, so a flag is needed to carry the decision to the end.
+    let mut close = false;
     let title = if studio.instrument_browser {
         "INSTRUMENT BROWSER // ADD PLUGIN / INSTRUMENT"
     } else {
@@ -704,8 +707,7 @@ fn draw_browser(
                     if let Some(descriptor) = to_load {
                         let slot = studio.browser_target;
                         studio.load_plugin(slot, &descriptor, audio);
-                        studio.browser_open = false;
-                        studio.instrument_browser = false;
+                        close = true;
                     }
                 });
             ui.add_space(4.0);
@@ -719,14 +721,16 @@ fn draw_browser(
             if choose_synth {
                 let track = studio.browser_target;
                 studio.select_synth(state, track);
-                studio.browser_open = false;
-                studio.instrument_browser = false;
+                close = true;
                 studio.notify(format!(
                     "Track {:02} now plays the internal FM synth",
                     track + 1
                 ));
             }
         });
+    if close {
+        open = false;
+    }
     studio.browser_open = open;
     if !open {
         studio.instrument_browser = false;

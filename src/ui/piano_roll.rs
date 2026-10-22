@@ -6,7 +6,7 @@ use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
 use crate::audio::{AudioRuntime, Command, LOOP_STEPS, SCENE_COUNT, TRACK_COUNT};
 use crate::state::UiState;
-use crate::studio::{sync_track_notes, RollDrag, RollDragMode, Studio};
+use crate::studio::{sync_clip_loop, sync_track_notes, RollDrag, RollDragMode, Studio};
 use crate::theme;
 
 const KEY_W: f32 = 42.0;
@@ -215,6 +215,18 @@ fn draw_header(
                 studio.roll_base_note = (studio.roll_base_note - 12).max(0);
             }
             if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("LOOP ALL").font(theme::display(8.0)))
+                        .fill(theme::accent_alpha(theme::AMBER, 22))
+                        .stroke(Stroke::new(1.0, theme::accent_alpha(theme::AMBER, 120))),
+                )
+                .on_hover_text("Reset the clip loop to the whole 16 bars")
+                .clicked()
+            {
+                state.set_clip_loop(track, scene, 0, crate::audio::LOOP_STEPS as u16);
+                sync_clip_loop(state, audio, track, scene);
+            }
+            if ui
                 .add(egui::Button::new(
                     egui::RichText::new("RESET VIEW").font(theme::display(8.0)),
                 ))
@@ -329,6 +341,96 @@ fn draw_grid(
                         theme::TEXT_FAINT,
                     );
                 }
+            }
+
+            // ---- Loop region -------------------------------------------
+            let (loop_start, loop_end) = state.clip_loop(track, scene);
+            let loop_x0 = grid.left() + loop_start as f32 * STEP_W;
+            let loop_x1 = grid.left() + loop_end as f32 * STEP_W;
+            let dim = Color32::from_rgba_unmultiplied(0, 0, 0, 110);
+            if loop_start > 0 {
+                painter.rect_filled(
+                    Rect::from_min_max(grid.min, Pos2::new(loop_x0, grid.bottom())),
+                    CornerRadius::ZERO,
+                    dim,
+                );
+            }
+            if loop_end < LOOP_STEPS as u16 {
+                painter.rect_filled(
+                    Rect::from_min_max(
+                        Pos2::new(loop_x1, grid.top()),
+                        Pos2::new(grid.right(), grid.bottom()),
+                    ),
+                    CornerRadius::ZERO,
+                    dim,
+                );
+            }
+
+            // The ruler band doubles as the loop selector.
+            let ruler = Rect::from_min_max(
+                Pos2::new(grid.left(), canvas.top()),
+                Pos2::new(grid.right(), grid.top()),
+            );
+            let ruler_response = ui.interact(
+                ruler,
+                ui.scope_id().with(("piano_roll_loop", track, scene)),
+                Sense::click_and_drag(),
+            );
+            if ruler_response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+            }
+            let step_at = |x: f32| -> u16 {
+                (((x - grid.left()) / STEP_W).floor().max(0.0) as i32).min(LOOP_STEPS as i32 - 1)
+                    as u16
+            };
+            if ruler_response.drag_started() {
+                if let Some(pos) = ruler_response.interact_pointer_pos() {
+                    let anchor = step_at(pos.x);
+                    studio.roll_loop_anchor = Some(anchor);
+                    state.set_clip_loop(track, scene, anchor, anchor + 1);
+                }
+            }
+            if ruler_response.dragged() {
+                if let (Some(anchor), Some(pos)) = (
+                    studio.roll_loop_anchor,
+                    ruler_response.interact_pointer_pos(),
+                ) {
+                    let current = step_at(pos.x);
+                    if current != anchor {
+                        state.set_clip_loop(track, scene, anchor, current);
+                        sync_clip_loop(state, audio, track, scene);
+                    }
+                }
+            }
+            if ruler_response.drag_stopped() {
+                studio.roll_loop_anchor = None;
+            }
+            if ruler_response.hovered() {
+                ruler_response.on_hover_text("Drag to set the clip's loop start and end");
+            }
+
+            // Loop band above the grid and its two handles.
+            painter.rect_filled(
+                Rect::from_min_max(
+                    Pos2::new(loop_x0, canvas.top() + 2.0),
+                    Pos2::new(loop_x1, grid.top() - 1.0),
+                ),
+                CornerRadius::same(1),
+                theme::accent_alpha(theme::AMBER, 60),
+            );
+            for x in [loop_x0, loop_x1] {
+                painter.line_segment(
+                    [Pos2::new(x, grid.top()), Pos2::new(x, grid.bottom())],
+                    Stroke::new(1.2, theme::accent_alpha(theme::AMBER, 170)),
+                );
+                painter.rect_filled(
+                    Rect::from_min_size(
+                        Pos2::new(x - 2.0, canvas.top() + 2.0),
+                        Vec2::new(4.0, RULER_H - 3.0),
+                    ),
+                    CornerRadius::same(1),
+                    theme::AMBER,
+                );
             }
 
             // Playhead.
@@ -539,6 +641,16 @@ fn draw_footer(
                 .font(theme::mono(8.0))
                 .color(theme::TEXT_FAINT),
         );
+        let (loop_start, loop_end) = state.clip_loop(track, scene);
+        ui.label(
+            egui::RichText::new(format!(
+                "LOOP {} – {}",
+                bar_beat_text(loop_start),
+                bar_beat_text(loop_end)
+            ))
+            .font(theme::mono(8.0))
+            .color(theme::AMBER),
+        );
         if let Some(selected) = studio.roll_selected {
             if let Some(note) = state.recorded_notes(track, scene).get(selected).copied() {
                 let mut velocity = note.velocity as i32;
@@ -574,7 +686,7 @@ fn draw_footer(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.label(
                 egui::RichText::new(format!(
-                    "CLICK GRID TO PROGRAM MIDI ON TRACK {:02}",
+                    "DRAG THE RULER TO SET THE CLIP LOOP · TRACK {:02}",
                     track + 1
                 ))
                 .font(theme::mono(7.5))
@@ -586,6 +698,11 @@ fn draw_footer(
 
 fn sync_notes(state: &UiState, audio: &mut AudioRuntime, track: usize, scene: usize) {
     sync_track_notes(state, audio, track, scene);
+}
+
+/// "bar.beat" label for a 16th-note step.
+fn bar_beat_text(step: u16) -> String {
+    format!("{}.{}", step / 16 + 1, step % 16 / 4 + 1)
 }
 
 fn is_black(note: u8) -> bool {

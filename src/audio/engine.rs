@@ -48,6 +48,8 @@ struct TrackState {
     solo: bool,
     active: bool,
     scene: usize,
+    /// Playhead inside the launched clip's loop region.
+    clip_step: u16,
     peak: f32,
 }
 
@@ -64,6 +66,7 @@ impl TrackState {
             solo: false,
             active: true,
             scene: super::tracks::DEFAULT_SCENES[index],
+            clip_step: 0,
             peak: 0.0,
         }
     }
@@ -106,6 +109,8 @@ pub struct Engine {
     cpu_load: f32,
     midi_rx: Option<Consumer<MidiMessage>>,
     record_tx: Option<Producer<RecordEvent>>,
+    /// Loop region of each clip, as `(start, end)` in 16th notes.
+    clip_loop: [[(u16, u16); SCENE_COUNT]; TRACK_COUNT],
     /// One MIDI clip per (track, session slot), flattened on the heap.
     ///
     /// An inline `[[RecordedClip; 8]; 8]` is ~190 KiB, which made `Engine`
@@ -189,6 +194,7 @@ impl Engine {
             cpu_load: 0.0,
             midi_rx: io.midi,
             record_tx: io.record_events,
+            clip_loop: [[(0, LOOP_STEPS as u16); SCENE_COUNT]; TRACK_COUNT],
             recorded: empty_clip_grid(),
             recorded_active: [[true; SCENE_COUNT]; TRACK_COUNT],
             recording: false,
@@ -568,6 +574,10 @@ impl Engine {
                 self.playing = false;
                 self.position = 0;
                 self.last_step = u64::MAX;
+                for track in 0..TRACK_COUNT {
+                    let scene = self.tracks[track].scene.min(SCENE_COUNT - 1);
+                    self.tracks[track].clip_step = self.clip_loop[track][scene].0;
+                }
                 for voice in &mut self.voices {
                     voice.release();
                 }
@@ -609,9 +619,12 @@ impl Engine {
             }
             Command::LaunchClip { track, scene } => {
                 if let Some(t) = self.tracks.get_mut(track as usize) {
-                    if (scene as usize) < super::messages::SCENE_COUNT {
+                    if (scene as usize) < SCENE_COUNT {
                         t.scene = scene as usize;
                         t.active = true;
+                        // A launched clip restarts at the beginning of its
+                        // loop region, like a clip launch in any DAW.
+                        t.clip_step = self.clip_loop[track as usize][scene as usize].0;
                     }
                 }
             }
@@ -655,6 +668,27 @@ impl Engine {
                 let track = (track as usize).min(TRACK_COUNT - 1);
                 let scene = (scene as usize).min(SCENE_COUNT - 1);
                 *self.clip_mut(track, scene) = clip;
+            }
+            Command::SetClipLoop {
+                track,
+                scene,
+                start,
+                end,
+            } => {
+                let track = (track as usize).min(TRACK_COUNT - 1);
+                let scene = (scene as usize).min(SCENE_COUNT - 1);
+                // Order and clamp: the UI drags both handles, so either one
+                // can arrive first.
+                let total = LOOP_STEPS as u16;
+                let (lo, hi) = if start <= end {
+                    (start, end)
+                } else {
+                    (end, start)
+                };
+                let start = lo.min(total - 1);
+                let end = hi.clamp(start + 1, total);
+                self.clip_loop[track][scene] = (start, end);
+                self.tracks[track].clip_step = self.tracks[track].clip_step.clamp(start, end - 1);
             }
             Command::SetPluginMidi { enabled } => {
                 self.plugin_midi = enabled;
@@ -829,25 +863,36 @@ impl Engine {
                 continue;
             }
 
-            // Recorded MIDI replaces the generative pattern for this slot.
+            // Recorded MIDI replaces the generative pattern for this slot, and
+            // plays inside its loop region on its own playhead.
             let scene = self.tracks[track].scene.min(SCENE_COUNT - 1);
             let clip = *self.clip(track, scene);
             if !clip.is_empty() {
-                if !self.recorded_active[track][scene] {
-                    continue;
-                }
-                for note in clip.as_slice() {
-                    if note.start_step != loop_step {
-                        continue;
+                let (start, end) = self.clip_loop[track][scene];
+                let region = (end - start).max(1);
+                let phase = self.tracks[track].clip_step.clamp(start, end - 1);
+                let muted = !self.recorded_active[track][scene];
+
+                if !muted {
+                    for note in clip.as_slice() {
+                        if note.start_step != phase {
+                            continue;
+                        }
+                        let gate = (step_samples * note.length_steps.max(1) as f64)
+                            .round()
+                            .max(1.0) as u32;
+                        let velocity = (note.velocity as f32 / 127.0).clamp(0.05, 1.0);
+                        self.trigger_note(track, note.note, velocity, gate, spec);
+                        self.forward_note_on(track, note.note, note.velocity);
+                        // When the note ends, expressed on the global step grid.
+                        let delta = (note.end_step().saturating_sub(phase)) % region;
+                        self.schedule_plugin_off(track, note.note, loop_step + delta);
                     }
-                    let gate = (step_samples * note.length_steps.max(1) as f64)
-                        .round()
-                        .max(1.0) as u32;
-                    let velocity = (note.velocity as f32 / 127.0).clamp(0.05, 1.0);
-                    self.trigger_note(track, note.note, velocity, gate, spec);
-                    self.forward_note_on(track, note.note, note.velocity);
-                    self.schedule_plugin_off(track, note.note, note.end_step());
                 }
+
+                // Advance the clip playhead, wrapping inside the region.
+                let next = phase + 1;
+                self.tracks[track].clip_step = if next >= end { start } else { next };
                 continue;
             }
 
@@ -1022,6 +1067,11 @@ impl Engine {
         let offset = self.plugin_pending.frames.saturating_sub(1);
         let bus = self.record_track;
         self.plugin_pending.push_event(bus, offset, bytes, len);
+    }
+
+    /// Loop region of one clip (tests and diagnostics).
+    pub fn clip_loop(&self, track: usize, scene: usize) -> (u16, u16) {
+        self.clip_loop[track.min(TRACK_COUNT - 1)][scene.min(SCENE_COUNT - 1)]
     }
 
     /// Currently recorded clip for one session slot (tests and diagnostics).
@@ -1558,6 +1608,100 @@ mod tests {
         let out = render(&mut engine, 48_000);
         let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
         assert!(peak < 1e-3, "disabled MIDI clip still sounded ({peak})");
+    }
+
+    #[test]
+    fn clip_loop_repeats_only_its_region() {
+        let mut engine = Engine::offline(48_000.0);
+        // Two notes per bar: one inside the region, one outside.
+        let mut clip = RecordedClip::default();
+        clip.push(RecordedNote {
+            note: 60,
+            velocity: 100,
+            start_step: 16,
+            length_steps: 2,
+        });
+        clip.push(RecordedNote {
+            note: 72,
+            velocity: 100,
+            start_step: 64,
+            length_steps: 2,
+        });
+        engine.apply(Command::SetRecordedClip {
+            track: 0,
+            scene: 0,
+            clip,
+        });
+        engine.apply(Command::SetClipLoop {
+            track: 0,
+            scene: 0,
+            start: 16,
+            end: 32,
+        });
+        engine.apply(Command::LaunchClip { track: 0, scene: 0 });
+        engine.apply(Command::SetBpm(120.0));
+        engine.apply(Command::Play);
+
+        // Bar 1 of the region plays its note; the note outside never fires.
+        let mut buffer = vec![0.0; 512 * 2];
+        let mut triggered_notes = Vec::new();
+        for _ in 0..(4 * 48_000 / 512) {
+            engine.process(&mut buffer);
+            for voice in &engine.voices {
+                // Only the clip's track matters here; the other seven play
+                // their generative patterns.
+                if voice.is_active() && voice.track == 0 && !triggered_notes.contains(&voice.note())
+                {
+                    triggered_notes.push(voice.note());
+                }
+            }
+        }
+        assert!(
+            triggered_notes.contains(&60),
+            "note inside the loop region did not play: {triggered_notes:?}"
+        );
+        assert!(
+            !triggered_notes.contains(&72),
+            "note outside the loop region played: {triggered_notes:?}"
+        );
+        // The playhead stays inside the region across many loops.
+        assert!((16..32).contains(&engine.tracks[0].clip_step));
+    }
+
+    #[test]
+    fn launching_a_clip_restarts_its_loop() {
+        let mut engine = Engine::offline(48_000.0);
+        engine.apply(Command::SetClipLoop {
+            track: 0,
+            scene: 2,
+            start: 40,
+            end: 48,
+        });
+        engine.apply(Command::LaunchClip { track: 0, scene: 2 });
+        assert_eq!(engine.tracks[0].clip_step, 40);
+
+        let mut clip = RecordedClip::default();
+        clip.push(RecordedNote {
+            note: 55,
+            velocity: 100,
+            start_step: 40,
+            length_steps: 1,
+        });
+        engine.apply(Command::SetRecordedClip {
+            track: 0,
+            scene: 2,
+            clip,
+        });
+        engine.apply(Command::Stop);
+        assert_eq!(engine.tracks[0].clip_step, 40);
+        // Out-of-range regions are ordered and clamped.
+        engine.apply(Command::SetClipLoop {
+            track: 0,
+            scene: 2,
+            start: 90,
+            end: 10,
+        });
+        assert_eq!(engine.clip_loop(0, 2), (10, 90));
     }
 
     #[test]

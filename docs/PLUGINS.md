@@ -89,6 +89,11 @@ The DAW hosts the plugin's real editor, not a reimplementation:
 - **Servicing** — both paths are serviced every ~4 ms by the plugin worker,
   independently of the audio stream, so the editor stays interactive while
   playing.
+- **Floating windows** — a plugin's own floating editor is preferred when it
+  offers one. Otherwise the host window is created as a `_NET_WM_WINDOW_TYPE_UTILITY`
+  with `_NET_WM_STATE_ABOVE`, `WM_TRANSIENT_FOR` pointing at the DAW window and
+  `WM_NORMAL_HINTS` matching the editor, so it floats above the DAW, can be
+  moved on its own and never clips the plugin's canvas.
 - **Sizing** — the host window is created at the plugin's reported size, then
   kept in sync: plugin-driven resizes are applied to the window, user resizes
   are pushed to the plugin when it can resize, and reversed when it cannot.

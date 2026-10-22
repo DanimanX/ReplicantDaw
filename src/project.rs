@@ -24,7 +24,7 @@ use crate::audio::messages::{EffectKind, RecordedNote, SynthParam, TRACK_COUNT};
 use crate::audio::{SynthParams, TRACKS};
 
 pub const PROJECT_EXTENSION: &str = "rproj";
-pub const PROJECT_FORMAT_VERSION: u32 = 5;
+pub const PROJECT_FORMAT_VERSION: u32 = 6;
 
 /// Editable FM synth settings stored per track.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -103,6 +103,11 @@ pub struct ProjectClip {
     pub notes: Vec<RecordedNote>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Loop region in 16th notes. Absent in v5 files, which looped everything.
+    #[serde(default)]
+    pub loop_start: Option<u16>,
+    #[serde(default)]
+    pub loop_end: Option<u16>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -326,6 +331,8 @@ impl Project {
                         scene: track.scene.unwrap_or(0),
                         notes: std::mem::take(&mut track.notes),
                         enabled: track.clip_enabled,
+                        loop_start: None,
+                        loop_end: None,
                     });
                 }
             }
@@ -404,10 +411,15 @@ impl Project {
                 scene: state.launched[index],
                 clips: (0..crate::audio::SCENE_COUNT)
                     .filter(|scene| !state.recorded_notes(index, *scene).is_empty())
-                    .map(|scene| ProjectClip {
-                        scene: scene as u8,
-                        notes: state.recorded_notes(index, scene).to_vec(),
-                        enabled: state.recorded_active[index][scene],
+                    .map(|scene| {
+                        let (start, end) = state.clip_loop(index, scene);
+                        ProjectClip {
+                            scene: scene as u8,
+                            notes: state.recorded_notes(index, scene).to_vec(),
+                            enabled: state.recorded_active[index][scene],
+                            loop_start: Some(start),
+                            loop_end: Some(end),
+                        }
                     })
                     .collect(),
                 notes: Vec::new(),
@@ -514,6 +526,8 @@ mod tests {
                 length_steps: 2,
             }],
             enabled: false,
+            loop_start: Some(16),
+            loop_end: Some(64),
         });
         project.tracks[1].synth = Some(ProjectSynth {
             ratio: 2.5,
@@ -550,6 +564,8 @@ mod tests {
         assert!(!loaded.tracks[1].clips[0].enabled);
         assert_eq!(loaded.tracks[1].clips[0].notes.len(), 1);
         assert_eq!(loaded.tracks[1].clips[0].notes[0].start_step, 16);
+        assert_eq!(loaded.tracks[1].clips[0].loop_start, Some(16));
+        assert_eq!(loaded.tracks[1].clips[0].loop_end, Some(64));
         assert_eq!(loaded.effects.len(), 5);
         assert_eq!(loaded.effects[4].kind, "DELAY");
         assert!((loaded.master_gain - 0.75).abs() < 1e-6);

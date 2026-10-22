@@ -451,6 +451,14 @@ pub enum Command {
         scene: u8,
         clip: RecordedClip,
     },
+    /// Loop region of one session clip, in 16th notes from the loop start.
+    /// `start < end`; notes outside the region do not play.
+    SetClipLoop {
+        track: u8,
+        scene: u8,
+        start: u16,
+        end: u16,
+    },
     /// Route incoming MIDI to the plugin chain as well as the internal synth.
     SetPluginMidi {
         enabled: bool,

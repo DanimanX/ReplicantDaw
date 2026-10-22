@@ -67,8 +67,12 @@ pub enum PluginCommand {
         sample_rate: f32,
     },
     /// Open the plugin's own editor window (its native GUI).
+    ///
+    /// `transient_for` is the DAW's own window handle, so the editor can be a
+    /// floating window that belongs to it.
     OpenGui {
         slot: u8,
+        transient_for: Option<u64>,
     },
     /// Re-read the parameters of every loaded plugin.
     ///
@@ -353,13 +357,16 @@ impl Worker {
             PluginCommand::SetSampleRate { sample_rate } => {
                 self.sample_rate = sample_rate;
             }
-            PluginCommand::OpenGui { slot } => {
+            PluginCommand::OpenGui {
+                slot,
+                transient_for,
+            } => {
                 let index = slot as usize;
                 let mut message = None;
                 let opened = match self.slots.get_mut(index).and_then(Option::as_mut) {
                     Some(slot) => {
                         let result = match &mut slot.instance {
-                            Instance::Clap(plugin) => plugin.open_gui(),
+                            Instance::Clap(plugin) => plugin.open_gui(transient_for),
                             Instance::Vst3(plugin) => plugin.open_gui(),
                         };
                         match result {

@@ -155,9 +155,6 @@ pub fn draw_matrix(
     }
 
     let beats = state.playhead_beats();
-    let step_in_bar = (beats.fract() * 4.0 * 4.0) as usize % 16;
-    let step_fraction = (beats * 4.0).fract();
-
     // ---- MIDI clip row -------------------------------------------------
     draw_midi_row(
         ui, content, launch_w, col_w, midi_h, midi_top, state, studio, audio, beats,
@@ -340,10 +337,17 @@ pub fn draw_matrix(
                 );
             }
 
-            // Live step indicator for the playing clip.
+            // Live position inside the clip's own loop. Using the global bar
+            // here made a short loop look like it ran across the whole grid.
             if active {
+                let (loop_start, loop_end) = state.clip_loop(track, scene);
+                let span = loop_end.saturating_sub(loop_start).max(1) as f32;
+                let phase = state
+                    .clip_phase(track, scene)
+                    .unwrap_or(loop_start)
+                    .clamp(loop_start, loop_end.saturating_sub(1));
                 let bar_w = cell.width() - 8.0;
-                let progress = (step_in_bar as f32 + step_fraction) / 16.0;
+                let progress = (phase.saturating_sub(loop_start)) as f32 / span;
                 let y = cell.bottom() - 4.0;
                 ui.painter().line_segment(
                     [
@@ -366,21 +370,49 @@ pub fn draw_matrix(
                     theme::accent_alpha(accent, (pulse * 255.0) as u8),
                 );
             }
+            // A looping sample says so, and shows where its region restarts.
+            if let Some(slot) = state.sample_slot(track, scene) {
+                if slot.loop_enabled && cell.width() > 46.0 {
+                    ui.painter().text(
+                        Pos2::new(cell.right() - 5.0, cell.bottom() - 10.0),
+                        Align2::RIGHT_BOTTOM,
+                        "LOOP",
+                        theme::mono(5.4),
+                        theme::accent_alpha(theme::CYAN, 170),
+                    );
+                }
+            }
 
+            let mut dropped = false;
             if let Some(payload) = response.dnd_release_payload::<Arc<SampleClip>>() {
                 let clip = (*payload).clone();
                 studio.assign_sample(state, audio, track, scene, clip);
+                dropped = true;
             }
 
-            let mut edit_sample = false;
+            let mut edit_clip = false;
+            let mut edit_source = false;
             let mut clear_sample = false;
-            if sample.is_some() {
+            let mut toggle_loop = false;
+            if let Some(slot) = state.sample_slot(track, scene) {
+                let looping = slot.loop_enabled;
                 response.context_menu(|ui| {
                     if ui
-                        .button(format!("EDIT SAMPLE · SLOT {:02}", scene + 1))
+                        .button(format!("EDIT CLIP · SLOT {:02}", scene + 1))
                         .clicked()
                     {
-                        edit_sample = true;
+                        edit_clip = true;
+                        ui.close();
+                    }
+                    if ui
+                        .button(if looping { "LOOP: ON" } else { "LOOP: OFF" })
+                        .clicked()
+                    {
+                        toggle_loop = true;
+                        ui.close();
+                    }
+                    if ui.button("EDIT SOURCE SAMPLE").clicked() {
+                        edit_source = true;
                         ui.close();
                     }
                     if ui.button("CLEAR SAMPLE").clicked() {
@@ -389,20 +421,32 @@ pub fn draw_matrix(
                     }
                 });
             }
+            if let Some(slot) = state.sample_slot(track, scene) {
+                if toggle_loop {
+                    let enabled = !slot.loop_enabled;
+                    studio.set_sample_loop(state, audio, track, scene, enabled);
+                }
+            }
             if clear_sample {
                 studio.clear_sample(state, audio, track, scene);
             }
-
-            if response.double_clicked() {
-                state.selected_track = track;
+            if edit_source {
                 if let Some(sample) = &sample {
                     studio.open_sample_editor_clip(sample);
+                }
+            }
+            if edit_clip {
+                studio.open_sample_clip(track, scene);
+            }
+
+            if response.double_clicked() && !dropped {
+                state.selected_track = track;
+                if sample.is_some() {
+                    // A sample slot is an audio clip: open its loop editor,
+                    // not the sampler that produced it.
+                    studio.open_sample_clip(track, scene);
                 } else {
                     studio.open_piano_roll(track, scene as u8);
-                }
-            } else if edit_sample {
-                if let Some(sample) = &sample {
-                    studio.open_sample_editor_clip(sample);
                 }
             } else if response.secondary_clicked() && has_clip && sample.is_none() {
                 state.recorded_active[track][scene] = !clip_enabled;
@@ -411,7 +455,7 @@ pub fn draw_matrix(
                     scene: scene as u8,
                     active: state.recorded_active[track][scene],
                 });
-            } else if response.clicked() {
+            } else if response.clicked() && !dropped {
                 if launched {
                     let _ = audio
                         .command_tx
@@ -428,7 +472,7 @@ pub fn draw_matrix(
             if response.hovered() {
                 if let Some(sample) = &sample {
                     response.on_hover_text(format!(
-                        "{} · {} · slot {}\nsample {} · {:.2} s\nclick = launch/stop · double-click = edit sample · right-click = sample menu",
+                        "{} · {} · slot {}\nsample {} · {:.2} s\nclick = launch/stop · double-click = clip loop · right-click = sample menu",
                         state.track_label(track),
                         UiState::scene_name(scene),
                         scene + 1,
@@ -650,8 +694,8 @@ fn draw_midi_row(
         let toggle_mute = !open_roll && response.clicked() && has_content;
         let select = response.clicked() || open_roll;
         if open_roll {
-            if let Some(sample) = &sample {
-                studio.open_sample_editor_clip(sample);
+            if sample.is_some() {
+                studio.open_sample_clip(track, scene);
             } else {
                 studio.open_piano_roll(track, scene as u8);
             }

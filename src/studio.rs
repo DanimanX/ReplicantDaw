@@ -18,7 +18,7 @@ use crate::plugins::{
     PluginSlotInfo, MAX_PLUGIN_SLOTS,
 };
 use crate::project::{Project, ProjectPlugin};
-use crate::samples::{list_directory, DecodedSample, SampleClip, SampleEntry};
+use crate::samples::{list_directory, DecodedSample, SampleClip, SampleEntry, SampleSlot};
 use crate::state::UiState;
 
 pub const MAX_STATUS_CHARS: usize = 160;
@@ -105,6 +105,9 @@ pub struct Studio {
     pub sample_filter: String,
     pub sample_editor_open: bool,
     pub sample_editor: Option<DecodedSample>,
+    /// Clip-level sample editor: loop region, slot trim and launch.
+    pub sample_clip_open: bool,
+    pub sample_clip_target: (usize, usize),
     /// Which trim handle the user is dragging in the sample editor.
     pub sample_trim_drag: Option<TrimEdge>,
     /// When the current one-shot preview began, for drawing its cursor.
@@ -171,6 +174,8 @@ impl Studio {
             sample_filter: String::new(),
             sample_editor_open: false,
             sample_editor: None,
+            sample_clip_open: false,
+            sample_clip_target: (0, 0),
             sample_trim_drag: None,
             preview_started: None,
             plugin_editor_open: false,
@@ -288,12 +293,27 @@ impl Studio {
                 clip: RecordedClip::default(),
             });
         }
-        state.set_sample_clip(track, scene, Some(Arc::clone(&clip)));
+        state.set_sample_slot(
+            track,
+            scene,
+            Some(Arc::new(SampleSlot::new(Arc::clone(&clip)))),
+        );
         let _ = audio.sample_tx.push(crate::audio::SampleUpload {
             track: track as u8,
             scene: scene as u8,
             sample: Some(Arc::clone(&clip.buffer)),
         });
+        // The slot plays its own sample right away, on its own loop.
+        let _ = audio.command_tx.push(Command::SetSampleLoop {
+            track: track as u8,
+            scene: scene as u8,
+            enabled: true,
+        });
+        let _ = audio.command_tx.push(Command::LaunchClip {
+            track: track as u8,
+            scene: scene as u8,
+        });
+        state.launched[track] = Some(scene as u8);
         self.notify(format!(
             "{} → track {:02} · slot {:02} ({:.2} s)",
             name,
@@ -314,7 +334,7 @@ impl Studio {
         if state.sample_clip(track, scene).is_none() {
             return;
         }
-        state.set_sample_clip(track, scene, None);
+        state.set_sample_slot(track, scene, None);
         let _ = audio.sample_tx.push(crate::audio::SampleUpload {
             track: track as u8,
             scene: scene as u8,
@@ -325,6 +345,60 @@ impl Studio {
             track + 1,
             scene + 1
         ));
+    }
+
+    /// Open the clip editor for a sample slot: its loop, trim and launch.
+    pub fn open_sample_clip(&mut self, track: usize, scene: usize) {
+        self.sample_clip_target = (track, scene);
+        self.sample_clip_open = true;
+        // Both windows describe the same audio; stacking them hid the clip's
+        // own controls. `EDIT SOURCE` reopens the sampler on demand.
+        self.sample_editor_open = false;
+        self.preview_started = None;
+    }
+
+    /// Toggle looping for one sample slot and tell the engine.
+    pub fn set_sample_loop(
+        &mut self,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+        track: usize,
+        scene: usize,
+        enabled: bool,
+    ) {
+        if !state.set_sample_loop(track, scene, enabled) {
+            return;
+        }
+        let _ = audio.command_tx.push(Command::SetSampleLoop {
+            track: track as u8,
+            scene: scene as u8,
+            enabled,
+        });
+        self.notify(format!(
+            "Slot {:02} · track {:02} loop {}",
+            scene + 1,
+            track + 1,
+            if enabled { "on" } else { "off" }
+        ));
+    }
+
+    /// Change the per-slot trim of a sample.
+    pub fn set_sample_gain(
+        &mut self,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+        track: usize,
+        scene: usize,
+        gain_db: f32,
+    ) {
+        if !state.set_sample_gain(track, scene, gain_db) {
+            return;
+        }
+        let _ = audio.command_tx.push(Command::SetSampleGain {
+            track: track as u8,
+            scene: scene as u8,
+            gain_db,
+        });
     }
 
     /// Audition the edited sample through the master bus.
@@ -431,7 +505,7 @@ impl Studio {
         }
     }
 
-    /// Choose the internal FM synth as the instrument source for `track`.
+    /// Choose the internal synth as the instrument source for `track`.
     pub fn select_synth(&mut self, state: &mut UiState, track: usize) {
         if track < TRACK_COUNT {
             state.instrument[track] = crate::state::InstrumentSource::Synth;
@@ -774,11 +848,26 @@ impl Studio {
                                 clip: RecordedClip::default(),
                             });
                         }
-                        state.set_sample_clip(index, scene, Some(Arc::clone(&clip)));
+                        let mut slot = SampleSlot::new(Arc::clone(&clip));
+                        slot.loop_enabled = entry.loop_enabled;
+                        slot.gain_db = entry.slot_gain_db;
+                        let loop_enabled = slot.loop_enabled;
+                        let gain_db = slot.gain_db;
+                        state.set_sample_slot(index, scene, Some(Arc::new(slot)));
                         let _ = audio.sample_tx.push(crate::audio::SampleUpload {
                             track: index as u8,
                             scene: scene as u8,
                             sample: Some(Arc::clone(&clip.buffer)),
+                        });
+                        let _ = audio.command_tx.push(Command::SetSampleLoop {
+                            track: index as u8,
+                            scene: scene as u8,
+                            enabled: loop_enabled,
+                        });
+                        let _ = audio.command_tx.push(Command::SetSampleGain {
+                            track: index as u8,
+                            scene: scene as u8,
+                            gain_db,
                         });
                     }
                     Err(error) => self.log_error(format!(
@@ -788,16 +877,18 @@ impl Studio {
                 }
             }
 
-            if let Some(synth) = &track.synth {
-                let params = synth.to_params();
-                state.synth[index] = params;
-                for param in crate::audio::SynthParam::ALL {
-                    let _ = audio.command_tx.push(Command::SetSynthParam {
-                        track: index as u8,
-                        param,
-                        value: params.get(param),
-                    });
-                }
+            let patch = track
+                .synth
+                .as_ref()
+                .map(|synth| synth.to_patch())
+                .unwrap_or_else(|| crate::audio::SynthXt::from_track(index));
+            state.synth[index] = patch;
+            for param in crate::audio::SynthParam::all() {
+                let _ = audio.command_tx.push(Command::SetSynthParam {
+                    track: index as u8,
+                    param,
+                    value: patch.get(param),
+                });
             }
 
             state.instrument[index] = crate::state::InstrumentSource::from_id(&track.instrument);

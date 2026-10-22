@@ -124,6 +124,24 @@ impl ReplicantApp {
                         studio.piano_roll_scene = state.launched[state.selected_track].unwrap_or(0);
                     }
                     "audio" => studio.audio_editor_open = true,
+                    "sampleclip" => {
+                        let mut found = None;
+                        for track in 0..TRACK_COUNT {
+                            for scene in 0..crate::audio::SCENE_COUNT {
+                                if state.sample_slot(track, scene).is_some() {
+                                    found = Some((track, scene));
+                                    break;
+                                }
+                            }
+                            if found.is_some() {
+                                break;
+                            }
+                        }
+                        if let Some((track, scene)) = found {
+                            state.selected_track = track;
+                            studio.open_sample_clip(track, scene);
+                        }
+                    }
                     "samples" => {
                         studio.sample_browser_open = true;
                         studio.reload_sample_dir();

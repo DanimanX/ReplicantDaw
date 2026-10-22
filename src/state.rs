@@ -9,11 +9,11 @@ use rtrb::Consumer;
 
 use crate::audio::messages::RecordedNote;
 use crate::audio::{
-    gain_to_db, EffectKind, RecordEvent, SynthParams, Telemetry, DEFAULT_BPM, SCENE_COUNT, TRACKS,
+    gain_to_db, EffectKind, RecordEvent, SynthXt, Telemetry, DEFAULT_BPM, SCENE_COUNT, TRACKS,
     TRACK_COUNT,
 };
 use crate::dsp::spectrum::SpectrumAnalyzer;
-use crate::samples::SampleClip;
+use crate::samples::SampleSlot;
 
 pub const MAX_SCOPE: usize = 4096;
 
@@ -23,7 +23,7 @@ pub enum InstrumentSource {
     /// Nothing loaded yet; the device chain offers `ADD PLUGIN / INSTRUMENT`.
     #[default]
     Empty,
-    /// The internal two-operator FM synth (`NEURAL GEN V5`).
+    /// The internal hybrid synth (`NEURAL GEN XT`).
     Synth,
     /// The CLAP/VST3 plugin hosted in the slot.
     Plugin,
@@ -114,8 +114,8 @@ pub struct UiState {
     pub clip_gain_db: [f32; TRACK_COUNT],
     pub clip_fade_in: [f32; TRACK_COUNT],
     pub clip_fade_out: [f32; TRACK_COUNT],
-    pub synth: [SynthParams; TRACK_COUNT],
-    /// What makes this track sound: nothing, the internal FM synth, or the
+    pub synth: [SynthXt; TRACK_COUNT],
+    /// What makes this track sound: nothing, the internal synth, or the
     /// hosted plugin. New tracks start empty, as the device chain shows.
     pub instrument: [InstrumentSource; TRACK_COUNT],
     /// Last synth-mute value pushed to the engine, to avoid resending it.
@@ -136,7 +136,7 @@ pub struct UiState {
     /// Loop region of each clip, as `(start, end)` in 16th notes.
     pub clip_loop: [[(u16, u16); SCENE_COUNT]; TRACK_COUNT],
     /// Audio sample assigned to each session slot, if any.
-    pub sample_slots: [[Option<Arc<SampleClip>>; SCENE_COUNT]; TRACK_COUNT],
+    pub sample_slots: [[Option<Arc<SampleSlot>>; SCENE_COUNT]; TRACK_COUNT],
     pub recording: bool,
     pub record_track: u8,
     pub input_track: u8,
@@ -176,7 +176,7 @@ impl UiState {
             clip_gain_db: [0.0; TRACK_COUNT],
             clip_fade_in: [0.0; TRACK_COUNT],
             clip_fade_out: [0.0; TRACK_COUNT],
-            synth: std::array::from_fn(|index| SynthParams::from_spec(&TRACKS[index])),
+            synth: std::array::from_fn(SynthXt::from_track),
             instrument: [InstrumentSource::Empty; TRACK_COUNT],
             // The engine starts with every synth enabled, so the empty default
             // must be pushed once; start "sent" as the opposite value.
@@ -304,21 +304,66 @@ impl UiState {
         }
     }
 
-    /// Audio sample assigned to a session slot.
-    pub fn sample_clip(&self, track: usize, scene: usize) -> Option<&Arc<SampleClip>> {
+    /// Audio sample assigned to a session slot, with its slot settings.
+    pub fn sample_slot(&self, track: usize, scene: usize) -> Option<&Arc<SampleSlot>> {
         self.sample_slots
             .get(track)
             .and_then(|slots| slots.get(scene))
             .and_then(|slot| slot.as_ref())
     }
 
-    pub fn set_sample_clip(&mut self, track: usize, scene: usize, sample: Option<Arc<SampleClip>>) {
+    /// The sample itself, for drawing and editing.
+    pub fn sample_clip(
+        &self,
+        track: usize,
+        scene: usize,
+    ) -> Option<&Arc<crate::samples::SampleClip>> {
+        self.sample_slot(track, scene).map(|slot| &slot.clip)
+    }
+
+    pub fn set_sample_slot(&mut self, track: usize, scene: usize, sample: Option<Arc<SampleSlot>>) {
         if let Some(slot) = self
             .sample_slots
             .get_mut(track)
             .and_then(|slots| slots.get_mut(scene))
         {
             *slot = sample;
+        }
+    }
+
+    /// Toggle whether the slot repeats its sample inside the clip loop.
+    pub fn set_sample_loop(&mut self, track: usize, scene: usize, enabled: bool) -> bool {
+        match self
+            .sample_slots
+            .get_mut(track)
+            .and_then(|slots| slots.get_mut(scene))
+            .and_then(|slot| slot.as_mut())
+        {
+            Some(slot) => {
+                let mut updated = (**slot).clone();
+                updated.loop_enabled = enabled;
+                *slot = Arc::new(updated);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Per-slot trim in dB, applied before the track fader.
+    pub fn set_sample_gain(&mut self, track: usize, scene: usize, gain_db: f32) -> bool {
+        match self
+            .sample_slots
+            .get_mut(track)
+            .and_then(|slots| slots.get_mut(scene))
+            .and_then(|slot| slot.as_mut())
+        {
+            Some(slot) => {
+                let mut updated = (**slot).clone();
+                updated.gain_db = gain_db.clamp(-48.0, 12.0);
+                *slot = Arc::new(updated);
+                true
+            }
+            None => false,
         }
     }
 
@@ -441,7 +486,7 @@ impl UiState {
     }
 
     /// Synth parameters for the selected track.
-    pub fn synth_params(&self, track: usize) -> SynthParams {
+    pub fn synth_params(&self, track: usize) -> SynthXt {
         self.synth[track.min(TRACK_COUNT - 1)]
     }
 
@@ -608,11 +653,19 @@ mod tests {
             }),
             peaks: vec![0.5],
         });
-        state.set_sample_clip(1, 4, Some(clip));
+        state.set_sample_slot(
+            1,
+            4,
+            Some(std::sync::Arc::new(crate::samples::SampleSlot::new(clip))),
+        );
         assert!(state.sample_clip(1, 4).is_some());
         assert!(state.sample_clip(1, 3).is_none());
         assert!(state.sample_clip(0, 4).is_none());
-        state.set_sample_clip(1, 4, None);
+        assert!(state.set_sample_loop(1, 4, false));
+        assert!(!state.sample_slot(1, 4).expect("slot").loop_enabled);
+        assert!(state.set_sample_gain(1, 4, -6.0));
+        assert!((state.sample_slot(1, 4).expect("slot").gain_db + 6.0).abs() < 1e-6);
+        state.set_sample_slot(1, 4, None);
         assert!(state.sample_clip(1, 4).is_none());
     }
 
@@ -643,9 +696,23 @@ mod tests {
     #[test]
     fn synth_params_are_editable_per_track() {
         let mut state = UiState::new();
-        state.synth[3].set(crate::audio::SynthParam::Index, 6.0);
-        assert!((state.synth_params(3).mod_index - 6.0).abs() < 1e-6);
-        assert!((state.synth_params(2).mod_index - 6.0).abs() > 1e-3);
+        state.synth[3].set(crate::audio::SynthParam::FilterCutoff(0), 6_000.0);
+        assert!(
+            (state
+                .synth_params(3)
+                .get(crate::audio::SynthParam::FilterCutoff(0))
+                - 6_000.0)
+                .abs()
+                < 1e-6
+        );
+        assert!(
+            (state
+                .synth_params(2)
+                .get(crate::audio::SynthParam::FilterCutoff(0))
+                - 6_000.0)
+                .abs()
+                > 1e-3
+        );
     }
 
     #[test]

@@ -220,9 +220,10 @@ pub fn draw_windows(
     draw_rename(ctx, studio, state);
     draw_midi(ctx, studio, state, audio);
     draw_project(ctx, studio, state, audio);
-    draw_synth_editor(ctx, studio, state, audio);
     draw_audio_editor(ctx, studio, state, audio);
     crate::ui::samples::draw_editor(ctx, studio, audio);
+    crate::ui::sample_clip::draw(ctx, studio, state, audio);
+    crate::ui::synth_xt::draw(ctx, studio, state, audio);
     crate::ui::piano_roll::draw(ctx, studio, state, audio);
 }
 
@@ -615,7 +616,7 @@ fn draw_browser(
                             .color(theme::GREEN),
                     );
                     ui.label(
-                        RichText::new("NEURAL GEN V5 · internal 2-op FM synth")
+                        RichText::new("NEURAL GEN XT · internal hybrid synth")
                             .font(theme::display(8.5))
                             .color(theme::TEXT),
                     );
@@ -724,7 +725,7 @@ fn draw_browser(
                 studio.select_synth(state, track);
                 close = true;
                 studio.notify(format!(
-                    "Track {:02} now plays the internal FM synth",
+                    "Track {:02} now plays the internal synth",
                     track + 1
                 ));
             }
@@ -1183,153 +1184,6 @@ fn draw_project(
             );
         });
     studio.project_open = open;
-}
-
-fn draw_synth_editor(
-    ctx: &egui::Context,
-    studio: &mut Studio,
-    state: &mut UiState,
-    audio: &mut AudioRuntime,
-) {
-    if !studio.synth_open {
-        return;
-    }
-    let mut open = true;
-    egui::Window::new("SYNTH // FM VOICE EDITOR")
-        .open(&mut open)
-        .frame(window_frame())
-        .default_pos(Pos2::new(430.0, 170.0))
-        .default_width(520.0)
-        .resizable(true)
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("TRACK")
-                        .font(theme::mono(8.0))
-                        .color(theme::TEXT_FAINT),
-                );
-                ComboBox::from_id_salt("synth_editor_track")
-                    .selected_text(format!(
-                        "{:02} {}",
-                        state.selected_track + 1,
-                        state.track_label(state.selected_track)
-                    ))
-                    .width(190.0)
-                    .show_ui(ui, |ui| {
-                        for track in 0..crate::audio::TRACK_COUNT {
-                            if ui
-                                .selectable_label(
-                                    state.selected_track == track,
-                                    format!(
-                                        "{:02} {}",
-                                        track + 1,
-                                        state.track_label(track)
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                state.selected_track = track;
-                            }
-                        }
-                    });
-                if ui
-                    .add(
-                        Button::new(
-                            RichText::new("RESET TRACK")
-                                .font(theme::display(8.0))
-                                .color(theme::TEXT),
-                        )
-                        .fill(theme::PANEL_SUNK)
-                        .stroke(Stroke::new(1.0, theme::BORDER)),
-                    )
-                    .clicked()
-                {
-                    let track = state.selected_track;
-                    let defaults =
-                        crate::audio::SynthParams::from_spec(&crate::audio::TRACKS[track]);
-                    state.synth[track] = defaults;
-                    for param in crate::audio::SynthParam::ALL {
-                        let _ = audio.command_tx.push(Command::SetSynthParam {
-                            track: track as u8,
-                            param,
-                            value: defaults.get(param),
-                        });
-                    }
-                }
-                ui.label(
-                    RichText::new("2-op FM · 32 voices")
-                        .font(theme::mono(7.0))
-                        .color(theme::TEXT_FAINT),
-                );
-            });
-
-            ui.add_space(6.0);
-            let accent = theme::track_accent(state.selected_track);
-            let track = state.selected_track;
-            let params = state.synth[track];
-            let columns = 4usize;
-            let cell = Vec2::new(104.0, 86.0);
-            let mut changes = Vec::new();
-            Grid::new("synth_editor_grid")
-                .num_columns(columns)
-                .spacing(Vec2::new(6.0, 6.0))
-                .show(ui, |ui| {
-                    for (index, param) in crate::audio::SynthParam::ALL.iter().enumerate() {
-                        let (rect, _) = ui.allocate_exact_size(cell, Sense::hover());
-                        let (min, max) = param.range();
-                        let log = param.logarithmic();
-                        let mut norm = synth_norm(params.get(*param), min, max, log);
-                        let default_norm = synth_norm(
-                            match param {
-                                crate::audio::SynthParam::Ratio => 1.0,
-                                crate::audio::SynthParam::Index => 1.15,
-                                crate::audio::SynthParam::Attack => 0.006,
-                                crate::audio::SynthParam::Decay => 0.22,
-                                crate::audio::SynthParam::Sustain => 0.30,
-                                crate::audio::SynthParam::Release => 0.22,
-                                crate::audio::SynthParam::Level => 0.9,
-                            },
-                            min,
-                            max,
-                            log,
-                        );
-                        if knob(
-                            ui,
-                            rect,
-                            ui.scope_id().with(("synth_editor_knob", track, index)),
-                            &mut norm,
-                            0.0..=1.0,
-                            default_norm,
-                            param.label(),
-                            &param.format(params.get(*param)),
-                            accent,
-                        ) {
-                            changes.push((*param, synth_denorm(norm, min, max, log)));
-                        }
-                        if (index + 1) % columns == 0 {
-                            ui.end_row();
-                        }
-                    }
-                });
-            for (param, value) in changes {
-                state.synth[track].set(param, value);
-                let _ = audio.command_tx.push(Command::SetSynthParam {
-                    track: track as u8,
-                    param,
-                    value,
-                });
-            }
-
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(
-                    "RATIO/INDEX shape the FM timbre; ATTACK→RELEASE shape the envelope. Changes apply to new notes.",
-                )
-                .font(theme::mono(7.5))
-                .color(theme::TEXT_FAINT),
-            );
-        });
-    studio.synth_open = open;
 }
 
 fn draw_audio_editor(
@@ -1938,24 +1792,4 @@ fn envelope(progress: f32, fade_in: f32, fade_out: f32) -> f32 {
         1.0
     };
     fade_in.min(fade_out)
-}
-
-fn synth_norm(value: f32, min: f32, max: f32, log: bool) -> f32 {
-    if log {
-        ((value.max(1.0e-6).ln() - min.max(1.0e-6).ln())
-            / (max.max(1.0e-6).ln() - min.max(1.0e-6).ln()))
-        .clamp(0.0, 1.0)
-    } else {
-        ((value - min) / (max - min).max(1.0e-9)).clamp(0.0, 1.0)
-    }
-}
-
-fn synth_denorm(norm: f32, min: f32, max: f32, log: bool) -> f32 {
-    if log {
-        let lo = min.max(1.0e-6).ln();
-        let hi = max.max(1.0e-6).ln();
-        (lo + (hi - lo) * norm.clamp(0.0, 1.0)).exp()
-    } else {
-        min + (max - min) * norm.clamp(0.0, 1.0)
-    }
 }

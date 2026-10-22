@@ -180,8 +180,8 @@ fn selftest() -> Result<(), String> {
     command_tx
         .push(Command::SetSynthParam {
             track: 0,
-            param: audio::SynthParam::Index,
-            value: 2.5,
+            param: audio::SynthParam::FilterCutoff(0),
+            value: 2_500.0,
         })
         .map_err(|e| e.to_string())?;
     command_tx
@@ -219,17 +219,19 @@ fn selftest() -> Result<(), String> {
     });
     chain.apply(Command::SetSynthParam {
         track: 0,
-        param: audio::SynthParam::Index,
-        value: 3.2,
+        param: audio::SynthParam::FilterCutoff(0),
+        value: 3_200.0,
     });
     let mut chain_buffer = vec![0.0_f32; block * 2];
     for _ in 0..(9_600 / block) {
         chain.process(&mut chain_buffer);
     }
     println!(
-        "- chain: {default_effects} default modules -> {} after remove/add; synth index {:.1}",
+        "- chain: {default_effects} default modules -> {} after remove/add; cutoff {:.0} Hz",
         chain.effect_count(),
-        chain.synth_params(0).mod_index
+        chain
+            .synth_params(0)
+            .get(audio::SynthParam::FilterCutoff(0))
     );
     if chain.effect_count() != default_effects {
         return Err("effect chain bookkeeping is inconsistent".into());
@@ -244,7 +246,7 @@ fn selftest() -> Result<(), String> {
     ui_state.add_effect(audio::EffectKind::Delay);
     ui_state.add_effect(audio::EffectKind::Filter);
     ui_state.master_gain = 0.66;
-    ui_state.synth[0].set(audio::SynthParam::Index, 4.25);
+    ui_state.synth[0].set(audio::SynthParam::FilterCutoff(0), 4_250.0);
     ui_state.set_recorded(
         0,
         2,
@@ -267,12 +269,11 @@ fn selftest() -> Result<(), String> {
         && reloaded.tracks[0].clips.len() == 1
         && reloaded.tracks[0].clips[0].scene == 2
         && !reloaded.tracks[0].clips[0].enabled
-        && reloaded.tracks[0]
-            .synth
-            .as_ref()
-            .is_some_and(|synth| (synth.index - 4.25).abs() < 1e-4);
+        && reloaded.tracks[0].synth.as_ref().is_some_and(|synth| {
+            (synth.to_patch().get(audio::SynthParam::FilterCutoff(0)) - 4_250.0).abs() < 1e-3
+        });
     println!(
-        "- project: {} module(s), {} note(s), synth index {:.2}",
+        "- project: {} module(s), {} note(s), cutoff {:.0} Hz",
         reloaded.effects.len(),
         reloaded.tracks[0]
             .clips
@@ -282,7 +283,7 @@ fn selftest() -> Result<(), String> {
         reloaded.tracks[0]
             .synth
             .as_ref()
-            .map(|synth| synth.index)
+            .map(|synth| synth.to_patch().get(audio::SynthParam::FilterCutoff(0)))
             .unwrap_or(f32::NAN)
     );
     if !ok {

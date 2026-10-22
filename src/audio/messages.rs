@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+pub use super::synth_xt::SynthParam;
+
 pub const TRACK_COUNT: usize = 8;
 pub const SCENE_COUNT: usize = 8;
 pub const STEPS_PER_BAR: usize = 16;
@@ -122,77 +124,6 @@ pub struct RecordEvent {
     pub reset: bool,
 }
 
-/// Editable parameters of the two-operator FM synth (per track).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SynthParam {
-    /// Modulator : carrier frequency ratio.
-    Ratio,
-    /// FM modulation index.
-    Index,
-    Attack,
-    Decay,
-    Sustain,
-    Release,
-    Level,
-}
-
-impl SynthParam {
-    pub const ALL: [Self; 7] = [
-        Self::Ratio,
-        Self::Index,
-        Self::Attack,
-        Self::Decay,
-        Self::Sustain,
-        Self::Release,
-        Self::Level,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Ratio => "RATIO",
-            Self::Index => "INDEX",
-            Self::Attack => "ATTACK",
-            Self::Decay => "DECAY",
-            Self::Sustain => "SUSTAIN",
-            Self::Release => "RELEASE",
-            Self::Level => "LEVEL",
-        }
-    }
-
-    /// Inclusive range accepted by the engine.
-    pub fn range(self) -> (f32, f32) {
-        match self {
-            Self::Ratio => (0.25, 8.0),
-            Self::Index => (0.0, 8.0),
-            Self::Attack => (0.001, 2.0),
-            Self::Decay => (0.005, 3.0),
-            Self::Sustain => (0.0, 1.0),
-            Self::Release => (0.01, 4.0),
-            Self::Level => (0.0, 1.5),
-        }
-    }
-
-    /// True when the parameter is perceptually logarithmic (time constants).
-    pub fn logarithmic(self) -> bool {
-        matches!(self, Self::Attack | Self::Decay | Self::Release)
-    }
-
-    pub fn format(self, value: f32) -> String {
-        match self {
-            Self::Ratio => format!("{value:.2}x"),
-            Self::Index => format!("{value:.2}"),
-            Self::Attack | Self::Decay | Self::Release => {
-                if value >= 1.0 {
-                    format!("{value:.2}s")
-                } else {
-                    format!("{:.0}ms", value * 1000.0)
-                }
-            }
-            Self::Sustain | Self::Level => format!("{:.0}%", value * 100.0),
-        }
-    }
-}
-
 /// Effect modules that can be inserted in the master chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EffectKind {
@@ -227,7 +158,7 @@ impl EffectKind {
         match self {
             Self::Drive => "SYNAPSE DRIVE",
             Self::Filter => "QUANTUM RESONATOR",
-            Self::Tone => "NEURAL GEN V5",
+            Self::Tone => "NEURAL GEN XT",
             Self::Width => "MIRROR WIDTH",
             Self::Delay => "ECHO MEMORY",
         }
@@ -433,7 +364,7 @@ pub enum Command {
     StopClip {
         track: u8,
     },
-    /// Change one editable parameter of a track's FM synth.
+    /// Change one editable parameter of a track's synth.
     SetSynthParam {
         track: u8,
         param: SynthParam,
@@ -488,6 +419,18 @@ pub enum Command {
     },
     /// Stop the editor's one-shot sample preview.
     StopPreview,
+    /// Repeat a slot's sample to fill the clip loop instead of playing once.
+    SetSampleLoop {
+        track: u8,
+        scene: u8,
+        enabled: bool,
+    },
+    /// Per-slot trim of a sample, in dB.
+    SetSampleGain {
+        track: u8,
+        scene: u8,
+        gain_db: f32,
+    },
     /// Loop region of one session clip, in 16th notes from the loop start.
     /// `start < end`; notes outside the region do not play.
     SetClipLoop {
@@ -509,7 +452,7 @@ pub enum Command {
         track: u8,
         active: bool,
     },
-    /// Mute or unmute the internal FM synth of a track. Used when an
+    /// Mute or unmute the internal synth of a track. Used when an
     /// instrument plugin replaces it in the track's instrument slot.
     SetTrackSynth {
         track: u8,

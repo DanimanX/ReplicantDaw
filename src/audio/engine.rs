@@ -1,4 +1,4 @@
-//! The audio engine: sequencer, FM voices, stereo mix bus and master FX.
+//! The audio engine: sequencer, synth voices, stereo mix bus and master FX.
 //!
 //! `Engine` is deliberately free of locks, allocations and syscalls in
 //! [`Engine::process`]. It is driven either by the cpal output callback or by
@@ -15,7 +15,7 @@ use super::messages::{
     TRACK_COUNT,
 };
 use super::midi::MidiMessage;
-use super::synth::{SynthParams, Voice};
+use super::synth_xt::{SynthXt, Voice};
 use super::tracks::{note_at, TrackSpec, TRACKS};
 use crate::dsp::{soft_clip, DcBlocker, Smoothed};
 use crate::plugins::{PluginBlock, PLUGIN_BLOCK_FRAMES};
@@ -108,7 +108,7 @@ pub struct Engine {
     position: u64,
     last_step: u64,
     tracks: [TrackState; TRACK_COUNT],
-    synth: [SynthParams; TRACK_COUNT],
+    synth: [SynthXt; TRACK_COUNT],
     voices: [Voice; MAX_VOICES],
     voice_age: u64,
     effects: [EffectSlot; MAX_EFFECTS],
@@ -147,7 +147,7 @@ pub struct Engine {
     plugin_midi: bool,
     plugin_latency: u16,
     track_plugin: [bool; TRACK_COUNT],
-    /// Internal FM synth audible per track. An instrument plugin replaces it.
+    /// Internal synth audible per track. An instrument plugin replaces it.
     synth_enabled: [bool; TRACK_COUNT],
     /// Note-offs scheduled for plugins at a given loop step.
     plugin_offs: [(u8, u8, u16); 128],
@@ -156,6 +156,10 @@ pub struct Engine {
     sample_rx: Option<Consumer<SampleUpload>>,
     /// One audio sample per (track, scene) clip.
     clip_samples: Box<[Option<Arc<SampleBuffer>>]>,
+    /// Repeat each slot's sample to fill its clip loop.
+    sample_loop: [[bool; SCENE_COUNT]; TRACK_COUNT],
+    /// Linear trim per slot, precomputed from the dB command.
+    sample_gain: [[f32; SCENE_COUNT]; TRACK_COUNT],
     /// One-shot sample preview from the editor.
     preview: Option<Arc<SampleBuffer>>,
     preview_pos: usize,
@@ -200,7 +204,7 @@ impl Engine {
             position: 0,
             last_step: u64::MAX,
             tracks: std::array::from_fn(|i| TrackState::new(i, sample_rate)),
-            synth: std::array::from_fn(|i| SynthParams::from_spec(&TRACKS[i])),
+            synth: std::array::from_fn(SynthXt::from_track),
             voices: [Voice::default(); MAX_VOICES],
             voice_age: 0,
             effects: std::array::from_fn(|_| EffectSlot::new(sample_rate)),
@@ -239,6 +243,8 @@ impl Engine {
             last_midi_note: 60,
             sample_rx: io.samples,
             clip_samples: empty_sample_grid(),
+            sample_loop: [[true; SCENE_COUNT]; TRACK_COUNT],
+            sample_gain: [[1.0; SCENE_COUNT]; TRACK_COUNT],
             preview: None,
             preview_pos: 0,
             preview_playing: false,
@@ -291,7 +297,7 @@ impl Engine {
     }
 
     /// Editable synth parameters for a track.
-    pub fn synth_params(&self, track: usize) -> SynthParams {
+    pub fn synth_params(&self, track: usize) -> SynthXt {
         self.synth[track.min(TRACK_COUNT - 1)]
     }
 
@@ -347,6 +353,9 @@ impl Engine {
             && self.track_plugin.iter().any(|active| *active);
         let mut block_peaks = [0.0_f32; TRACK_COUNT];
         let mut block_master = [0.0_f32; 2];
+        // Patches are copyable and small; taking one snapshot per block keeps
+        // the per-sample loop free of borrow juggling and cache misses.
+        let patches = self.synth;
 
         for frame in out.chunks_exact_mut(2) {
             if self.playing {
@@ -361,12 +370,13 @@ impl Engine {
                 if !voice.is_active() {
                     continue;
                 }
-                let sample = voice.next_sample(self.sample_rate);
                 let track = voice.track as usize;
-                if track < TRACK_COUNT {
-                    track_l[track] += sample;
-                    track_r[track] += sample;
+                if track >= TRACK_COUNT {
+                    continue;
                 }
+                let (left, right) = voice.next_sample(&patches[track], self.sample_rate);
+                track_l[track] += left;
+                track_r[track] += right;
             }
 
             // Audio samples play from their clip slot, one-shot per launch
@@ -380,15 +390,27 @@ impl Engine {
                     if !self.recorded_active[index][scene] {
                         continue;
                     }
-                    let Some(sample) = self.clip_samples[clip_index(index, scene)].as_ref() else {
+                    let slot = clip_index(index, scene);
+                    let Some(sample) = self.clip_samples[slot].as_ref() else {
                         continue;
                     };
-                    let position = self.tracks[index].sample_pos;
-                    if position < sample.frame_count() {
-                        track_l[index] += sample.frames[position * 2];
-                        track_r[index] += sample.frames[position * 2 + 1];
-                        self.tracks[index].sample_pos = position + 1;
+                    let frames = sample.frame_count();
+                    if frames == 0 {
+                        continue;
                     }
+                    let mut position = self.tracks[index].sample_pos;
+                    if position >= frames {
+                        if !self.sample_loop[index][scene] {
+                            continue;
+                        }
+                        // Loop: the sample repeats inside the clip region
+                        // until the region wraps and retriggers it.
+                        position %= frames;
+                    }
+                    let gain = self.sample_gain[index][scene];
+                    track_l[index] += sample.frames[position * 2] * gain;
+                    track_r[index] += sample.frames[position * 2 + 1] * gain;
+                    self.tracks[index].sample_pos = position + 1;
                 }
             }
 
@@ -802,6 +824,26 @@ impl Engine {
                 self.preview_playing = false;
                 self.preview_pos = 0;
             }
+            Command::SetSampleLoop {
+                track,
+                scene,
+                enabled,
+            } => {
+                let track = (track as usize).min(TRACK_COUNT - 1);
+                let scene = (scene as usize).min(SCENE_COUNT - 1);
+                self.sample_loop[track][scene] = enabled;
+            }
+            Command::SetSampleGain {
+                track,
+                scene,
+                gain_db,
+            } => {
+                let track = (track as usize).min(TRACK_COUNT - 1);
+                let scene = (scene as usize).min(SCENE_COUNT - 1);
+                if gain_db.is_finite() {
+                    self.sample_gain[track][scene] = db_to_gain(gain_db.clamp(-48.0, 12.0));
+                }
+            }
             Command::SetPluginMidi { enabled } => {
                 self.plugin_midi = enabled;
             }
@@ -1014,9 +1056,13 @@ impl Engine {
             }
 
             // Empty slots can still hold an audio sample. Their playhead has
-            // to advance too, so the waveform cursor follows the audio.
+            // to advance too, so the waveform cursor follows the audio, and
+            // the sample restarts when the clip's own region wraps.
             let next = phase + 1;
             self.tracks[track].clip_step = if next >= end { start } else { next };
+            if next >= end {
+                self.tracks[track].sample_pos = 0;
+            }
 
             // A sample slot replaces the generative pattern: otherwise the
             // internal synth would keep playing under the dragged sample.
@@ -1236,8 +1282,33 @@ impl Engine {
             return;
         }
         let params = self.synth[track];
-        // Prefer a free voice; otherwise steal the quietest, then oldest.
-        let slot = self.voices.iter().position(|v| !v.is_active()).or_else(|| {
+        let limit = (params.polyphony.round() as usize).clamp(1, MAX_VOICES);
+        let sounding = self
+            .voices
+            .iter()
+            .filter(|voice| voice.is_active() && voice.track as usize == track)
+            .count();
+        // A free slot, unless this track already reached its polyphony limit.
+        let slot = if sounding < limit {
+            self.voices.iter().position(|v| !v.is_active())
+        } else {
+            None
+        }
+        .or_else(|| {
+            // Steal the quietest voice of this track, then the oldest.
+            self.voices
+                .iter()
+                .enumerate()
+                .filter(|(_, voice)| voice.is_active() && voice.track as usize == track)
+                .min_by(|(_, a), (_, b)| {
+                    a.envelope_level()
+                        .total_cmp(&b.envelope_level())
+                        .then_with(|| a.age().cmp(&b.age()))
+                })
+                .map(|(i, _)| i)
+        })
+        .or_else(|| {
+            // Fallback for a full pool: steal the quietest anywhere.
             self.voices
                 .iter()
                 .enumerate()
@@ -1426,6 +1497,68 @@ mod tests {
             .iter()
             .fold(0.0_f32, |max, sample| max.max(sample.abs()));
         assert!(peak < 1e-4, "preview did not stop: {peak}");
+    }
+
+    #[test]
+    fn sample_loops_inside_the_clip_or_plays_once() {
+        let (mut sample_tx, sample_rx) = RingBuffer::new(4);
+        let mut engine = Engine::new_with_io(
+            48_000.0,
+            EngineIo {
+                samples: Some(sample_rx),
+                ..EngineIo::default()
+            },
+        );
+        for track in 0..TRACK_COUNT {
+            engine.apply(Command::SetTrackSynth {
+                track: track as u8,
+                enabled: false,
+            });
+            engine.apply(Command::StopClip { track: track as u8 });
+        }
+        engine.apply(Command::Play);
+
+        // 0.1 s of a steady tone.
+        let frames = 4_800usize;
+        let mut data = Vec::with_capacity(frames * 2);
+        for index in 0..frames {
+            let value = (std::f32::consts::TAU * 220.0 * index as f32 / 48_000.0).sin() * 0.5;
+            data.push(value);
+            data.push(value);
+        }
+        sample_tx
+            .push(SampleUpload {
+                track: 0,
+                scene: 0,
+                sample: Some(Arc::new(SampleBuffer {
+                    frames: data,
+                    sample_rate: 48_000,
+                })),
+            })
+            .expect("queue sample");
+        engine.apply(Command::LaunchClip { track: 0, scene: 0 });
+
+        // After the sample's own length the loop keeps it audible.
+        let _ = render(&mut engine, 9_600);
+        let tail = render(&mut engine, 4_800);
+        let peak = tail
+            .iter()
+            .fold(0.0_f32, |max, sample| max.max(sample.abs()));
+        assert!(peak > 0.05, "looping sample fell silent: {peak}");
+
+        // Turning the loop off leaves the region silent after one pass.
+        engine.apply(Command::SetSampleLoop {
+            track: 0,
+            scene: 0,
+            enabled: false,
+        });
+        engine.apply(Command::LaunchClip { track: 0, scene: 0 });
+        let _ = render(&mut engine, 7_200);
+        let tail = render(&mut engine, 4_800);
+        let peak = tail
+            .iter()
+            .fold(0.0_f32, |max, sample| max.max(sample.abs()));
+        assert!(peak < 1e-4, "one-shot sample kept repeating: {peak}");
     }
 
     #[test]
@@ -1772,8 +1905,8 @@ mod tests {
         let mut bright = Engine::offline(48_000.0);
         bright.apply(Command::SetSynthParam {
             track: 0,
-            param: SynthParam::Index,
-            value: 6.0,
+            param: SynthParam::FilterCutoff(0),
+            value: 14_000.0,
         });
         bright.apply(Command::Play);
         let bright_out = render(&mut bright, 24_000);
@@ -1782,8 +1915,8 @@ mod tests {
         let mut mellow = Engine::offline(48_000.0);
         mellow.apply(Command::SetSynthParam {
             track: 0,
-            param: SynthParam::Index,
-            value: 0.0,
+            param: SynthParam::FilterCutoff(0),
+            value: 120.0,
         });
         mellow.apply(Command::Play);
         let mellow_out = render(&mut mellow, 24_000);
@@ -1794,7 +1927,69 @@ mod tests {
             (bright_energy - mellow_energy).abs() > 1.0,
             "synth parameter had no audible effect ({bright_energy} vs {mellow_energy})"
         );
-        assert!((bright.synth_params(0).mod_index - 6.0).abs() < 1e-6);
+        assert!((bright.synth_params(0).get(SynthParam::FilterCutoff(0)) - 14_000.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn every_preset_sounds_on_a_launched_track() {
+        use crate::audio::PRESETS;
+        for preset in PRESETS.iter() {
+            let mut engine = Engine::offline(48_000.0);
+            for track in 0..TRACK_COUNT {
+                engine.apply(Command::StopClip { track: track as u8 });
+            }
+            let patch = preset.patch();
+            for param in SynthParam::all() {
+                engine.apply(Command::SetSynthParam {
+                    track: 0,
+                    param,
+                    value: patch.get(param),
+                });
+            }
+            engine.apply(Command::Play);
+            // A long gate so slow pads reach their body before release.
+            engine.trigger_note(0, 60, 1.0, 96_000, &TRACKS[0]);
+            // Long enough for the slowest attack in the factory bank.
+            let out = render(&mut engine, 72_000);
+            let peak = out
+                .iter()
+                .fold(0.0_f32, |max, sample| max.max(sample.abs()));
+            let rms =
+                (out.iter().map(|sample| sample * sample).sum::<f32>() / out.len() as f32).sqrt();
+            assert!(
+                peak > 0.002 && rms > 5.0e-5,
+                "preset {} produced no audio (peak {peak}, rms {rms})",
+                preset.name
+            );
+            assert!(
+                out.iter().all(|sample| sample.is_finite()),
+                "preset {} produced non-finite samples",
+                preset.name
+            );
+        }
+    }
+
+    #[test]
+    fn polyphony_limit_steals_within_the_track() {
+        let mut engine = Engine::offline(48_000.0);
+        engine.apply(Command::SetSynthParam {
+            track: 0,
+            param: SynthParam::Polyphony,
+            value: 2.0,
+        });
+        engine.apply(Command::Play);
+        for note in 60..66 {
+            engine.trigger_note(0, note, 1.0, 48_000, &TRACKS[0]);
+        }
+        let sounding = engine
+            .voices
+            .iter()
+            .filter(|voice| voice.is_active() && voice.track == 0)
+            .count();
+        assert!(
+            sounding <= 2,
+            "polyphony limit ignored: {sounding} voices sounding"
+        );
     }
 
     #[test]

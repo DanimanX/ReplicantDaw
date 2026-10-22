@@ -1,7 +1,7 @@
 //! Bottom device chain: instrument slot, modular effects and the master bus.
 //!
 //! The first module is the track's instrument slot. It holds the internal
-//! `NEURAL GEN V5` FM synth and the CLAP/VST3 instrument insert, and lets you
+//! `NEURAL GEN XT` synth and the CLAP/VST3 instrument insert, and lets you
 //! choose which one sounds. Modules are painted left to right in signal order;
 //! every effect can be bypassed, reordered, closed and re-added from `+ FX`.
 
@@ -65,7 +65,7 @@ pub fn draw(
     let mut param_change: Option<(usize, usize, f32)> = None;
     let mut synth_change: Option<(usize, SynthParam, f32)> = None;
 
-    // ---- Instrument slot (internal FM synth + plugin insert) ------------
+    // ---- Instrument slot (internal synth + plugin insert) ----------------
     let instrument_rect = Rect::from_min_size(
         Pos2::new(x, content.top()),
         Vec2::new(unit * instrument_weight, content.height()),
@@ -273,7 +273,7 @@ fn norm_to_value(norm: f32, min: f32, max: f32, log: bool) -> f32 {
 ///
 /// Ableton-style: one slot, one sound source per track. It starts **empty**
 /// and shows `ADD PLUGIN / INSTRUMENT`; from there the user either picks a
-/// scanned CLAP/VST3 plugin or switches to the internal `NEURAL GEN V5` synth.
+/// scanned CLAP/VST3 plugin or switches to the internal `NEURAL GEN XT` synth.
 fn draw_instrument(
     ui: &mut Ui,
     rect: Rect,
@@ -370,7 +370,7 @@ fn draw_instrument(
         }
         if hovered {
             hit.on_hover_text(
-                "Pick a CLAP/VST3 plugin installed on this system, or the internal FM synth",
+                "Pick a CLAP/VST3 plugin installed on this system, or the internal synth",
             );
         }
         return;
@@ -533,14 +533,22 @@ fn draw_instrument(
         }
     }
 
-    // ---- Internal FM synth (NEURAL GEN V5) ------------------------------
+    // ---- NEURAL GEN XT: the six controls that matter in the rack --------
     let params = state.synth[track];
-    let columns = ((content.width() / 62.0).floor() as usize).clamp(2, 4);
-    let rows = SynthParam::ALL.len().div_ceil(columns);
+    let compact = [
+        SynthParam::FilterCutoff(0),
+        SynthParam::FilterResonance(0),
+        SynthParam::OscLevel(1),
+        SynthParam::OscDetune(0),
+        SynthParam::EnvAttack(0),
+        SynthParam::EnvRelease(0),
+    ];
+    let columns = ((content.width() / 62.0).floor() as usize).clamp(2, 3);
+    let rows = compact.len().div_ceil(columns);
     let cell_w = content.width() / columns as f32;
     let cell_h = (content.height() / rows as f32).max(32.0);
 
-    for (index, param) in SynthParam::ALL.iter().enumerate() {
+    for (index, param) in compact.iter().enumerate() {
         let row = index / columns;
         let column = index % columns;
         let cell = Rect::from_min_size(
@@ -559,21 +567,8 @@ fn draw_instrument(
             ui.scope_id().with(("synth_knob", track, index)),
             &mut norm,
             0.0..=1.0,
-            value_to_norm(
-                match param {
-                    SynthParam::Ratio => 1.0,
-                    SynthParam::Index => 1.15,
-                    SynthParam::Attack => 0.006,
-                    SynthParam::Decay => 0.22,
-                    SynthParam::Sustain => 0.30,
-                    SynthParam::Release => 0.22,
-                    SynthParam::Level => 0.9,
-                },
-                min,
-                max,
-                log,
-            ),
-            param.label(),
+            value_to_norm(param.default_value(), min, max, log),
+            &param.label(),
             &param.format(params.get(*param)),
             accent,
         );
@@ -596,7 +591,7 @@ fn draw_instrument(
     ui.painter().text(
         Pos2::new(badge.left() + 2.0, badge.center().y),
         Align2::LEFT_CENTER,
-        "NEURAL GEN V5 · 2-OP FM",
+        "NEURAL GEN XT · HYBRID",
         theme::mono(6.0),
         theme::TEXT_FAINT,
     );
@@ -620,7 +615,7 @@ fn draw_instrument(
     }
     if badge_hit.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        badge_hit.on_hover_text("Open the FM voice editor");
+        badge_hit.on_hover_text("Open the NEURAL GEN XT editor");
     }
 
     let _ = pending;

@@ -458,8 +458,8 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
         }
         if lane_hit.double_clicked() {
             state.selected_track = track;
-            if let Some(sample) = &sample {
-                studio.open_sample_editor_clip(sample);
+            if sample.is_some() {
+                studio.open_sample_clip(track, scene);
             } else if notes.is_empty() {
                 studio.open_audio_editor(track);
             } else {

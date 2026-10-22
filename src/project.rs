@@ -17,59 +17,45 @@
 //!   audible, because that was the only source back then.
 //! - v7: audio samples assigned to session slots, with their edit settings.
 //!   v6 files load with no samples.
+//! - v8: the FM voice is replaced by the NEURAL GEN XT hybrid synth. The
+//!   patch is stored as (parameter id, value) pairs, so unknown parameters in
+//!   newer files are ignored instead of breaking the load. Older files load
+//!   with the default patch for each track.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio::messages::{EffectKind, RecordedNote, SynthParam, TRACK_COUNT};
-use crate::audio::{SynthParams, TRACKS};
+use crate::audio::messages::{EffectKind, RecordedNote, TRACK_COUNT};
+use crate::audio::{SynthXt, TRACKS};
 use crate::samples::SampleEdits;
 
 pub const PROJECT_EXTENSION: &str = "rproj";
-pub const PROJECT_FORMAT_VERSION: u32 = 7;
+pub const PROJECT_FORMAT_VERSION: u32 = 8;
 
-/// Editable FM synth settings stored per track.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ProjectSynth {
-    pub ratio: f32,
-    pub index: f32,
-    pub attack: f32,
-    pub decay: f32,
-    pub sustain: f32,
-    pub release: f32,
-    pub level: f32,
+/// A NEURAL GEN XT patch: parameter id/value pairs so the format survives
+/// new parameters without a migration.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProjectSynthXt {
+    #[serde(default)]
+    pub params: Vec<(String, f32)>,
 }
 
-impl ProjectSynth {
-    pub fn from_params(params: &SynthParams) -> Self {
+impl ProjectSynthXt {
+    pub fn from_patch(patch: &SynthXt) -> Self {
         Self {
-            ratio: params.fm_ratio,
-            index: params.mod_index,
-            attack: params.attack,
-            decay: params.decay,
-            sustain: params.sustain,
-            release: params.release,
-            level: params.level,
+            params: patch.to_saved(),
         }
     }
 
-    pub fn default_for_track(index: usize) -> Self {
-        let spec = &TRACKS[index.min(TRACK_COUNT - 1)];
-        Self::from_params(&SynthParams::from_spec(spec))
+    pub fn to_patch(&self) -> SynthXt {
+        let mut patch = SynthXt::default();
+        patch.apply_saved(&self.params);
+        patch
     }
 
-    /// Convert to engine values, clamping anything out of range.
-    pub fn to_params(&self) -> SynthParams {
-        let mut params = SynthParams::from_spec(&TRACKS[0]);
-        params.set(SynthParam::Ratio, self.ratio);
-        params.set(SynthParam::Index, self.index);
-        params.set(SynthParam::Attack, self.attack);
-        params.set(SynthParam::Decay, self.decay);
-        params.set(SynthParam::Sustain, self.sustain);
-        params.set(SynthParam::Release, self.release);
-        params.set(SynthParam::Level, self.level);
-        params
+    pub fn default_for_track(index: usize) -> Self {
+        Self::from_patch(&SynthXt::from_track(index))
     }
 }
 
@@ -133,6 +119,12 @@ pub struct ProjectSample {
     pub reverse: bool,
     #[serde(default)]
     pub normalize: bool,
+    /// Repeat the sample to fill the clip loop (default on).
+    #[serde(default = "default_true")]
+    pub loop_enabled: bool,
+    /// Per-slot trim in dB.
+    #[serde(default)]
+    pub slot_gain_db: f32,
 }
 
 impl ProjectSample {
@@ -181,7 +173,7 @@ pub struct ProjectTrack {
     #[serde(default)]
     pub fade_out: f32,
     #[serde(default)]
-    pub synth: Option<ProjectSynth>,
+    pub synth: Option<ProjectSynthXt>,
     /// Instrument slot source: `empty`, `synth` or `plugin`.
     #[serde(default)]
     pub instrument: String,
@@ -280,7 +272,7 @@ impl Default for Project {
                 clip_gain_db: 0.0,
                 fade_in: 0.0,
                 fade_out: 0.0,
-                synth: Some(ProjectSynth::default_for_track(index)),
+                synth: Some(ProjectSynthXt::default_for_track(index)),
                 instrument: "synth".to_string(),
                 instrument_plugin: None,
             })
@@ -400,7 +392,7 @@ impl Project {
             }
             for (index, track) in project.tracks.iter_mut().enumerate() {
                 if track.synth.is_none() {
-                    track.synth = Some(ProjectSynth::default_for_track(index));
+                    track.synth = Some(ProjectSynthXt::default_for_track(index));
                 }
             }
         }
@@ -467,17 +459,19 @@ impl Project {
                     .collect(),
                 samples: (0..crate::audio::SCENE_COUNT)
                     .filter_map(|scene| {
-                        let clip = state.sample_clip(index, scene)?;
+                        let slot = state.sample_slot(index, scene)?;
                         Some(ProjectSample {
                             scene: scene as u8,
-                            path: clip.path.clone(),
-                            gain_db: clip.edits.gain_db,
-                            trim_start: clip.edits.trim_start,
-                            trim_end: clip.edits.trim_end,
-                            fade_in: clip.edits.fade_in,
-                            fade_out: clip.edits.fade_out,
-                            reverse: clip.edits.reverse,
-                            normalize: clip.edits.normalize,
+                            path: slot.clip.path.clone(),
+                            gain_db: slot.clip.edits.gain_db,
+                            trim_start: slot.clip.edits.trim_start,
+                            trim_end: slot.clip.edits.trim_end,
+                            fade_in: slot.clip.edits.fade_in,
+                            fade_out: slot.clip.edits.fade_out,
+                            reverse: slot.clip.edits.reverse,
+                            normalize: slot.clip.edits.normalize,
+                            loop_enabled: slot.loop_enabled,
+                            slot_gain_db: slot.gain_db,
                         })
                     })
                     .collect(),
@@ -486,7 +480,7 @@ impl Project {
                 clip_gain_db: state.clip_gain_db[index],
                 fade_in: state.clip_fade_in[index],
                 fade_out: state.clip_fade_out[index],
-                synth: Some(ProjectSynth::from_params(&state.synth_params(index))),
+                synth: Some(ProjectSynthXt::from_patch(&state.synth_params(index))),
                 instrument: state.instrument[index].id().to_string(),
                 instrument_plugin: None,
             })
@@ -550,6 +544,7 @@ fn legacy_chain(fx: &ProjectFx) -> Vec<ProjectEffect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::SynthParam;
 
     #[test]
     fn default_project_has_all_tracks_and_a_chain() {
@@ -598,16 +593,13 @@ mod tests {
             fade_out: 0.02,
             reverse: true,
             normalize: true,
+            loop_enabled: false,
+            slot_gain_db: -1.5,
         });
-        project.tracks[1].synth = Some(ProjectSynth {
-            ratio: 2.5,
-            index: 4.0,
-            attack: 0.01,
-            decay: 0.2,
-            sustain: 0.3,
-            release: 0.4,
-            level: 1.2,
-        });
+        let mut patch = SynthXt::default();
+        patch.set(SynthParam::FilterCutoff(0), 2_500.0);
+        patch.set(SynthParam::OscUnison(0), 4.0);
+        project.tracks[1].synth = Some(ProjectSynthXt::from_patch(&patch));
         project.effects.push(ProjectEffect::new(EffectKind::Delay));
         project.master_gain = 0.75;
         project.plugins.push(ProjectPlugin {
@@ -645,11 +637,14 @@ mod tests {
         assert!((loaded.tracks[1].samples[0].gain_db + 2.5).abs() < 1e-6);
         assert!(loaded.tracks[1].samples[0].reverse);
         assert!(loaded.tracks[1].samples[0].normalize);
+        assert!(!loaded.tracks[1].samples[0].loop_enabled);
+        assert!((loaded.tracks[1].samples[0].slot_gain_db + 1.5).abs() < 1e-6);
         assert_eq!(loaded.effects.len(), 5);
         assert_eq!(loaded.effects[4].kind, "DELAY");
         assert!((loaded.master_gain - 0.75).abs() < 1e-6);
-        let synth = loaded.tracks[1].synth.as_ref().unwrap();
-        assert!((synth.ratio - 2.5).abs() < 1e-6);
+        let synth = loaded.tracks[1].synth.as_ref().unwrap().to_patch();
+        assert!((synth.get(SynthParam::FilterCutoff(0)) - 2_500.0).abs() < 1e-3);
+        assert!((synth.get(SynthParam::OscUnison(0)) - 4.0).abs() < 1e-6);
         assert_eq!(loaded.plugins[0].format, "CLAP");
     }
 
@@ -762,12 +757,10 @@ mod tests {
             ]
         }"#;
         let project = Project::from_json(json).expect("parse v1 project");
-        let first = project.tracks[0].synth.as_ref().unwrap();
-        let expected = crate::audio::TRACKS[0];
-        assert!((first.ratio - expected.fm_ratio).abs() < 1e-6);
-        assert!((first.index - expected.mod_index).abs() < 1e-6);
-        let bass = project.tracks[1].synth.as_ref().unwrap();
-        assert!((bass.index - crate::audio::TRACKS[1].mod_index).abs() < 1e-6);
+        // v8 replaced the FM voice: old files get the XT default patch.
+        let first = project.tracks[0].synth.as_ref().unwrap().to_patch();
+        let expected = SynthXt::from_track(0);
+        assert_eq!(first, expected);
     }
 
     #[test]

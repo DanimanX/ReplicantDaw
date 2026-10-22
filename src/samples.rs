@@ -88,6 +88,26 @@ impl SampleClip {
     }
 }
 
+/// A sample assigned to one session slot, plus its slot-level settings.
+#[derive(Clone, Debug)]
+pub struct SampleSlot {
+    pub clip: Arc<SampleClip>,
+    /// Repeat the sample to fill the clip's loop region.
+    pub loop_enabled: bool,
+    /// Per-slot trim, independent of the track fader.
+    pub gain_db: f32,
+}
+
+impl SampleSlot {
+    pub fn new(clip: Arc<SampleClip>) -> Self {
+        Self {
+            clip,
+            loop_enabled: true,
+            gain_db: 0.0,
+        }
+    }
+}
+
 /// An audio file open in the editor.
 pub struct DecodedSample {
     pub path: PathBuf,

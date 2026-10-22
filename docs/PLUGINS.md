@@ -59,7 +59,7 @@ REPLICANT_DAW_PLUGIN_PATH="/data/plugins/clap:/data/plugins/vst3" cargo run --re
    refreshes the list.
 2. A new track starts empty. Click `ADD PLUGIN / INSTRUMENT` in the device
    chain (or the `PLUGIN` chip) to open the instrument browser: the internal
-   `NEURAL GEN V5` FM synth is listed first, followed by every CLAP/VST3 plugin
+   `NEURAL GEN XT` synth is listed first, followed by every CLAP/VST3 plugin
    installed on the system. Picking one assigns it to the track.
 3. **RACK** lists all eight track inserts. Each row has **EDIT**, **LOAD**,
    **BYPASS** and **X** (unload), reports its latency, and exposes its
@@ -113,7 +113,7 @@ Instrument vs effect:
 - If the loaded plugin reports itself as an instrument, the slot switches from
   `FM` to `PLUGIN` and the internal synth is muted for that track. Pick `FM`
   again to go back.
-- If it is an effect, the FM synth keeps sounding and the plugin is a track
+- If it is an effect, the synth keeps sounding and the plugin is a track
   insert. You can still force either source with the two chips.
 
 Routing rules:

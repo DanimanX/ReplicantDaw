@@ -271,9 +271,8 @@ fn norm_to_value(norm: f32, min: f32, max: f32, log: bool) -> f32 {
 
 /// The track's instrument slot.
 ///
-/// Ableton-style: one slot, one sound source per track. It starts **empty**
-/// and shows `ADD PLUGIN / INSTRUMENT`; from there the user either picks a
-/// scanned CLAP/VST3 plugin or switches to the internal `NEURAL GEN XT` synth.
+/// Mutually exclusive instrument generator: either the internal `SURGE WT SYNTH`
+/// or the loaded `VST3 / CLAP` plugin. Exactly one is active and sounds per track.
 fn draw_instrument(
     ui: &mut Ui,
     rect: Rect,
@@ -295,10 +294,22 @@ fn draw_instrument(
         state.instrument[track] = source;
     }
 
+    let title = match source {
+        InstrumentSource::Synth => "INSTRUMENT // SURGE WT SYNTH",
+        InstrumentSource::Plugin => {
+            if let Some(info) = &info {
+                &info.name
+            } else {
+                "INSTRUMENT // PLUGIN"
+            }
+        }
+        InstrumentSource::Empty => "INSTRUMENT // EMPTY (AUDIO ONLY)",
+    };
+
     let inner = module_shell(
         ui,
         rect,
-        "INSTRUMENT",
+        title,
         &format!("TRK {:02}", track + 1),
         accent,
     );
@@ -350,19 +361,16 @@ fn draw_instrument(
             if pending {
                 "LOADING…"
             } else {
-                "ADD PLUGIN / INSTRUMENT"
+                "SELECT SURGE WT SYNTH OR VST/CLAP"
             },
-            theme::display(9.0),
+            theme::display(10.0),
             if hovered { Color32::WHITE } else { theme::TEXT },
         );
         ui.painter().text(
-            Pos2::new(center.x, center.y + 24.0),
+            Pos2::new(center.x, center.y + 26.0),
             Align2::CENTER_CENTER,
-            format!(
-                "{} PLUGIN(S) SCANNED · VST3 / CLAP / INTERNAL FM",
-                studio.scan_results.len()
-            ),
-            theme::mono(6.2),
+            "CLICK TO OPEN INSTRUMENT BROWSER",
+            theme::mono(8.0),
             theme::TEXT_FAINT,
         );
         if hit.clicked() {
@@ -370,49 +378,50 @@ fn draw_instrument(
         }
         if hovered {
             hit.on_hover_text(
-                "Pick a CLAP/VST3 plugin installed on this system, or the internal synth",
+                "Pick a CLAP/VST3 plugin installed on this system, or the internal Surge WT synth",
             );
         }
         return;
     }
 
-    // ---- Source selector + plugin actions -------------------------------
-    let row_h = 16.0;
-    let chip_w = (inner.width() * 0.22).clamp(38.0, 70.0);
-    let fm_chip = Rect::from_min_size(inner.min, Vec2::new(chip_w, row_h));
-    let plugin_chip = Rect::from_min_size(
-        Pos2::new(fm_chip.right() + 3.0, inner.top()),
-        Vec2::new((inner.width() * 0.34).clamp(56.0, 132.0), row_h),
-    );
-    let open_chip = Rect::from_min_size(
-        Pos2::new(plugin_chip.right() + 3.0, inner.top()),
-        Vec2::new((inner.width() * 0.22).clamp(34.0, 86.0), row_h),
+    // ---- Mutually Exclusive Selector Header ----------------------------
+    let row_h = 18.0;
+    let tab_w = ((inner.width() - 40.0) * 0.45).clamp(80.0, 150.0);
+    let synth_tab = Rect::from_min_size(inner.min, Vec2::new(tab_w, row_h));
+    let plugin_tab = Rect::from_min_size(
+        Pos2::new(synth_tab.right() + 4.0, inner.top()),
+        Vec2::new(tab_w, row_h),
     );
     let track_select = Rect::from_min_size(
-        Pos2::new(open_chip.right() + 3.0, inner.top()),
-        Vec2::new((inner.right() - open_chip.right() - 3.0).max(20.0), row_h),
+        Pos2::new(plugin_tab.right() + 4.0, inner.top()),
+        Vec2::new((inner.right() - plugin_tab.right() - 4.0).max(30.0), row_h),
     );
 
+    // [ ⚡ SURGE WT SYNTH ] Tab
+    let synth_active = source == InstrumentSource::Synth;
     if source_chip(
         ui,
-        fm_chip,
-        "FM",
-        source == InstrumentSource::Synth,
+        synth_tab,
+        "⚡ SURGE WT SYNTH",
+        synth_active,
         accent,
-        ui.scope_id().with(("instrument_fm", track)),
+        ui.scope_id().with(("instrument_synth", track)),
     ) {
         state.instrument[track] = InstrumentSource::Synth;
         source = InstrumentSource::Synth;
     }
+
+    // [ 🔌 VST3 / CLAP ] Tab
+    let plugin_active = source == InstrumentSource::Plugin;
     let plugin_label = match &info {
-        Some(info) => info.name.chars().take(12).collect::<String>(),
-        None => "+ ADD".to_string(),
+        Some(info) => format!("🔌 {}", info.name.chars().take(11).collect::<String>()),
+        None => "🔌 + VST/CLAP".to_string(),
     };
     if source_chip(
         ui,
-        plugin_chip,
+        plugin_tab,
         &plugin_label,
-        source == InstrumentSource::Plugin,
+        plugin_active,
         theme::GREEN,
         ui.scope_id().with(("instrument_plugin", track)),
     ) {
@@ -423,28 +432,8 @@ fn draw_instrument(
             studio.open_instrument_browser(track);
         }
     }
-    // The native-editor chip only makes sense with a plugin in the slot.
-    let gui_label = if info.as_ref().is_some_and(|slot| slot.gui_open) {
-        "GUI ON"
-    } else {
-        "GUI"
-    };
-    if source_chip(
-        ui,
-        open_chip,
-        if info.is_some() { gui_label } else { "ADD" },
-        info.as_ref().is_some_and(|slot| slot.gui_open),
-        theme::CYAN,
-        ui.scope_id().with(("instrument_gui", track)),
-    ) {
-        match &info {
-            Some(slot) if slot.gui_open => studio.close_plugin_gui(track),
-            Some(_) => studio.open_plugin_gui(track),
-            None => studio.open_instrument_browser(track),
-        }
-    }
 
-    // Clicking the track name cycles the edited track.
+    // Track selector chip
     let track_hit = ui.interact(
         track_select,
         ui.scope_id().with(("instrument_track", track)),
@@ -465,7 +454,7 @@ fn draw_instrument(
     let label_font = theme::fitted_font(
         &track_painter,
         state.track_label(track),
-        theme::mono(7.0),
+        theme::mono(8.5),
         track_select.width() - 6.0,
     );
     track_painter.text(
@@ -483,20 +472,26 @@ fn draw_instrument(
         track_hit.on_hover_text("Click to edit the next track");
     }
 
-    // ---- Plugin actions on the right of the selector --------------------
-    let button = 13.0;
+    // ---- Action Buttons in the Top Module Header -----------------------
+    let button = 14.0;
     let y = rect.top() + (HEADER_H - button) * 0.5;
     let right = rect.right() - 4.0;
-    let close = Rect::from_min_size(Pos2::new(right - button, y), Vec2::splat(button));
-    let bypass = Rect::from_min_size(
-        Pos2::new(close.left() - button - 2.0, y),
-        Vec2::splat(button),
-    );
-    let edit = Rect::from_min_size(
-        Pos2::new(bypass.left() - button - 2.0, y),
-        Vec2::splat(button),
-    );
-    if info.is_some() {
+
+    if source == InstrumentSource::Plugin && info.is_some() {
+        let close = Rect::from_min_size(Pos2::new(right - button, y), Vec2::splat(button));
+        let bypass = Rect::from_min_size(
+            Pos2::new(close.left() - button - 3.0, y),
+            Vec2::splat(button),
+        );
+        let edit = Rect::from_min_size(
+            Pos2::new(bypass.left() - button - 3.0, y),
+            Vec2::splat(button),
+        );
+        let gui = Rect::from_min_size(
+            Pos2::new(edit.left() - 26.0 - 3.0, y),
+            Vec2::new(26.0, button),
+        );
+
         if icon_button(ui, edit, "E", accent) {
             studio.open_plugin_editor(track, false);
         }
@@ -517,15 +512,31 @@ fn draw_instrument(
             studio.unload_plugin(track, audio);
             state.instrument[track] = crate::studio::source_after_unload(state.instrument[track]);
         }
+        if info.as_ref().is_some() {
+            let is_open = info.as_ref().is_some_and(|slot| slot.gui_open);
+            if icon_button(ui, gui, if is_open { "GUI*" } else { "GUI" }, theme::CYAN) {
+                if is_open {
+                    studio.close_plugin_gui(track);
+                } else {
+                    studio.open_plugin_gui(track);
+                }
+            }
+        }
+    } else if source == InstrumentSource::Synth {
+        let edit = Rect::from_min_size(Pos2::new(right - 34.0, y), Vec2::new(34.0, button));
+        if icon_button(ui, edit, "EDIT", accent) {
+            studio.synth_open = true;
+        }
     }
 
     let content_top = inner.top() + row_h + 4.0;
     // Leave room for the engine badge under the synth knobs.
     let content = Rect::from_min_max(
         Pos2::new(inner.left(), content_top),
-        Pos2::new(inner.right(), inner.bottom() - 13.0),
+        Pos2::new(inner.right(), inner.bottom() - 14.0),
     );
 
+    // ---- If Plugin is selected, render Plugin Controls ONLY ------------
     if source == InstrumentSource::Plugin {
         if let Some(info) = &info {
             draw_plugin_parameters(ui, content, studio, track, info, accent);
@@ -533,14 +544,14 @@ fn draw_instrument(
         }
     }
 
-    // ---- NEURAL GEN XT: the six controls that matter in the rack --------
+    // ---- If Synth is selected, render Surge WT Synth Controls ONLY ------
     let params = state.synth[track];
     let compact = [
+        SynthParam::OscMorph(0),
         SynthParam::FilterCutoff(0),
         SynthParam::FilterResonance(0),
         SynthParam::OscLevel(1),
         SynthParam::OscDetune(0),
-        SynthParam::EnvAttack(0),
         SynthParam::EnvRelease(0),
     ];
     let columns = ((content.width() / 62.0).floor() as usize).clamp(2, 3);
@@ -578,10 +589,10 @@ fn draw_instrument(
         }
     }
 
-    // Badge that names the internal engine and opens the full editor.
+    // Badge that names the internal Surge WT engine and opens the full editor.
     let badge = Rect::from_min_size(
         Pos2::new(inner.left(), content.bottom() + 1.0),
-        Vec2::new(content.width(), 11.0),
+        Vec2::new(content.width(), 13.0),
     );
     let badge_hit = ui.interact(
         badge,
@@ -591,19 +602,19 @@ fn draw_instrument(
     ui.painter().text(
         Pos2::new(badge.left() + 2.0, badge.center().y),
         Align2::LEFT_CENTER,
-        "NEURAL GEN XT · HYBRID",
-        theme::mono(6.0),
-        theme::TEXT_FAINT,
+        "SURGE WT SYNTH · 1:1 WAVETABLE ENGINE",
+        theme::mono(8.0),
+        theme::TEXT_DIM,
     );
     ui.painter().text(
         Pos2::new(badge.right() - 2.0, badge.center().y),
         Align2::RIGHT_CENTER,
         if badge_hit.hovered() {
-            "OPEN >"
+            "OPEN FULL EDITOR >"
         } else {
             "EDITOR >"
         },
-        theme::mono(6.0),
+        theme::mono(8.0),
         if badge_hit.hovered() {
             accent
         } else {
@@ -615,7 +626,7 @@ fn draw_instrument(
     }
     if badge_hit.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        badge_hit.on_hover_text("Open the NEURAL GEN XT editor");
+        badge_hit.on_hover_text("Open the Surge WT Synth full editor");
     }
 
     let _ = pending;

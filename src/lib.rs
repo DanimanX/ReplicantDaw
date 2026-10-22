@@ -1,4 +1,4 @@
-//! Replicant DAW - a cyberpunk DAW prototype.
+//! Replicant DAW - a cyberpunk digital audio workstation.
 //!
 //! The crate is split into a UI layer (`app`, `ui`, `theme`) and a
 //! real-time audio layer (`audio`, `dsp`). Both halves meet only at lock-free

@@ -279,9 +279,20 @@ fn oscillator_panel(
 ) {
     let index = osc as usize;
     let params = patch.osc[index];
+    let title = if params.wave == crate::audio::synth_xt::Waveform::Wavetable {
+        let table_idx = (params.table.round() as usize).min(crate::audio::synth_xt::WAVETABLE_COUNT - 1);
+        format!(
+            "OSC {} // SURGE WT · {} · {:.0}%",
+            osc + 1,
+            crate::audio::synth_xt::WAVETABLE_NAMES[table_idx],
+            params.morph * 100.0
+        )
+    } else {
+        format!("OSC {} // {}", osc + 1, params.wave.label())
+    };
     panel(
         ui,
-        &format!("OSC {} // {}", osc + 1, params.wave.label()),
+        &title,
         accent,
         width,
         |ui| {
@@ -293,7 +304,106 @@ fn oscillator_panel(
                     }
                 }
             });
+
+            if params.wave == crate::audio::synth_xt::Waveform::Wavetable {
+                ui.add_space(3.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("TABLE:")
+                            .font(theme::mono(9.0))
+                            .color(theme::TEXT_FAINT),
+                    );
+                    let current_table = (params.table.round() as usize).min(crate::audio::synth_xt::WAVETABLE_COUNT - 1);
+                    egui::ComboBox::from_id_salt(format!("wt_table_{osc}"))
+                        .selected_text(
+                            RichText::new(crate::audio::synth_xt::WAVETABLE_NAMES[current_table])
+                                .font(theme::display(10.0))
+                                .color(theme::CYAN),
+                        )
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for (idx, name) in crate::audio::synth_xt::WAVETABLE_NAMES.iter().enumerate() {
+                                if ui
+                                    .selectable_label(
+                                        idx == current_table,
+                                        RichText::new(format!("{:02} {}", idx + 1, name))
+                                            .font(theme::display(9.5)),
+                                    )
+                                    .clicked()
+                                {
+                                    push(changes, SynthParam::OscTable(osc), idx as f32);
+                                }
+                            }
+                        });
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!("MORPH: {:.1}%", params.morph * 100.0))
+                            .font(theme::mono(9.0))
+                            .color(theme::TEXT_DIM),
+                    );
+                });
+
+                // Surge XT 3D / Layered Wavetable Visualizer
+                ui.add_space(2.0);
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(width - 24.0, 48.0), Sense::hover());
+                let painter = ui.painter().with_clip_rect(rect);
+                painter.rect_filled(rect, CornerRadius::same(2), theme::PANEL_SUNK);
+                painter.rect_stroke(rect, CornerRadius::same(2), Stroke::new(1.0, theme::BORDER_SOFT), egui::StrokeKind::Inside);
+
+                let current_table = (params.table.round() as usize).min(crate::audio::synth_xt::WAVETABLE_COUNT - 1);
+                // Draw inactive frames in subtle background perspective
+                for frame_i in 0..crate::audio::synth_xt::WT_FRAMES {
+                    let frame_norm = frame_i as f32 / (crate::audio::synth_xt::WT_FRAMES - 1) as f32;
+                    let y_offset = (frame_i as f32 - 2.0) * 2.5;
+                    let x_offset = (frame_i as f32 - 2.0) * 3.0;
+                    let pts = 48;
+                    let mut line_pts = Vec::with_capacity(pts);
+                    for p in 0..pts {
+                        let phase = p as f32 / (pts - 1) as f32;
+                        let val = crate::audio::synth_xt::sample_wavetable(current_table, frame_norm, phase, 0.01);
+                        let x = rect.left() + 10.0 + x_offset + (rect.width() - 26.0) * phase;
+                        let y = rect.center().y + y_offset - val * 15.0;
+                        line_pts.push(Pos2::new(x, y));
+                    }
+                    painter.add(egui::Shape::line(
+                        line_pts,
+                        Stroke::new(0.8, theme::accent_alpha(theme::TEXT_FAINT, 45)),
+                    ));
+                }
+
+                // Draw active morphed waveform in bright glowing cyan
+                let preview_pts = 64;
+                let preview = crate::audio::synth_xt::get_wavetable_frame_preview(current_table, params.morph, preview_pts);
+                let mut morph_line = Vec::with_capacity(preview_pts);
+                for (p, &val) in preview.iter().enumerate() {
+                    let phase = p as f32 / (preview_pts - 1) as f32;
+                    let x = rect.left() + 10.0 + (rect.width() - 20.0) * phase;
+                    let y = rect.center().y - val * 19.0;
+                    morph_line.push(Pos2::new(x, y));
+                }
+                // Glow line + core line
+                painter.add(egui::Shape::line(
+                    morph_line.clone(),
+                    Stroke::new(2.8, theme::accent_alpha(theme::CYAN, 70)),
+                ));
+                painter.add(egui::Shape::line(
+                    morph_line,
+                    Stroke::new(1.4, theme::CYAN),
+                ));
+
+                // Morph position indicator marker
+                let marker_x = rect.left() + 10.0 + (rect.width() - 20.0) * params.morph;
+                painter.line_segment(
+                    [Pos2::new(marker_x, rect.top() + 3.0), Pos2::new(marker_x, rect.bottom() - 3.0)],
+                    Stroke::new(1.2, theme::MAGENTA),
+                );
+            }
+
+            ui.add_space(3.0);
             ui.horizontal(|ui| {
+                if params.wave == crate::audio::synth_xt::Waveform::Wavetable {
+                    small_knob(ui, patch, SynthParam::OscMorph(osc), theme::MAGENTA, changes, "");
+                }
                 for param in [
                     SynthParam::OscOctave(osc),
                     SynthParam::OscSemitone(osc),
@@ -780,6 +890,8 @@ fn chip(ui: &mut Ui, label: &str, selected: bool, accent: egui::Color32) -> bool
 fn short_label(param: SynthParam) -> String {
     match param {
         SynthParam::OscWave(_) => "WAVE".into(),
+        SynthParam::OscTable(_) => "TABLE".into(),
+        SynthParam::OscMorph(_) => "MORPH".into(),
         SynthParam::OscOctave(_) => "OCT".into(),
         SynthParam::OscSemitone(_) => "SEMI".into(),
         SynthParam::OscFine(_) => "FINE".into(),

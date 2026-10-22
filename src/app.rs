@@ -165,16 +165,21 @@ impl ReplicantApp {
         if std::env::var_os("REPLICANT_DAW_CLOSE_GUI").is_some() {
             studio.close_plugin_gui(0);
         }
-        if let Ok(zoom) = std::env::var("REPLICANT_DAW_ZOOM") {
+        let zoom = if let Ok(zoom) = std::env::var("REPLICANT_DAW_ZOOM") {
             if let Ok(percent) = zoom.parse::<u32>() {
-                studio.zoom = (percent as f32 / 100.0).clamp(0.75, 1.5);
-                cc.egui_ctx.set_zoom_factor(studio.zoom);
-                cc.egui_ctx
-                    .send_viewport_cmd(egui::ViewportCommand::InnerSize(
-                        Vec2::new(1660.0, 1000.0) * studio.zoom,
-                    ));
+                (percent as f32 / 100.0).clamp(0.75, 2.0)
+            } else {
+                1.15
             }
-        }
+        } else {
+            1.15
+        };
+        studio.zoom = zoom;
+        cc.egui_ctx.set_zoom_factor(studio.zoom);
+        cc.egui_ctx
+            .send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                Vec2::new(1660.0, 1000.0) * studio.zoom,
+            ));
 
         if smoke.is_some() {
             // A deterministic, lively frame for documentation and CI.

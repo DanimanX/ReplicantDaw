@@ -42,15 +42,15 @@ pub fn mono_family() -> FontFamily {
 }
 
 pub fn display(size: f32) -> FontId {
-    FontId::new(size, display_family())
+    FontId::new((size * 1.30).max(9.0), display_family())
 }
 
 pub fn mono(size: f32) -> FontId {
-    FontId::new(size, mono_family())
+    FontId::new((size * 1.30).max(9.0), mono_family())
 }
 
 pub fn body(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Proportional)
+    FontId::new((size * 1.25).max(11.0), FontFamily::Proportional)
 }
 
 /// Shrink a font until `text` fits `max_width`, with a readable floor.
@@ -68,7 +68,7 @@ pub fn fitted_font(painter: &Painter, text: &str, font: FontId, max_width: f32) 
     if width <= max_width || width <= 0.0 {
         return font;
     }
-    let size = (font.size * max_width / width).max(4.5);
+    let size = (font.size * max_width / width).max(8.0);
     FontId::new(size, font.family)
 }
 
@@ -95,13 +95,13 @@ pub fn install(ctx: &egui::Context) {
         style.spacing.window_margin = Margin::same(0);
         style.animation_time = 0.12;
         style.text_styles.extend([
-            (TextStyle::Small, body(11.5)),
-            (TextStyle::Body, body(13.5)),
-            (TextStyle::Button, display(10.5)),
-            (TextStyle::Monospace, mono(12.0)),
-            (TextStyle::Heading, display(18.0)),
-            (TextStyle::Name("display".into()), display(14.0)),
-            (TextStyle::Name("mono_small".into()), mono(10.0)),
+            (TextStyle::Small, body(12.5)),
+            (TextStyle::Body, body(15.0)),
+            (TextStyle::Button, display(12.0)),
+            (TextStyle::Monospace, mono(13.0)),
+            (TextStyle::Heading, display(20.0)),
+            (TextStyle::Name("display".into()), display(15.5)),
+            (TextStyle::Name("mono_small".into()), mono(11.0)),
         ]);
     });
 }

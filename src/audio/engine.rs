@@ -550,7 +550,7 @@ impl Engine {
         l = self.dc_l.process(l);
         r = self.dc_r.process(r);
 
-        // Speaker protection: the prototype should never emit NaN or
+        // Speaker protection: the engine should never emit NaN or
         // full-scale digital clipping, even with extreme knob positions.
         l = if l.is_finite() {
             l.clamp(-1.0, 1.0)

@@ -44,9 +44,10 @@ pub fn draw(
     let mut stop = false;
     let mut edit_source = false;
     let mut clear = false;
+    let mut open_piano_roll = false;
 
     egui::Window::new(format!(
-        "SAMPLE CLIP // TRACK {:02} · SLOT {:02}",
+        "CLIP EDITOR // TRACK {:02} · SLOT {:02}",
         track + 1,
         scene + 1
     ))
@@ -63,10 +64,32 @@ pub fn draw(
     .resizable(true)
     .show(ctx, |ui| {
         ui.set_width(width - 24.0);
+
+        // View mode tabs (Ableton-style Clip View: Audio Clip vs Piano Roll MIDI)
+        ui.horizontal(|ui| {
+            let _ = ui.add(
+                egui::Button::new(RichText::new("🌊 AUDIO CLIP").font(theme::display(10.0)))
+                    .fill(theme::accent_alpha(theme::MAGENTA, 60))
+                    .stroke(Stroke::new(1.2, theme::MAGENTA)),
+            );
+            if ui
+                .add(
+                    egui::Button::new(RichText::new("🎹 PIANO ROLL (MIDI)").font(theme::display(10.0)))
+                        .fill(theme::PANEL_SUNK)
+                        .stroke(Stroke::new(1.0, theme::BORDER_SOFT)),
+                )
+                .on_hover_text("Switch to MIDI note piano roll for this track and slot")
+                .clicked()
+            {
+                open_piano_roll = true;
+            }
+        });
+        ui.add_space(4.0);
+
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new(truncate(&slot.clip.name, 28))
-                    .font(theme::display(10.0))
+                    .font(theme::display(11.0))
                     .color(accent),
             );
             ui.label(
@@ -76,7 +99,7 @@ pub fn draw(
                     slot.clip.duration_secs(),
                     slot.clip.buffer.sample_rate
                 ))
-                .font(theme::mono(7.0))
+                .font(theme::mono(8.5))
                 .color(theme::TEXT_DIM),
             );
         });
@@ -88,7 +111,7 @@ pub fn draw(
         ui.horizontal(|ui| {
             if ui
                 .add(
-                    egui::Button::new(RichText::new("LOOP").font(theme::display(8.5)))
+                    egui::Button::new(RichText::new("LOOP").font(theme::display(9.5)))
                         .fill(if loop_enabled {
                             theme::accent_alpha(theme::CYAN, 45)
                         } else {
@@ -110,7 +133,7 @@ pub fn draw(
             }
             if ui
                 .add(
-                    egui::Button::new(RichText::new("LAUNCH").font(theme::display(8.5)))
+                    egui::Button::new(RichText::new("LAUNCH").font(theme::display(9.5)))
                         .fill(theme::accent_alpha(theme::GREEN, 35)),
                 )
                 .clicked()
@@ -119,7 +142,7 @@ pub fn draw(
             }
             if ui
                 .add(
-                    egui::Button::new(RichText::new("STOP").font(theme::display(8.5)))
+                    egui::Button::new(RichText::new("STOP").font(theme::display(9.5)))
                         .fill(theme::PANEL_SUNK),
                 )
                 .clicked()
@@ -128,7 +151,7 @@ pub fn draw(
             }
             if ui
                 .add(
-                    egui::Button::new(RichText::new("EDIT SOURCE").font(theme::display(8.0)))
+                    egui::Button::new(RichText::new("EDIT SOURCE").font(theme::display(9.0)))
                         .fill(theme::PANEL_SUNK),
                 )
                 .on_hover_text("Open the sample in the source editor to trim, fade or reverse it")
@@ -138,7 +161,7 @@ pub fn draw(
             }
             if ui
                 .add(
-                    egui::Button::new(RichText::new("CLEAR").font(theme::display(8.0)))
+                    egui::Button::new(RichText::new("CLEAR").font(theme::display(9.0)))
                         .fill(theme::PANEL_SUNK),
                 )
                 .clicked()
@@ -158,10 +181,14 @@ pub fn draw(
             RichText::new(
                 "The loop region sets the clip length: when it wraps, the sample restarts. LOOP repeats the sample inside that region.",
             )
-            .font(theme::mono(6.6))
+            .font(theme::mono(8.0))
             .color(theme::TEXT_FAINT),
         );
     });
+
+    if open_piano_roll {
+        studio.open_piano_roll(track, scene as u8);
+    }
 
     if loop_enabled != slot.loop_enabled {
         studio.set_sample_loop(state, audio, track, scene, loop_enabled);

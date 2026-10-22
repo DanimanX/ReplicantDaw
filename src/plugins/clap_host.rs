@@ -168,7 +168,7 @@ impl HostThreadCheckImpl for HostShared {
         std::thread::current().id() == self.owner
     }
 
-    /// Audio blocks and GUI calls share this thread in the prototype, so the
+    /// Audio blocks and GUI calls share this thread, so the
     /// owning thread is also the one that renders audio.
     fn is_audio_thread(&self) -> bool {
         std::thread::current().id() == self.owner

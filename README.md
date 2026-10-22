@@ -1,11 +1,11 @@
 # Replicant DAW
 
-A cyberpunk DAW prototype in Rust: a real-time hybrid synthesizer and stereo mix bus
+A cyberpunk Digital Audio Workstation (DAW) in Rust: real-time Surge XT wavetable synthesis and stereo mix bus
 driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.3.1** · MIT, Linux, macOS and Windows.
+**Version 1.3.2** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -15,7 +15,7 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 
 ![Instrument browser listing the plugins installed on the system](docs/instrument-browser.png)
 
-![NEURAL GEN XT hybrid synth editor](docs/synth.png)
+![SURGE WT SYNTH wavetable editor](docs/synth.png)
 
 ![Piano roll clip editor](docs/piano-roll.png)
 
@@ -27,36 +27,31 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 
 ![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
 
-## What's new in 1.3.1
+## What's new in 1.3.2
 
-- **A sample slot is an audio clip that loops.** Dropping a sample on a cell
-  hands it to the engine with `LOOP` on: it repeats to fill the clip's loop
-  region and restarts when that region wraps. Double-clicking the cell opens
-  the *clip* editor — loop handles, slot gain, launch, `EDIT SOURCE` — instead
-  of reopening the sampler. Right-click offers loop on/off, clip, source and
-  clear. The loop region and `LOOP` flag are saved with the project.
-- **`NEURAL GEN XT` replaces the two-operator FM voice.** A new hybrid engine
-  written from scratch for this DAW: two band-limited oscillators (sine,
-  triangle, saw, square, pulse, noise) with up to five unison voices each,
-  noise, two state-variable filters (12/24 dB low/high pass, band pass,
-  notch) with drive and key tracking, three ADSR envelopes, two LFOs
-  (sine/tri/saw/square/sample-and-hold), a six-slot bipolar modulation matrix,
-  glide, polyphony and 16 factory presets.
-
-  It follows the architecture of Surge XT, but it is **not a port of it**:
-  Surge XT is a very large C++ instrument and a literal 1:1 clone is out of
-  scope for this prototype. What is here is a complete, playable instrument
-  with the same signal-flow ideas, and it is cheap: tuning ratios, pan gains
-  and filter coefficients update at control rate and a bypassed filter costs
-  nothing, so `--selftest` renders the eight-track demo at ~20x realtime with
-  19 voices.
-- **The XT editor** puts the whole patch on one cyberpunk panel: oscillator
-  waves and tuning, filters with their response curves, envelopes, LFOs, the
-  modulation matrix and a master scope. The rack strip keeps the six controls
-  that matter most.
-- **Projects store XT patches** as parameter id/value pairs (format v8), so a
-  patch survives new parameters and older files load with the default patch
-  instead of failing.
+- **1:1 Surge XT Wavetable Architecture:** The included synthesizer now features
+  a dedicated wavetable oscillator engine with 10 morphing wavetable banks
+  (*Basic Shapes*, *Surge Classic*, *Vocal Formants*, *Cyber Metal*, *Harmonic Spectrum*,
+  *PWM Modern*, *Analog Warmth*, *Sub Drone*, *Resonance Sweep*, *Digital Acid*),
+  continuous multi-frame interpolation, real-time `MORPH` modulation via LFOs,
+  envelopes, and mod matrix (`OSC 1 MORPH` / `OSC 2 MORPH`), and an interactive
+  3D glowing wavetable visualizer in the editor.
+- **Ableton-Style Clip Workflow (Audio & MIDI):** Every matrix slot now seamlessly
+  supports both audio samples and MIDI clips. Double-clicking or right-clicking
+  provides immediate access to both the Piano Roll note editor and the Audio Clip
+  waveform/loop editor, with unified view switchers in both editors.
+- **Mutually Exclusive Instrument Selection:** The device chain below now clearly
+  and unambiguously presents `[ ⚡ SURGE WT SYNTH ]` and `[ 🔌 VST3 / CLAP ]`
+  with mutually exclusive activation per track. When a plugin is loaded or selected,
+  only the plugin controls are active and routed; when the built-in synth is selected,
+  only the synth is active and routed.
+- **UI Readability & HiDPI Scaling:** All base font sizes and widgets have been
+  scaled up for high-resolution displays. Default zoom is optimized for 1080p and
+  2K/1440p monitors, with zoom steps up to 200% via shortcuts (`Ctrl +` / `Ctrl -`)
+  or the menu bar.
+- **Production DAW Architecture:** Transitioned from prototype status to full
+  production digital audio workstation architecture with robust error recovery,
+  expanded serialization, and clean modular isolation.
 
 ## What's new in 1.3.0
 
@@ -554,9 +549,7 @@ The CI matrix runs tests and the self-test on Ubuntu, macOS and Windows. The
 release workflows cross-build both macOS architectures and publish packages for
 Linux, macOS and Windows on every tag (`.github/workflows/release-*.yml`).
 
-## Limitations / next steps
-
-This is a prototype, not a production DAW:
+## Architecture & roadmap
 
 - Plugin hosting is in-process: a crashing plugin takes the app down, and the
   plugin worker adds one block of latency. An out-of-process sandbox is the

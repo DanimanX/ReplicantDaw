@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use crate::audio::{
     db_to_gain, gain_to_db, AudioRuntime, Command, SCENE_COUNT, TRACKS, TRACK_COUNT,
@@ -251,11 +251,16 @@ pub fn draw_matrix(
                             theme::accent_alpha(theme::MAGENTA, 70)
                         },
                     );
+                    let badge_text = if has_clip {
+                        format!("AUDIO · {} + MIDI", sample.extension())
+                    } else {
+                        format!("AUDIO · {}", sample.extension())
+                    };
                     ui.painter().text(
                         Pos2::new(wave_rect.left(), wave_rect.top()),
                         Align2::LEFT_TOP,
-                        format!("SAMPLE · {}", sample.extension()),
-                        theme::display(5.8),
+                        badge_text,
+                        theme::display(7.5),
                         if clip_enabled {
                             theme::MAGENTA
                         } else {
@@ -394,33 +399,77 @@ pub fn draw_matrix(
             let mut edit_source = false;
             let mut clear_sample = false;
             let mut toggle_loop = false;
-            if let Some(slot) = state.sample_slot(track, scene) {
-                let looping = slot.loop_enabled;
-                response.context_menu(|ui| {
-                    if ui
-                        .button(format!("EDIT CLIP · SLOT {:02}", scene + 1))
-                        .clicked()
-                    {
+            let mut open_roll_menu = false;
+            let mut clear_notes = false;
+            let mut toggle_notes_active = false;
+
+            response.context_menu(|ui| {
+                ui.label(
+                    RichText::new(format!("TRK {:02} · SLOT {:02}", track + 1, scene + 1))
+                        .font(theme::mono(8.5))
+                        .color(accent),
+                );
+                if ui.button("🎹 OPEN PIANO ROLL (MIDI)").clicked() {
+                    open_roll_menu = true;
+                    ui.close();
+                }
+                if let Some(slot) = state.sample_slot(track, scene) {
+                    let looping = slot.loop_enabled;
+                    if ui.button("🌊 EDIT AUDIO CLIP").clicked() {
                         edit_clip = true;
                         ui.close();
                     }
-                    if ui
-                        .button(if looping { "LOOP: ON" } else { "LOOP: OFF" })
-                        .clicked()
-                    {
+                    if ui.button(if looping { "🔁 LOOP: ON" } else { "🔁 LOOP: OFF" }).clicked() {
                         toggle_loop = true;
                         ui.close();
                     }
-                    if ui.button("EDIT SOURCE SAMPLE").clicked() {
+                    if ui.button("🎛️ OPEN SAMPLER").clicked() {
                         edit_source = true;
                         ui.close();
                     }
-                    if ui.button("CLEAR SAMPLE").clicked() {
+                    if ui.button("🗑️ CLEAR SAMPLE").clicked() {
                         clear_sample = true;
                         ui.close();
                     }
+                }
+                if has_clip {
+                    if ui
+                        .button(if clip_enabled {
+                            "🔇 MUTE MIDI CLIP"
+                        } else {
+                            "🔊 UNMUTE MIDI CLIP"
+                        })
+                        .clicked()
+                    {
+                        toggle_notes_active = true;
+                        ui.close();
+                    }
+                    if ui.button("🗑️ CLEAR MIDI NOTES").clicked() {
+                        clear_notes = true;
+                        ui.close();
+                    }
+                }
+            });
+
+            if open_roll_menu {
+                state.selected_track = track;
+                studio.open_piano_roll(track, scene as u8);
+            }
+            if clear_notes {
+                state.clear_recorded(track, scene);
+                studio.roll_selected = None;
+                studio.roll_drag = None;
+                crate::studio::sync_track_notes(state, audio, track, scene);
+            }
+            if toggle_notes_active {
+                state.recorded_active[track][scene] = !clip_enabled;
+                let _ = audio.command_tx.push(Command::SetRecordedActive {
+                    track: track as u8,
+                    scene: scene as u8,
+                    active: state.recorded_active[track][scene],
                 });
             }
+
             if let Some(slot) = state.sample_slot(track, scene) {
                 if toggle_loop {
                     let enabled = !slot.loop_enabled;
@@ -441,20 +490,14 @@ pub fn draw_matrix(
 
             if response.double_clicked() && !dropped {
                 state.selected_track = track;
-                if sample.is_some() {
-                    // A sample slot is an audio clip: open its loop editor,
-                    // not the sampler that produced it.
+                let shift = ui.input(|i| i.modifiers.shift || i.modifiers.alt);
+                if shift {
+                    studio.open_piano_roll(track, scene as u8);
+                } else if sample.is_some() {
                     studio.open_sample_clip(track, scene);
                 } else {
                     studio.open_piano_roll(track, scene as u8);
                 }
-            } else if response.secondary_clicked() && has_clip && sample.is_none() {
-                state.recorded_active[track][scene] = !clip_enabled;
-                let _ = audio.command_tx.push(Command::SetRecordedActive {
-                    track: track as u8,
-                    scene: scene as u8,
-                    active: state.recorded_active[track][scene],
-                });
             } else if response.clicked() && !dropped {
                 if launched {
                     let _ = audio
@@ -694,11 +737,7 @@ fn draw_midi_row(
         let toggle_mute = !open_roll && response.clicked() && has_content;
         let select = response.clicked() || open_roll;
         if open_roll {
-            if sample.is_some() {
-                studio.open_sample_clip(track, scene);
-            } else {
-                studio.open_piano_roll(track, scene as u8);
-            }
+            studio.open_piano_roll(track, scene as u8);
         }
         if response.hovered() {
             if let Some(sample) = &sample {

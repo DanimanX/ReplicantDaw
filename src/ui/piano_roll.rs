@@ -29,7 +29,7 @@ pub fn draw(
     let scene = (studio.piano_roll_scene as usize).min(SCENE_COUNT - 1);
     let accent = theme::track_accent(track);
     egui::Window::new(format!(
-        "PIANO ROLL // TRACK {:02} {} // SLOT {:02}",
+        "CLIP EDITOR // PIANO ROLL // TRK {:02} {} // SLOT {:02}",
         track + 1,
         state.track_label(track),
         scene + 1
@@ -125,6 +125,22 @@ fn draw_header(
             studio.roll_drag = None;
         }
         let muted = !state.recorded_active[track][scene];
+        let has_sample = state.sample_clip(track, scene).is_some();
+        if has_sample {
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("🌊 VIEW AUDIO CLIP").font(theme::display(9.0)),
+                    )
+                    .fill(theme::accent_alpha(theme::MAGENTA, 45))
+                    .stroke(Stroke::new(1.0, theme::MAGENTA)),
+                )
+                .on_hover_text("Open the audio clip waveform and loop editor for this slot")
+                .clicked()
+            {
+                studio.open_sample_clip(track, scene);
+            }
+        }
         ui.label(
             egui::RichText::new(format!(
                 "{count} NOTE{plural}{muted}",

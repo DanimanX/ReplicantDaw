@@ -1,9 +1,9 @@
 [package]
 name = "replicant-daw"
-version = "1.3.1"
+version = "1.3.2"
 edition = "2021"
 rust-version = "1.85"
-description = "A cyberpunk DAW prototype: real-time FM synthesis and a neon interface."
+description = "A cyberpunk digital audio workstation: real-time Surge XT wavetable synthesis, VST3/CLAP hosting, and neon interface."
 license = "MIT"
 default-run = "replicant-daw"
 

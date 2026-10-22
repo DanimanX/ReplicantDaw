@@ -67,6 +67,7 @@ pub struct Studio {
     pub slot_pending: [bool; MAX_PLUGIN_SLOTS],
     /// Slots that had a plugin on the previous frame, used to notice loads.
     slot_loaded: [bool; MAX_PLUGIN_SLOTS],
+    pub plugin_sent: [bool; MAX_PLUGIN_SLOTS],
     pub selected_slot: usize,
 
     pub scan_results: Vec<PluginDescriptor>,
@@ -146,6 +147,7 @@ impl Studio {
             slots: std::array::from_fn(|_| None),
             slot_pending: [false; MAX_PLUGIN_SLOTS],
             slot_loaded: [false; MAX_PLUGIN_SLOTS],
+            plugin_sent: [false; MAX_PLUGIN_SLOTS],
             selected_slot: 0,
             scan_results: Vec::new(),
             scan_running: false,
@@ -1014,12 +1016,21 @@ impl Studio {
             }
             self.slot_loaded[track] = loaded;
 
-            let want_synth = state.instrument[track].synth_audible();
+            let want_synth = state.instrument[track] == crate::state::InstrumentSource::Synth;
             if state.synth_sent[track] != want_synth {
                 state.synth_sent[track] = want_synth;
                 let _ = audio.command_tx.push(Command::SetTrackSynth {
                     track: track as u8,
                     enabled: want_synth,
+                });
+            }
+
+            let want_plugin = state.instrument[track] == crate::state::InstrumentSource::Plugin && self.slots[track].is_some();
+            if self.plugin_sent[track] != want_plugin {
+                self.plugin_sent[track] = want_plugin;
+                let _ = audio.command_tx.push(Command::SetTrackPlugin {
+                    track: track as u8,
+                    active: want_plugin,
                 });
             }
         }
@@ -1058,12 +1069,12 @@ pub fn source_after_load(
     plugin_is_instrument: bool,
 ) -> crate::state::InstrumentSource {
     use crate::state::InstrumentSource;
-    match current {
-        InstrumentSource::Empty | InstrumentSource::Plugin if plugin_is_instrument => {
-            InstrumentSource::Plugin
-        }
-        InstrumentSource::Empty if !plugin_is_instrument => InstrumentSource::Empty,
-        other => other,
+    if plugin_is_instrument {
+        InstrumentSource::Plugin
+    } else if current == InstrumentSource::Plugin {
+        InstrumentSource::Empty
+    } else {
+        current
     }
 }
 

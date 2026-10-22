@@ -166,7 +166,7 @@ pub fn draw_menu_bar(ui: &mut Ui, rect: Rect, studio: &mut Studio, state: &mut U
 }
 
 /// Zoom presets available from the menu.
-pub const ZOOM_STEPS: [u32; 6] = [75, 90, 100, 110, 125, 150];
+pub const ZOOM_STEPS: [u32; 8] = [75, 90, 100, 115, 125, 150, 175, 200];
 
 fn next_zoom(current: u32) -> u32 {
     ZOOM_STEPS
@@ -185,7 +185,7 @@ fn previous_zoom(current: u32) -> u32 {
 
 /// Apply a UI scale and resize the window so the logical layout is preserved.
 pub fn set_zoom(ctx: &egui::Context, studio: &mut Studio, percent: u32) {
-    let zoom = (percent as f32 / 100.0).clamp(0.75, 1.5);
+    let zoom = (percent as f32 / 100.0).clamp(0.75, 2.0);
     if (studio.zoom - zoom).abs() < 0.001 {
         return;
     }

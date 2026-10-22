@@ -168,7 +168,7 @@ is planned.
 **A plugin fails to load.** The rack shows an error and the engine continues
 with the dry signal. Common causes: missing runtime libraries, a plugin built
 for another architecture, or a CLAP plugin that requires host extensions this
-prototype does not implement (for example a GUI or remote-control extension).
+DAW does not implement (for example a GUI or remote-control extension).
 
 **A plugin is silent.** Instruments only produce sound when they receive MIDI:
 connect a keyboard or use the on-screen keys, and verify **MIDI → PLUGINS** is

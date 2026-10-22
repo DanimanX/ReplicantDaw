@@ -28,7 +28,7 @@ pub const ENV_FILTER: usize = 1;
 pub const ENV_MOD: usize = 2;
 
 /// Destination slots of the modulation matrix.
-const DEST_COUNT: usize = 11;
+const DEST_COUNT: usize = 13;
 const DEST_PITCH: usize = 0;
 const DEST_OSC1_PITCH: usize = 1;
 const DEST_OSC2_PITCH: usize = 2;
@@ -40,6 +40,271 @@ const DEST_OSC1_LEVEL: usize = 7;
 const DEST_OSC2_LEVEL: usize = 8;
 const DEST_PAN: usize = 9;
 const DEST_DRIVE: usize = 10;
+const DEST_OSC1_MORPH: usize = 11;
+const DEST_OSC2_MORPH: usize = 12;
+
+pub const WAVETABLE_COUNT: usize = 10;
+pub const WT_FRAMES: usize = 5;
+pub const WT_SIZE: usize = 256;
+
+pub const WAVETABLE_NAMES: [&str; WAVETABLE_COUNT] = [
+    "BASIC SHAPES",
+    "SURGE CLASSIC",
+    "VOCAL FORMANTS",
+    "CYBER METAL",
+    "HARMONIC SPECTRUM",
+    "PWM MODERN",
+    "ANALOG WARMTH",
+    "SUB DRONE",
+    "RESONANCE SWEEP",
+    "DIGITAL ACID",
+];
+
+static WAVETABLE_BANK: std::sync::OnceLock<[[[f32; WT_SIZE]; WT_FRAMES]; WAVETABLE_COUNT]> =
+    std::sync::OnceLock::new();
+
+fn init_wavetable_bank() -> [[[f32; WT_SIZE]; WT_FRAMES]; WAVETABLE_COUNT] {
+    let mut bank = [[[0.0_f32; WT_SIZE]; WT_FRAMES]; WAVETABLE_COUNT];
+    for table_idx in 0..WAVETABLE_COUNT {
+        for frame_idx in 0..WT_FRAMES {
+            let mut max_abs = 0.0_f32;
+            for sample_idx in 0..WT_SIZE {
+                let t = sample_idx as f32 / WT_SIZE as f32;
+                let val = generate_raw_wt_sample(table_idx, frame_idx, t);
+                bank[table_idx][frame_idx][sample_idx] = val;
+                max_abs = max_abs.max(val.abs());
+            }
+            if max_abs > 1.0e-5 {
+                let norm = 0.98 / max_abs;
+                for sample_idx in 0..WT_SIZE {
+                    bank[table_idx][frame_idx][sample_idx] *= norm;
+                }
+            }
+        }
+    }
+    bank
+}
+
+fn generate_raw_wt_sample(table: usize, frame: usize, t: f32) -> f32 {
+    match table {
+        // Table 0: Basic Shapes (Sine -> Triangle -> Saw -> Square -> Pulse)
+        0 => match frame {
+            0 => fast_sine(t),
+            1 => 1.0 - 4.0 * (t - 0.5).abs(),
+            2 => {
+                let mut s = 0.0;
+                for k in 1..=16 {
+                    let kf = k as f32;
+                    s += (kf * TAU * t).sin() / kf;
+                }
+                -2.0 / PI * s
+            }
+            3 => {
+                let mut s = 0.0;
+                for k in (1..=23).step_by(2) {
+                    let kf = k as f32;
+                    s += (kf * TAU * t).sin() / kf;
+                }
+                4.0 / PI * s
+            }
+            _ => {
+                if t < 0.20 {
+                    1.0
+                } else {
+                    -0.25
+                }
+            }
+        },
+        // Table 1: Surge Classic (Warm fundamental harmonics sweeping into multi-peak spectral)
+        1 => match frame {
+            0 => (TAU * t).sin() + 0.45 * (2.0 * TAU * t).sin(),
+            1 => {
+                0.7 * (TAU * t).sin()
+                    + 0.5 * (2.0 * TAU * t).sin()
+                    + 0.35 * (3.0 * TAU * t).sin()
+                    + 0.2 * (4.0 * TAU * t).sin()
+            }
+            2 => {
+                (TAU * t).sin()
+                    + 0.6 * (3.0 * TAU * t).sin()
+                    + 0.4 * (5.0 * TAU * t).sin()
+                    + 0.3 * (7.0 * TAU * t).sin()
+            }
+            3 => {
+                let mut s = 0.0;
+                for k in 1..=14 {
+                    let f = k as f32;
+                    let boost = 1.0 / (1.0 + (f - 6.0).powi(2) * 0.4);
+                    s += (f * TAU * t).sin() * (1.0 / f + boost * 0.85);
+                }
+                s
+            }
+            _ => {
+                let mut s = 0.0;
+                for k in 1..=16 {
+                    let f = k as f32;
+                    let b1 = 1.0 / (1.0 + (f - 4.0).powi(2) * 0.5);
+                    let b2 = 1.0 / (1.0 + (f - 11.0).powi(2) * 0.5);
+                    s += (f * TAU * t).sin() * (0.6 / f + b1 * 0.9 + b2 * 0.7);
+                }
+                s
+            }
+        },
+        // Table 2: Vocal Formants (/a/ -> /e/ -> /i/ -> /o/ -> /u/)
+        2 => {
+            let (f1_center, f2_center) = match frame {
+                0 => (8.0, 12.0),
+                1 => (5.0, 18.0),
+                2 => (3.0, 23.0),
+                3 => (5.0, 9.0),
+                _ => (3.0, 8.0),
+            };
+            let mut s = 0.0;
+            for k in 1..=24 {
+                let f = k as f32;
+                let b1 = 1.0 / (1.0 + (f - f1_center).powi(2) * 0.5);
+                let b2 = 1.0 / (1.0 + (f - f2_center).powi(2) * 0.5);
+                s += (f * TAU * t).sin() * (b1 * 1.0 + b2 * 0.75 + 0.15 / f);
+            }
+            s
+        }
+        // Table 3: Cyber Metal (Inharmonic partials & FM bell-like textures)
+        3 => match frame {
+            0 => (TAU * t).sin() + 0.65 * (2.76 * TAU * t).sin() + 0.35 * (5.40 * TAU * t).sin(),
+            1 => {
+                (TAU * t).sin()
+                    + 0.55 * (1.414 * TAU * t).sin()
+                    + 0.4 * (3.141 * TAU * t).sin()
+                    + 0.25 * (4.2 * TAU * t).sin()
+            }
+            2 => (TAU * t).sin() + 0.7 * (3.75 * TAU * t).sin() + 0.5 * (6.33 * TAU * t).sin(),
+            3 => (TAU * t + 1.8 * (2.0 * TAU * t).sin()).sin(),
+            _ => (TAU * t + 3.2 * (3.0 * TAU * t).sin()).sin(),
+        },
+        // Table 4: Harmonic Spectrum (Additive partial sweeps)
+        4 => {
+            let max_harmonic = match frame {
+                0 => 1,
+                1 => 4,
+                2 => 8,
+                3 => 12,
+                _ => 16,
+            };
+            let mut s = 0.0;
+            for k in 1..=max_harmonic {
+                let f = k as f32;
+                let amp = if frame == 4 {
+                    1.0 / f.sqrt()
+                } else {
+                    1.0 / f
+                };
+                s += (f * TAU * t).sin() * amp;
+            }
+            s
+        }
+        // Table 5: PWM Modern (50% square down to 10% needle pulse)
+        5 => {
+            let duty = match frame {
+                0 => 0.50,
+                1 => 0.40,
+                2 => 0.30,
+                3 => 0.20,
+                _ => 0.10,
+            };
+            if t < duty {
+                1.0 - duty
+            } else {
+                -duty
+            }
+        }
+        // Table 6: Analog Warmth (Overdriven analog shapes)
+        6 => match frame {
+            0 => ((TAU * t).sin() * 2.0).tanh() + 0.18 * (2.0 * TAU * t).cos(),
+            1 => ((1.0 - 4.0 * (t - 0.5).abs()) * 2.2).tanh(),
+            2 => (2.0 * t - 1.0) + 0.35 * (2.0 * t - 1.0).powi(2),
+            3 => ((2.0 * t - 1.0) * 2.5).clamp(-0.85, 0.85),
+            _ => {
+                let wave = (TAU * t).sin() * 2.5;
+                if wave > 1.0 {
+                    2.0 - wave
+                } else if wave < -1.0 {
+                    -2.0 - wave
+                } else {
+                    wave
+                }
+            }
+        },
+        // Table 7: Sub Drone (Heavy deep foundations)
+        7 => match frame {
+            0 => (TAU * t).sin() + 0.5 * (0.5 * TAU * t).sin(),
+            1 => (TAU * t).sin() + 0.35 * (3.0 * TAU * t).sin() + 0.4 * (0.5 * TAU * t).sin(),
+            2 => (1.0 - 4.0 * (t - 0.5).abs()) + 0.4 * (TAU * t).sin(),
+            3 => {
+                let mut s = 0.0;
+                for k in 1..=6 {
+                    let f = k as f32;
+                    s += (f * TAU * t).sin() / (f * f);
+                }
+                s
+            }
+            _ => ((TAU * t).sin() * 3.2).tanh(),
+        },
+        // Table 8: Resonance Sweep (Resonant harmonic peak moving up)
+        8 => {
+            let peak_harmonic = match frame {
+                0 => 2.0,
+                1 => 4.0,
+                2 => 7.0,
+                3 => 10.0,
+                _ => 14.0,
+            };
+            let mut s = 0.0;
+            for k in 1..=18 {
+                let f = k as f32;
+                let res = 1.0 / (1.0 + (f - peak_harmonic).powi(2) * 0.6);
+                s += (f * TAU * t).sin() * (0.2 / f + res * 1.2);
+            }
+            s
+        }
+        // Table 9: Digital Acid (Aggressive sync-morph wave)
+        _ => match frame {
+            0 => 2.0 * t - 1.0 + 0.4 * (3.0 * TAU * t).sin(),
+            1 => (t * 1.5).fract() * 2.0 - 1.0,
+            2 => (t * 2.2).fract() * 2.0 - 1.0,
+            3 => (t * 3.0 * PI).sin().abs() * 2.0 - 1.0,
+            _ => ((t * 3.7).fract() * 2.0 - 1.0) * (1.0 - t * 0.7),
+        },
+    }
+}
+
+pub fn sample_wavetable(table: usize, morph: f32, phase: f32, _increment: f32) -> f32 {
+    let bank = WAVETABLE_BANK.get_or_init(init_wavetable_bank);
+    let table = table.min(WAVETABLE_COUNT - 1);
+    let morph = morph.clamp(0.0, 1.0);
+    let f_pos = morph * (WT_FRAMES - 1) as f32;
+    let f0 = (f_pos.floor() as usize).min(WT_FRAMES - 2);
+    let f1 = f0 + 1;
+    let f_frac = f_pos - f0 as f32;
+
+    let p = phase.fract() * WT_SIZE as f32;
+    let p0 = (p.floor() as usize) % WT_SIZE;
+    let p1 = (p0 + 1) % WT_SIZE;
+    let p_frac = p - p0 as f32;
+
+    let s0 = (1.0 - p_frac) * bank[table][f0][p0] + p_frac * bank[table][f0][p1];
+    let s1 = (1.0 - p_frac) * bank[table][f1][p0] + p_frac * bank[table][f1][p1];
+
+    (1.0 - f_frac) * s0 + f_frac * s1
+}
+
+pub fn get_wavetable_frame_preview(table: usize, morph: f32, points: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(points);
+    for i in 0..points {
+        let phase = i as f32 / points as f32;
+        out.push(sample_wavetable(table, morph, phase, 0.01));
+    }
+    out
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Waveform {
@@ -50,16 +315,18 @@ pub enum Waveform {
     Square,
     Pulse,
     Noise,
+    Wavetable,
 }
 
 impl Waveform {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Sine,
         Self::Triangle,
         Self::Saw,
         Self::Square,
         Self::Pulse,
         Self::Noise,
+        Self::Wavetable,
     ];
 
     pub fn label(self) -> &'static str {
@@ -70,6 +337,7 @@ impl Waveform {
             Self::Square => "SQR",
             Self::Pulse => "PULSE",
             Self::Noise => "NOISE",
+            Self::Wavetable => "WT",
         }
     }
 
@@ -81,6 +349,7 @@ impl Waveform {
             Self::Square => "square",
             Self::Pulse => "pulse",
             Self::Noise => "noise",
+            Self::Wavetable => "wavetable",
         }
     }
 
@@ -91,6 +360,7 @@ impl Waveform {
             "square" => Self::Square,
             "pulse" => Self::Pulse,
             "noise" => Self::Noise,
+            "wavetable" => Self::Wavetable,
             _ => Self::Sine,
         }
     }
@@ -297,10 +567,12 @@ pub enum ModDest {
     Osc2Level,
     Pan,
     Drive,
+    Osc1Morph,
+    Osc2Morph,
 }
 
 impl ModDest {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::Off,
         Self::Pitch,
         Self::Osc1Pitch,
@@ -313,6 +585,8 @@ impl ModDest {
         Self::Osc2Level,
         Self::Pan,
         Self::Drive,
+        Self::Osc1Morph,
+        Self::Osc2Morph,
     ];
 
     pub fn label(self) -> &'static str {
@@ -329,6 +603,8 @@ impl ModDest {
             Self::Osc2Level => "OSC 2 LEVEL",
             Self::Pan => "PAN",
             Self::Drive => "DRIVE",
+            Self::Osc1Morph => "OSC 1 MORPH",
+            Self::Osc2Morph => "OSC 2 MORPH",
         }
     }
 
@@ -346,6 +622,8 @@ impl ModDest {
             Self::Osc2Level => "osc2_level",
             Self::Pan => "pan",
             Self::Drive => "drive",
+            Self::Osc1Morph => "osc1_morph",
+            Self::Osc2Morph => "osc2_morph",
         }
     }
 
@@ -374,6 +652,8 @@ impl ModDest {
             Self::Osc2Level => Some(DEST_OSC2_LEVEL),
             Self::Pan => Some(DEST_PAN),
             Self::Drive => Some(DEST_DRIVE),
+            Self::Osc1Morph => Some(DEST_OSC1_MORPH),
+            Self::Osc2Morph => Some(DEST_OSC2_MORPH),
         }
     }
 }
@@ -382,6 +662,8 @@ impl ModDest {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OscParams {
     pub wave: Waveform,
+    pub table: f32,
+    pub morph: f32,
     pub octave: f32,
     pub semitone: f32,
     pub fine: f32,
@@ -395,7 +677,9 @@ pub struct OscParams {
 impl Default for OscParams {
     fn default() -> Self {
         Self {
-            wave: Waveform::Saw,
+            wave: Waveform::Wavetable,
+            table: 1.0,
+            morph: 0.35,
             octave: 0.0,
             semitone: 0.0,
             fine: 0.0,
@@ -529,6 +813,8 @@ impl Default for SynthXt {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SynthParam {
     OscWave(u8),
+    OscTable(u8),
+    OscMorph(u8),
     OscOctave(u8),
     OscSemitone(u8),
     OscFine(u8),
@@ -565,10 +851,12 @@ impl SynthParam {
     /// Every parameter, in panel order. Built on the UI thread, never in the
     /// audio callback.
     pub fn all() -> Vec<Self> {
-        let mut params = Vec::with_capacity(80);
+        let mut params = Vec::with_capacity(84);
         for osc in 0..OSC_COUNT as u8 {
             params.extend([
                 Self::OscWave(osc),
+                Self::OscTable(osc),
+                Self::OscMorph(osc),
                 Self::OscOctave(osc),
                 Self::OscSemitone(osc),
                 Self::OscFine(osc),
@@ -617,6 +905,8 @@ impl SynthParam {
     pub fn label(self) -> String {
         match self {
             Self::OscWave(i) => format!("OSC {} WAVE", i + 1),
+            Self::OscTable(i) => format!("OSC {} TABLE", i + 1),
+            Self::OscMorph(i) => format!("OSC {} MORPH", i + 1),
             Self::OscOctave(i) => format!("OSC {} OCT", i + 1),
             Self::OscSemitone(i) => format!("OSC {} SEMI", i + 1),
             Self::OscFine(i) => format!("OSC {} FINE", i + 1),
@@ -654,6 +944,8 @@ impl SynthParam {
     pub fn id(self) -> String {
         match self {
             Self::OscWave(i) => format!("osc{}.wave", i + 1),
+            Self::OscTable(i) => format!("osc{}.table", i + 1),
+            Self::OscMorph(i) => format!("osc{}.morph", i + 1),
             Self::OscOctave(i) => format!("osc{}.octave", i + 1),
             Self::OscSemitone(i) => format!("osc{}.semitone", i + 1),
             Self::OscFine(i) => format!("osc{}.fine", i + 1),
@@ -695,6 +987,8 @@ impl SynthParam {
     pub fn range(self) -> (f32, f32) {
         match self {
             Self::OscWave(_) => (0.0, (Waveform::ALL.len() - 1) as f32),
+            Self::OscTable(_) => (0.0, (WAVETABLE_COUNT - 1) as f32),
+            Self::OscMorph(_) => (0.0, 1.0),
             Self::OscOctave(_) => (-3.0, 3.0),
             Self::OscSemitone(_) => (-12.0, 12.0),
             Self::OscFine(_) => (-50.0, 50.0),
@@ -743,6 +1037,11 @@ impl SynthParam {
     pub fn format(self, value: f32) -> String {
         match self {
             Self::OscWave(_) => Waveform::from_index(value).label().to_string(),
+            Self::OscTable(_) => {
+                let idx = (value.round() as usize).min(WAVETABLE_COUNT - 1);
+                WAVETABLE_NAMES[idx].to_string()
+            }
+            Self::OscMorph(_) => format!("{:.0}%", (value * 100.0).clamp(0.0, 100.0)),
             Self::OscOctave(_) => format!("{:+.0}", value),
             Self::OscSemitone(_) => format!("{:+.0}", value),
             Self::OscFine(_) => format!("{:+.0}c", value),
@@ -808,7 +1107,21 @@ impl SynthParam {
     /// Value used when the user double-clicks a knob.
     pub fn default_value(self) -> f32 {
         match self {
-            Self::OscWave(_) => 2.0,
+            Self::OscWave(_) => 6.0, // Default to Wavetable!
+            Self::OscTable(i) => {
+                if i == 0 {
+                    1.0 // Surge Classic
+                } else {
+                    0.0 // Basic Shapes
+                }
+            }
+            Self::OscMorph(i) => {
+                if i == 0 {
+                    0.35
+                } else {
+                    0.50
+                }
+            }
             Self::OscOctave(_) | Self::OscSemitone(_) | Self::OscFine(_) => 0.0,
             Self::OscLevel(_) => 0.75,
             Self::OscPan(_) | Self::OscPhase(_) => 0.0,
@@ -848,6 +1161,8 @@ impl SynthXt {
     pub fn get(&self, param: SynthParam) -> f32 {
         match param {
             SynthParam::OscWave(i) => index_of(&Waveform::ALL, self.osc(i).wave),
+            SynthParam::OscTable(i) => self.osc(i).table,
+            SynthParam::OscMorph(i) => self.osc(i).morph,
             SynthParam::OscOctave(i) => self.osc(i).octave,
             SynthParam::OscSemitone(i) => self.osc(i).semitone,
             SynthParam::OscFine(i) => self.osc(i).fine,
@@ -904,6 +1219,8 @@ impl SynthXt {
         let value = value.clamp(min, max);
         match param {
             SynthParam::OscWave(i) => self.osc_mut(i).wave = Waveform::from_index(value),
+            SynthParam::OscTable(i) => self.osc_mut(i).table = value.round(),
+            SynthParam::OscMorph(i) => self.osc_mut(i).morph = value,
             SynthParam::OscOctave(i) => self.osc_mut(i).octave = value.round(),
             SynthParam::OscSemitone(i) => self.osc_mut(i).semitone = value.round(),
             SynthParam::OscFine(i) => self.osc_mut(i).fine = value,
@@ -1870,10 +2187,20 @@ impl Voice {
                     DEST_OSC2_LEVEL
                 }];
             let gain = gain.clamp(0.0, 1.5) / (unison as f32).sqrt();
+            let morph_mod = mods[if osc_index == 0 {
+                DEST_OSC1_MORPH
+            } else {
+                DEST_OSC2_MORPH
+            }];
+            let effective_morph = (osc.morph + morph_mod).clamp(0.0, 1.0);
             for voice_index in 0..unison {
                 let increment = self.freq * self.ratio[osc_index][voice_index] * inv_rate;
                 let phase = self.phases[osc_index][voice_index];
-                let value = oscillator(osc.wave, phase, increment, &mut self.rng);
+                let value = if osc.wave == Waveform::Wavetable {
+                    sample_wavetable(osc.table as usize, effective_morph, phase, increment)
+                } else {
+                    oscillator(osc.wave, phase, increment, &mut self.rng)
+                };
                 self.phases[osc_index][voice_index] = (phase + increment).fract();
                 let (pan_l, pan_r) = self.pan[osc_index][voice_index];
                 left += value * gain * pan_l;
@@ -1994,6 +2321,7 @@ fn oscillator(wave: Waveform, phase: f32, increment: f32, rng: &mut u32) -> f32 
             *rng = x;
             (x as f32 / u32::MAX as f32) * 2.0 - 1.0
         }
+        Waveform::Wavetable => sample_wavetable(0, 0.5, phase, dt),
     }
 }
 

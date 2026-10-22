@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.0.4** · MIT · Linux, macOS and Windows.
+**Version 1.0.5** · MIT · Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -21,6 +21,14 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Per-track plugin rack hosting a real CLAP instrument](docs/plugins.png)
 
 ![Plugin editor at full screen](docs/plugin-editor.png)
+
+## Fixes in 1.0.5
+
+- **Windows build** — the 1.0.4 release failed its Windows self-test with a
+  stack overflow. Session clips now live in a heap-allocated grid, which takes
+  `Engine` from ~260 KiB back to ~70 KiB and keeps the whole app inside the
+  1 MiB main-thread stack Windows provides. A regression test now fails if the
+  struct grows past 128 KiB or if four engines cannot run on a 1 MiB stack.
 
 ## What's new in 1.0.4
 
@@ -324,7 +332,7 @@ Keystation 49 MK3 MIDI keyboard, and third-party plugins already installed:
 
 ```
 $ cargo test
-test result: ok. 86 passed; 0 failed
+test result: ok. 87 passed; 0 failed
 
 $ cargo clippy --all-targets -- -D warnings
 Finished

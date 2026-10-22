@@ -22,6 +22,22 @@ pub const LOOP_BARS: u64 = 16;
 pub const DEFAULT_BPM: f32 = 142.0;
 pub const SAMPLE_RATE: u32 = 48_000;
 
+/// Flat index of one session clip inside [`Engine::recorded`].
+#[inline]
+fn clip_index(track: usize, scene: usize) -> usize {
+    track.min(TRACK_COUNT - 1) * SCENE_COUNT + scene.min(SCENE_COUNT - 1)
+}
+
+/// Heap-allocated grid of empty session clips.
+///
+/// Built through `Vec` so the big array is never materialised on the stack,
+/// which matters on Windows' 1 MiB main-thread stack.
+fn empty_clip_grid() -> Box<[RecordedClip]> {
+    let mut clips = Vec::with_capacity(TRACK_COUNT * SCENE_COUNT);
+    clips.resize_with(TRACK_COUNT * SCENE_COUNT, RecordedClip::default);
+    clips.into_boxed_slice()
+}
+
 struct TrackState {
     gain: Smoothed,
     pan: Smoothed,
@@ -90,8 +106,12 @@ pub struct Engine {
     cpu_load: f32,
     midi_rx: Option<Consumer<MidiMessage>>,
     record_tx: Option<Producer<RecordEvent>>,
-    /// One MIDI clip per (track, session slot).
-    recorded: [[RecordedClip; SCENE_COUNT]; TRACK_COUNT],
+    /// One MIDI clip per (track, session slot), flattened on the heap.
+    ///
+    /// An inline `[[RecordedClip; 8]; 8]` is ~190 KiB, which made `Engine`
+    /// exceed the 1 MiB main-thread stack Windows gives a process as soon as
+    /// the selftest created a few engines. `clip_index` keeps the addressing.
+    recorded: Box<[RecordedClip]>,
     recorded_active: [[bool; SCENE_COUNT]; TRACK_COUNT],
     recording: bool,
     record_track: u8,
@@ -169,7 +189,7 @@ impl Engine {
             cpu_load: 0.0,
             midi_rx: io.midi,
             record_tx: io.record_events,
-            recorded: [[RecordedClip::default(); SCENE_COUNT]; TRACK_COUNT],
+            recorded: empty_clip_grid(),
             recorded_active: [[true; SCENE_COUNT]; TRACK_COUNT],
             recording: false,
             record_track: 0,
@@ -506,13 +526,10 @@ impl Engine {
             recording: self.recording,
             record_track: self.record_track,
             recorded_notes: if self.recording {
-                self.recorded[self.record_track as usize][self.record_scene as usize].len
+                self.clip(self.record_track as usize, self.record_scene as usize)
+                    .len
             } else {
-                self.recorded
-                    .iter()
-                    .flat_map(|slots| slots.iter())
-                    .map(|clip| clip.len)
-                    .sum()
+                self.recorded.iter().map(|clip| clip.len).sum()
             },
             plugin_latency: self.plugin_latency,
         };
@@ -616,7 +633,7 @@ impl Engine {
                 // Recording goes into the slot that is playing on this track.
                 self.tracks[track].scene = scene;
                 self.tracks[track].active = true;
-                self.recorded[track][scene].clear();
+                self.clip_mut(track, scene).clear();
                 self.recording = true;
                 self.record_pending = None;
                 if !self.playing {
@@ -631,13 +648,13 @@ impl Engine {
             Command::ClearRecorded { track, scene } => {
                 let track = (track as usize).min(TRACK_COUNT - 1);
                 let scene = (scene as usize).min(SCENE_COUNT - 1);
-                self.recorded[track][scene].clear();
+                self.clip_mut(track, scene).clear();
                 self.emit_record_reset(track as u8, scene as u8);
             }
             Command::SetRecordedClip { track, scene, clip } => {
                 let track = (track as usize).min(TRACK_COUNT - 1);
                 let scene = (scene as usize).min(SCENE_COUNT - 1);
-                self.recorded[track][scene] = clip;
+                *self.clip_mut(track, scene) = clip;
             }
             Command::SetPluginMidi { enabled } => {
                 self.plugin_midi = enabled;
@@ -814,7 +831,7 @@ impl Engine {
 
             // Recorded MIDI replaces the generative pattern for this slot.
             let scene = self.tracks[track].scene.min(SCENE_COUNT - 1);
-            let clip = self.recorded[track][scene];
+            let clip = *self.clip(track, scene);
             if !clip.is_empty() {
                 if !self.recorded_active[track][scene] {
                     continue;
@@ -972,11 +989,7 @@ impl Engine {
         let track = self.record_track as usize;
         let scene = self.record_scene as usize;
 
-        if let Some(slots) = self.recorded.get_mut(track) {
-            if let Some(clip) = slots.get_mut(scene) {
-                clip.push(pending);
-            }
-        }
+        self.clip_mut(track, scene).push(pending);
         self.emit_record_note(track as u8, self.record_scene, pending, false);
     }
 
@@ -1013,7 +1026,19 @@ impl Engine {
 
     /// Currently recorded clip for one session slot (tests and diagnostics).
     pub fn recorded_clip(&self, track: usize, scene: usize) -> &RecordedClip {
-        &self.recorded[track.min(TRACK_COUNT - 1)][scene.min(SCENE_COUNT - 1)]
+        self.clip(track, scene)
+    }
+
+    /// Address one session clip. Out-of-range indices clamp to the last slot.
+    #[inline]
+    fn clip(&self, track: usize, scene: usize) -> &RecordedClip {
+        &self.recorded[clip_index(track, scene)]
+    }
+
+    #[inline]
+    fn clip_mut(&mut self, track: usize, scene: usize) -> &mut RecordedClip {
+        let index = clip_index(track, scene);
+        &mut self.recorded[index]
     }
 
     pub fn is_recording(&self) -> bool {
@@ -1087,6 +1112,39 @@ mod tests {
         let mut buffer = vec![0.0; frames * 2];
         engine.process(&mut buffer);
         buffer
+    }
+
+    /// The Windows main thread gets a 1 MiB stack, and the selftest plus
+    /// project load keep several engines alive at once.
+    #[test]
+    fn engine_fits_a_windows_sized_stack() {
+        let size = std::mem::size_of::<Engine>();
+        assert!(
+            size < 128 * 1024,
+            "Engine grew to {size} bytes; keep large state on the heap"
+        );
+
+        let handle = std::thread::Builder::new()
+            .name("engine-stack-check".into())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                // Four *stack* locals, mirroring `selftest` and project load.
+                let mut a = Engine::offline(48_000.0);
+                let mut b = Engine::offline(48_000.0);
+                let mut c = Engine::offline(48_000.0);
+                let mut d = Engine::offline(48_000.0);
+                let mut buffer = vec![0.0_f32; 4_096];
+                let mut engines = [&mut a, &mut b, &mut c, &mut d];
+                let mut ok = true;
+                for engine in engines.iter_mut() {
+                    engine.apply(Command::Play);
+                    engine.process(&mut buffer);
+                    ok &= engine.is_playing() && engine.effect_count() == 4;
+                }
+                ok
+            })
+            .expect("spawn stack-check thread");
+        assert!(handle.join().expect("engine thread panicked"));
     }
 
     #[test]

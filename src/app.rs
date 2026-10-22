@@ -113,8 +113,21 @@ impl ReplicantApp {
                     "browser" => studio.browser_open = true,
                     "synth" => studio.synth_open = true,
                     "add" => state.add_effect_open = true,
-                    "piano" => studio.piano_roll_open = true,
+                    "piano" => {
+                        studio.piano_roll_open = true;
+                        studio.piano_roll_track = state.selected_track;
+                        studio.piano_roll_scene = state.launched[state.selected_track].unwrap_or(0);
+                    }
                     "audio" => studio.audio_editor_open = true,
+                    "plugined" => {
+                        studio.plugin_editor_track = state.selected_track;
+                        studio.plugin_editor_open = true;
+                    }
+                    "fullscreen" => studio.plugin_editor_fullscreen = true,
+                    "rename" => {
+                        studio.rename_track = Some(state.selected_track);
+                        studio.rename_buffer = state.track_label(state.selected_track).to_string();
+                    }
                     _ => {}
                 }
             }
@@ -171,6 +184,8 @@ impl ReplicantApp {
 
     fn pump_audio(&mut self, dt: f32) {
         self.studio.pump();
+        self.studio
+            .sync_instrument_sources(&mut self.state, &mut self.audio);
 
         while let Ok(event) = self.record_rx.pop() {
             self.state.apply_record_event(event);
@@ -222,6 +237,10 @@ impl ReplicantApp {
         }
         if zoom_reset {
             ui::studio_windows::zoom_step(ctx, &mut self.studio, 0);
+        }
+        if self.studio.plugin_editor_open && ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            self.studio.plugin_editor_fullscreen = !self.studio.plugin_editor_fullscreen;
+            ctx.request_repaint();
         }
         if save {
             match self.studio.save_project(&self.state) {
@@ -308,7 +327,13 @@ impl ReplicantApp {
             &mut self.studio,
             &mut self.audio,
         );
-        ui::session::draw_mixer(ui, mixer_rect, &mut self.state, &mut self.audio);
+        ui::session::draw_mixer(
+            ui,
+            mixer_rect,
+            &mut self.state,
+            &mut self.studio,
+            &mut self.audio,
+        );
         ui::lanes::draw_lanes(ui, tracks_rect, &mut self.state, &mut self.studio);
         ui::lanes::draw_fft(ui, fft_rect, &mut self.state);
         ui::devices::draw(

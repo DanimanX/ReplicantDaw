@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.0.3** · MIT · Linux, macOS and Windows.
+**Version 1.0.4** · MIT · Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -18,27 +18,30 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 
 ![Piano roll clip editor](docs/piano-roll.png)
 
-![Plugin rack hosting a real VST3 instrument](docs/plugins.png)
+![Per-track plugin rack hosting a real CLAP instrument](docs/plugins.png)
 
-## What's new in 1.0.3
+![Plugin editor at full screen](docs/plugin-editor.png)
 
-- **Piano roll clip editor** — double-click any clip cell in the session matrix
-  (or the MIDI row) to open a 16-bar piano roll. Click the grid to add notes,
-  drag the body to move them, drag the right edge to change length, right-click
-  to delete, and edit velocity per note. Edits are sent to the engine and saved
-  with the project.
-- **Arrangement editing** — double-click a MIDI clip in the arrangement to open
-  the same piano roll, or double-click an audio clip/lane to open the audio clip
-  editor with waveform, clip gain, fade-in and fade-out. The envelope is applied
-  to the rendered track audio and persisted in the project.
-- **Per-track plugin inserts** — the device chain now includes a `PLUGIN INSERT`
-  module for the selected track. Load a CLAP or VST3 plugin there (or from the
-  rack/browser) and it stays assigned to that track, before the master effect
-  chain. The rack shows all eight track inserts and their parameter knobs.
-- **Donation button** — a `DONATE` control in the menu bar opens the same
-  PayPal page used by the other Replicant projects.
-- **Project format v3** — stores per-track plugin assignments and audio-clip
-  envelopes. v1/v2 projects still load with neutral defaults.
+## What's new in 1.0.4
+
+- **Independent session clips** — every one of the 8 × 8 slots now owns its own
+  MIDI clip. Programming a slot no longer copies the pattern to the slots below
+  it; each slot can be empty, hold generative material, or hold its own MIDI
+  clip, and the piano roll switches slots with a selector.
+- **Editable track names** — double-click a track name in the session header,
+  mixer strip or arrangement gutter to rename it. Names appear everywhere and
+  are saved in the project.
+- **Instrument slot** — the device chain starts with a single `INSTRUMENT`
+  module: `FM` plays the internal `NEURAL GEN V5` synth, `PLUGIN` plays the
+  hosted CLAP/VST3 instrument, and loading an instrument plugin takes over the
+  track automatically. Sequencer and recorded MIDI now reach the plugin insert
+  too, including note-offs.
+- **Full-screen plugin editor** — open any track insert in a large parameter
+  editor and press `FULLSCREEN` (or `Esc` to restore). Plugin parameters can be
+  filtered by name.
+- **Project format v4** — stores per-slot MIDI clips, track names and the
+  instrument-slot choice. v3 files migrate their single clip into the slot they
+  played from; v1/v2 files still load.
 
 ## Features
 
@@ -48,6 +51,12 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
   - UI thread: `eframe` + `egui` with the `wgpu` renderer.
   - Lock-free SPSC `rtrb` rings for commands, telemetry, scope samples, MIDI,
     recording events and plugin audio blocks.
+- **Instrument slots**
+  - Each track has one instrument slot: internal 2-op FM synth or a hosted
+    CLAP/VST3 instrument.
+  - Loading an instrument plugin mutes the internal synth for that track;
+    effect plugins stay inserts and keep the synth audible.
+  - Full-screen parameter editor per insert, with a name filter.
 - **Synthesis**
   - 8 tracks with a 32-voice polyphonic two-operator FM engine.
   - Per-track editable FM ratio, modulation index and ADSR envelope.
@@ -65,19 +74,25 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
   - Live MIDI input through `midir` (ALSA, CoreMIDI, WinMM), with rescan and
     device selection.
   - Arm a track, hit `REC`, and play: notes are captured at 16th-note
-    resolution into a clip that replaces the generative pattern for that track.
+    resolution into the track's launched session slot, replacing its generative
+    pattern. Other slots keep their own material.
   - An on-screen two-octave keyboard feeds the same MIDI path, so the workflow
     is testable without hardware.
   - Clips are visible in the session matrix and the arrangement, and can be
     muted without deleting them.
 - **Piano roll and audio clip editing**
-  - Double-click a session or arrangement clip to program MIDI on its track.
+  - Double-click a session or arrangement clip to program MIDI for that slot.
   - 16-bar grid at 16th-note resolution, four-octave view with octave shift.
-  - Add, move, resize, delete and set velocity per note.
+  - Add, move, resize, delete, mute and set velocity per note.
+  - Each session slot is independent; the editor has a slot selector.
   - Audio clips expose clip gain and loop-normalized fade-in/fade-out.
+- **Track management**
+  - Rename tracks from the session, mixer or arrangement; names are saved.
+  - Track names drive the session, arrangement, mixer, rack and editors.
 - **Project save / load**
-  - Versioned JSON `.rproj` files: tempo, mix, scenes, synth parameters, effect
-    chain, master gain, recorded MIDI and plugin state (base64).
+  - Versioned JSON `.rproj` files: tempo, mix, scenes, track names, per-slot
+    MIDI clips, synth parameters, effect chain, master gain and plugin state
+    (base64).
   - `Ctrl+S` quick save, a project browser, and `--project <path>` on startup.
   - Format v1 files still load; the legacy fixed FX block becomes a chain.
   - `examples/Demo.rproj` ships with MIDI clips and a five-module chain.
@@ -93,8 +108,8 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
   - Menu bar with project, plugin, synth, MIDI and zoom controls.
   - Transport with bar/beat/step counter, editable BPM, play/stop, REC, audio
     callback CPU meter, master meter and link status.
-  - Clip matrix (8 × 8) plus a MIDI clip row, with live step progress and
-    scene launch.
+  - Clip matrix (8 × 8) plus a MIDI row, with a per-slot piano-roll preview,
+    live step progress and scene launch.
   - Mixer strips with vertical faders, LED dB meters, pan and mute/solo.
   - Arrangement lanes with a 16-bar ruler, animated playhead and MIDI clip
     containers.
@@ -248,8 +263,9 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
   with per-track ratio, index and ADSR edited live from the UI.
 - The sequencer derives the current 16th note from a sample-accurate transport
   position, so tempo changes and loops stay tight.
-- Chain order is user-defined; master gain, soft clip, DC blocker and output
-  guard always come last, followed by the plugin inserts.
+- Each track runs its instrument slot (internal FM synth or plugin) and then
+  sums into the master bus. Chain order is user-defined; master gain, soft
+  clip, DC blocker and output guard always come last.
 - Effect parameters are clamped to their module ranges and smoothed to avoid
   zipper noise. Delay runs a 1.05 s stereo line.
 - `src/dsp/spectrum.rs` uses `rustfft` with a 1024-point Hann window and
@@ -257,12 +273,12 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
 
 ## Project format
 
-`.rproj` is versioned JSON (format 3):
+`.rproj` is versioned JSON (format 4):
 
 ```json
 {
-  "format_version": 3,
-  "app_version": "1.0.3",
+  "format_version": 4,
+  "app_version": "1.0.4",
   "name": "Neon Demo",
   "bpm": 142.0,
   "effects": [
@@ -272,28 +288,34 @@ MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring 
   ],
   "master_gain": 0.9,
   "tracks": [
-    { "name": "SYNAPSE 01", "gain_db": -7.0, "pan": -0.12,
+    { "name": "MY LEAD", "gain_db": -7.0, "pan": -0.12,
       "mute": false, "solo": false, "scene": 1,
-      "clip_enabled": true,
       "clip_gain_db": 0.0, "fade_in": 0.0, "fade_out": 0.0,
+      "instrument_plugin": false,
       "synth": { "ratio": 1.0, "index": 2.4, "attack": 0.004,
                  "decay": 0.18, "sustain": 0.25, "release": 0.25,
                  "level": 0.9 },
-      "notes": [ { "note": 60, "velocity": 100,
-                   "start_step": 0, "length_steps": 2 } ] }
+      "clips": [
+        { "scene": 1, "enabled": true,
+          "notes": [ { "note": 60, "velocity": 100,
+                       "start_step": 0, "length_steps": 2 } ] }
+      ] }
   ],
   "plugins": [
-    { "slot": 0, "name": "OB-Xd", "format": "VST3",
-      "path": "/home/user/.vst3/OB-Xd 3.vst3",
+    { "slot": 0, "name": "Dexed", "format": "CLAP",
+      "path": "/usr/lib/clap/Dexed.clap",
       "bypass": false, "state": "<base64>" }
   ]
 }
 ```
 
-`plugins[].slot` is the track index. Unknown fields are ignored (forward
-compatible), while a newer `format_version` is rejected with a clear error.
-Loading a v1 file translates its `fx` block into chain modules; v2 plugin slots
-map to the same track numbers.
+`tracks[].clips` holds one entry per non-empty session slot, so each of the
+8 × 8 slots is independent. `plugins[].slot` is the track index and
+`instrument_plugin` records the instrument-slot choice (`null` follows the
+plugin type). Unknown fields are ignored (forward compatible), while a newer
+`format_version` is rejected with a clear error. Loading a v3 file moves its
+single `notes` clip into the slot named by `scene`; v1 files translate their
+`fx` block into chain modules.
 
 ## Verification
 
@@ -302,7 +324,7 @@ Keystation 49 MK3 MIDI keyboard, and third-party plugins already installed:
 
 ```
 $ cargo test
-test result: ok. 78 passed; 0 failed
+test result: ok. 86 passed; 0 failed
 
 $ cargo clippy --all-targets -- -D warnings
 Finished
@@ -327,13 +349,22 @@ Additional manual checks:
 - **VST3**: `OB-Xd 3.vst3` loads on the worker thread, exposes its parameters,
   reports latency and produces audio from MIDI; closing the slot no longer
   crashes thanks to the parked-instance workaround.
-- **CLAP**: `Dexed.clap` loads, exposes parameters and processes audio.
-- **Projects**: saved a session with chain, synth parameters and MIDI clips,
-  then loaded it in a fresh process; `examples/Demo.rproj` is the same file.
+- **CLAP**: `Dexed.clap` loads into a track's instrument slot, exposes 128
+  parameters, takes over the track's sound source and is playable from the
+  sequencer and the piano roll. The full-screen editor and parameter filter
+  were captured from the running binary.
+- **Independent slots**: an injected double-click on the session cell for
+  track 1 / slot 3 opened `PIANO ROLL // TRACK 01 // SLOT 03`, a note added
+  there left slot 2's 16-note clip untouched, and the matrix only kept the
+  slot-2 clip. Also covered by engine and UI-state tests.
+- **Projects**: saved a session with chain, synth parameters, per-slot clips,
+  track names and the instrument choice, then loaded it in a fresh process;
+  `examples/Demo.rproj` is the same file in format v4.
 - **UI zoom**: captured at 125% (`docs/synth.png`), with the logical layout
   preserved and the synth editor open.
-- **Screenshots**: `docs/screenshot.png`, `docs/synth.png`, `docs/plugins.png`
-  and `docs/piano-roll.png` are captured from the real binary under Xvfb.
+- **Screenshots**: `docs/screenshot.png`, `docs/synth.png`, `docs/plugins.png`,
+  `docs/piano-roll.png` and `docs/plugin-editor.png` are captured from the real
+  binary under Xvfb.
 
 The CI matrix runs tests and the self-test on Ubuntu, macOS and Windows. The
 release workflows cross-build both macOS architectures and publish packages for
@@ -348,13 +379,16 @@ This is a prototype, not a production DAW:
   natural next step.
 - The VST3 workaround parks closed instances instead of destroying them, so
   their memory is held until exit.
-- No plugin GUI embedding; parameters are edited with the rack knobs.
+- No native plugin GUI embedding: the plugin editor is a full-screen parameter
+  surface, not the vendor's own window.
 - VST2 and Audio Unit hosting are not implemented (see the matrix above).
 - The modular effects are still a master chain; per-track inserts host one
   plugin each. There is no arbitrary per-track effect chain yet.
-- MIDI clips are stored per track (one clip per track), not per scene slot.
-- No MIDI export, automation lanes or undo. Recording replaces the target clip,
-  no overdub.
+- One MIDI clip per session slot and one instrument plugin per track. There is
+  no arrangement clip model (the arrangement mirrors the launched slot) and no
+  MIDI export, automation lanes or undo. Recording replaces the target clip.
+- Instrument-slot choice and effect-plugin inserts share the same slot: an
+  instrument plugin replaces the FM synth, an effect plugin is an insert.
 - One 16-bar loop.
 - Windows and macOS are covered by CI builds but were not manually auditioned
   for this release; Linux/ALSA, MIDI input, CLAP and VST3 were verified on

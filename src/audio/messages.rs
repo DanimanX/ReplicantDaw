@@ -80,6 +80,8 @@ impl RecordedClip {
 #[derive(Clone, Copy, Debug)]
 pub struct RecordEvent {
     pub track: u8,
+    /// Session slot the note belongs to.
+    pub scene: u8,
     pub note: RecordedNote,
     /// True when recording started from a clean clip.
     pub reset: bool,
@@ -427,22 +429,26 @@ pub enum Command {
     SetMasterGain {
         gain: f32,
     },
-    /// Enable or mute a track's recorded MIDI clip.
+    /// Enable or mute one session clip slot.
     SetRecordedActive {
         track: u8,
+        scene: u8,
         active: bool,
     },
-    /// Start recording incoming MIDI on `track`, replacing its clip.
+    /// Start recording incoming MIDI into one session slot.
     RecordStart {
         track: u8,
+        scene: u8,
     },
     RecordStop,
     ClearRecorded {
         track: u8,
+        scene: u8,
     },
-    /// Replace a track's recorded clip (project load).
+    /// Replace the MIDI clip of one session slot (editor and project load).
     SetRecordedClip {
         track: u8,
+        scene: u8,
         clip: RecordedClip,
     },
     /// Route incoming MIDI to the plugin chain as well as the internal synth.
@@ -457,6 +463,12 @@ pub enum Command {
     SetTrackPlugin {
         track: u8,
         active: bool,
+    },
+    /// Mute or unmute the internal FM synth of a track. Used when an
+    /// instrument plugin replaces it in the track's instrument slot.
+    SetTrackSynth {
+        track: u8,
+        enabled: bool,
     },
     /// Audio-clip envelope applied to a track before the master bus.
     /// Fades are normalized to the 16-bar loop (0.0 = off, 1.0 = whole loop).

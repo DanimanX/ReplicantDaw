@@ -247,6 +247,7 @@ fn selftest() -> Result<(), String> {
     ui_state.synth[0].set(audio::SynthParam::Index, 4.25);
     ui_state.set_recorded(
         0,
+        2,
         vec![audio::RecordedNote {
             note: 64,
             velocity: 99,
@@ -254,15 +255,18 @@ fn selftest() -> Result<(), String> {
             length_steps: 3,
         }],
     );
-    ui_state.recorded_active[0] = false;
+    ui_state.recorded_active[0][2] = false;
+    ui_state.rename_track(0, "Selftest Lead");
     let project = project::Project::from_session("Selftest", 137.0, &ui_state);
     let json = project.to_json()?;
     let reloaded = project::Project::from_json(&json)?;
     let ok = reloaded.effects.len() == 2
         && reloaded.effects[0].kind == "DELAY"
         && (reloaded.master_gain - 0.66).abs() < 1e-6
-        && reloaded.tracks[0].notes.len() == 1
-        && !reloaded.tracks[0].clip_enabled
+        && reloaded.tracks[0].name == "Selftest Lead"
+        && reloaded.tracks[0].clips.len() == 1
+        && reloaded.tracks[0].clips[0].scene == 2
+        && !reloaded.tracks[0].clips[0].enabled
         && reloaded.tracks[0]
             .synth
             .as_ref()
@@ -270,7 +274,11 @@ fn selftest() -> Result<(), String> {
     println!(
         "- project: {} module(s), {} note(s), synth index {:.2}",
         reloaded.effects.len(),
-        reloaded.tracks[0].notes.len(),
+        reloaded.tracks[0]
+            .clips
+            .iter()
+            .map(|clip| clip.notes.len())
+            .sum::<usize>(),
         reloaded.tracks[0]
             .synth
             .as_ref()
@@ -293,7 +301,7 @@ fn selftest() -> Result<(), String> {
         },
     );
     recorded.apply(Command::SetBpm(120.0));
-    recorded.apply(Command::RecordStart { track: 0 });
+    recorded.apply(Command::RecordStart { track: 0, scene: 0 });
     midi_tx
         .push(audio::MidiMessage::NoteOn {
             channel: 0,
@@ -314,7 +322,7 @@ fn selftest() -> Result<(), String> {
         recorded.process(&mut buffer);
     }
     recorded.apply(Command::RecordStop);
-    let captured = recorded.recorded_clip(0).len;
+    let captured = recorded.recorded_clip(0, 0).len;
     let mut mirrored = 0usize;
     while record_rx.pop().is_ok() {
         mirrored += 1;

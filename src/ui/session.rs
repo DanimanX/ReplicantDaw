@@ -36,7 +36,7 @@ pub fn draw_matrix(
     let midi_top = content.top() + header_h;
 
     // Column headers.
-    for (track, spec) in TRACKS.iter().enumerate() {
+    for (track, _spec) in TRACKS.iter().enumerate() {
         let x = content.left() + launch_w + track as f32 * col_w;
         let head = Rect::from_min_size(Pos2::new(x, content.top()), Vec2::new(col_w, header_h));
         let accent = theme::track_accent(track);
@@ -56,21 +56,31 @@ pub fn draw_matrix(
             ui.scope_id().with(("track_head", track)),
             Sense::click(),
         );
-        if hit.clicked() {
+        if hit.double_clicked() {
+            studio.begin_rename(track, &state.track_name[track]);
+        } else if hit.clicked() {
             state.selected_track = track;
         }
-        if hit.hovered() {
+        let head_hovered = hit.hovered();
+        if head_hovered {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            hit.on_hover_text("Click to select · double-click to rename the track");
         }
-        let label = spec.name;
+        let label = state.track_label(track);
         let head_painter = ui
             .painter()
-            .with_clip_rect(head.shrink2(Vec2::new(1.0, 0.0)));
+            .with_clip_rect(head.shrink2(Vec2::new(2.0, 0.0)));
+        let font = theme::fitted_font(
+            &head_painter,
+            label,
+            theme::display(6.9),
+            head.width() - 6.0,
+        );
         head_painter.text(
             Pos2::new(head.center().x, head.center().y + 1.0),
             Align2::CENTER_CENTER,
             label,
-            theme::display(6.9),
+            font,
             if selected { accent } else { theme::TEXT_DIM },
         );
         ui.painter().text(
@@ -151,7 +161,7 @@ pub fn draw_matrix(
     );
 
     let rows_top = midi_top + midi_h + midi_gap;
-    for (track, spec) in TRACKS.iter().enumerate() {
+    for (track, _spec) in TRACKS.iter().enumerate() {
         let accent = theme::track_accent(track);
         let x = content.left() + launch_w + track as f32 * col_w;
         for scene in 0..SCENE_COUNT {
@@ -205,48 +215,77 @@ pub fn draw_matrix(
                 );
             }
 
-            // Miniature waveform.
+            // Slot content: this slot's own MIDI clip, or the generative
+            // pattern preview when the slot is empty.
+            let notes = state.recorded_notes(track, scene);
+            let has_clip = !notes.is_empty();
+            let clip_enabled = state.recorded_active[track][scene];
             let wave_rect = Rect::from_min_max(
                 Pos2::new(cell.left() + 5.0, cell.top() + 5.0),
                 Pos2::new(cell.right() - 5.0, cell.bottom() - 8.0),
             );
             if wave_rect.width() > 8.0 && wave_rect.height() > 6.0 {
-                let points = state.clip_waveform(track, scene, 28);
-                let mid_y = wave_rect.center().y;
-                let amp = wave_rect.height() * 0.42;
-                let path: Vec<Pos2> = points
-                    .iter()
-                    .enumerate()
-                    .map(|(i, value)| {
-                        let x = wave_rect.left()
-                            + wave_rect.width() * i as f32 / (points.len().max(2) - 1) as f32;
-                        Pos2::new(x, mid_y - value * amp)
-                    })
-                    .collect();
-                let color = if launched {
-                    theme::accent_alpha(accent, 220)
+                if has_clip {
+                    draw_mini_roll(
+                        ui.painter(),
+                        wave_rect,
+                        notes,
+                        crate::audio::LOOP_STEPS as f32,
+                        if clip_enabled {
+                            theme::accent_alpha(accent, 225)
+                        } else {
+                            theme::accent_alpha(accent, 70)
+                        },
+                    );
                 } else {
-                    theme::accent_alpha(accent, 75)
-                };
-                ui.painter()
-                    .add(egui::Shape::line(path, Stroke::new(1.0, color)));
-                ui.painter().line_segment(
-                    [
-                        Pos2::new(wave_rect.left(), mid_y),
-                        Pos2::new(wave_rect.right(), mid_y),
-                    ],
-                    Stroke::new(1.0, theme::accent_alpha(accent, 30)),
-                );
+                    let points = state.clip_waveform(track, scene, 28);
+                    let mid_y = wave_rect.center().y;
+                    let amp = wave_rect.height() * 0.42;
+                    let path: Vec<Pos2> = points
+                        .iter()
+                        .enumerate()
+                        .map(|(i, value)| {
+                            let x = wave_rect.left()
+                                + wave_rect.width() * i as f32 / (points.len().max(2) - 1) as f32;
+                            Pos2::new(x, mid_y - value * amp)
+                        })
+                        .collect();
+                    let color = if launched {
+                        theme::accent_alpha(accent, 220)
+                    } else {
+                        theme::accent_alpha(accent, 75)
+                    };
+                    ui.painter()
+                        .add(egui::Shape::line(path, Stroke::new(1.0, color)));
+                    ui.painter().line_segment(
+                        [
+                            Pos2::new(wave_rect.left(), mid_y),
+                            Pos2::new(wave_rect.right(), mid_y),
+                        ],
+                        Stroke::new(1.0, theme::accent_alpha(accent, 30)),
+                    );
+                }
             }
 
-            // Name on the bottom edge for wider slots.
+            // Slot label: scene name or the MIDI clip summary.
             if cell.width() > 54.0 {
+                let label = if has_clip {
+                    format!(
+                        "MIDI · {}N{}",
+                        notes.len(),
+                        if clip_enabled { "" } else { " · MUTED" }
+                    )
+                } else {
+                    UiState::scene_name(scene).to_string()
+                };
                 ui.painter().text(
                     Pos2::new(cell.left() + 5.0, cell.bottom() - 3.0),
                     Align2::LEFT_BOTTOM,
-                    UiState::scene_name(scene),
+                    label,
                     theme::mono(6.0),
-                    if launched {
+                    if has_clip && !clip_enabled {
+                        theme::AMBER
+                    } else if launched {
                         theme::accent_alpha(accent, 200)
                     } else {
                         theme::TEXT_FAINT
@@ -284,6 +323,13 @@ pub fn draw_matrix(
             if response.double_clicked() {
                 state.selected_track = track;
                 studio.open_piano_roll(track, scene as u8);
+            } else if response.secondary_clicked() && !notes.is_empty() {
+                state.recorded_active[track][scene] = !clip_enabled;
+                let _ = audio.command_tx.push(Command::SetRecordedActive {
+                    track: track as u8,
+                    scene: scene as u8,
+                    active: state.recorded_active[track][scene],
+                });
             } else if response.clicked() {
                 if launched {
                     let _ = audio
@@ -298,16 +344,10 @@ pub fn draw_matrix(
                     state.launched[track] = Some(scene as u8);
                 }
             }
-            if response.secondary_clicked() {
-                let _ = audio
-                    .command_tx
-                    .push(Command::StopClip { track: track as u8 });
-                state.launched[track] = None;
-            }
             if response.hovered() {
                 response.on_hover_text(format!(
-                    "{} · {} · scene {} · double-click to edit MIDI",
-                    spec.name,
+                    "{} · {} · slot {}\nclick = launch/stop · double-click = piano roll · right-click = mute clip",
+                    state.track_label(track),
                     UiState::scene_name(scene),
                     scene + 1
                 ));
@@ -325,7 +365,7 @@ pub fn draw_matrix(
     }
 }
 
-/// Dedicated session row showing each track's recorded MIDI clip.
+/// Dedicated row showing the MIDI clip of each track's launched slot.
 #[allow(clippy::too_many_arguments)]
 fn draw_midi_row(
     ui: &mut Ui,
@@ -357,8 +397,9 @@ fn draw_midi_row(
 
     let steps_total = crate::audio::LOOP_STEPS as f32;
 
-    for (track, spec) in TRACKS.iter().enumerate() {
+    for (track, _spec) in TRACKS.iter().enumerate() {
         let track_accent = theme::track_accent(track);
+        let scene = state.launched[track].unwrap_or(0) as usize;
         let x = content.left() + launch_w + track as f32 * col_w;
         let cell = Rect::from_min_size(
             Pos2::new(x, top + 1.0),
@@ -372,8 +413,9 @@ fn draw_midi_row(
             ui.scope_id().with(("midi_clip", track)),
             Sense::click(),
         );
-        let has_clip = !state.recorded_notes(track).is_empty();
-        let enabled = state.recorded_active[track];
+        let notes = state.recorded_notes(track, scene);
+        let has_clip = !notes.is_empty();
+        let enabled = state.recorded_active[track][scene];
         let hovered = response.hovered();
         if hovered {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -420,18 +462,16 @@ fn draw_midi_row(
         ui.painter().text(
             Pos2::new(cell.left() + 5.0, cell.top() + 2.0),
             Align2::LEFT_TOP,
-            "MIDI",
+            format!("MIDI {}/{}", scene + 1, SCENE_COUNT),
             theme::display(6.4),
             label_color,
         );
 
         if has_clip {
-            let notes = state.recorded_notes(track);
-            let count = notes.len();
             ui.painter().text(
                 Pos2::new(cell.right() - 4.0, cell.top() + 2.0),
                 Align2::RIGHT_TOP,
-                format!("{count} N"),
+                format!("{} N", notes.len()),
                 theme::mono(5.8),
                 label_color,
             );
@@ -441,33 +481,17 @@ fn draw_midi_row(
                 Pos2::new(cell.right() - 4.0, cell.bottom() - 3.0),
             );
             if roll.height() > 5.0 {
-                let mut min_note = 127u8;
-                let mut max_note = 0u8;
-                for note in notes {
-                    min_note = min_note.min(note.note);
-                    max_note = max_note.max(note.note);
-                }
-                let span = (max_note.saturating_sub(min_note)).max(11) as f32;
-                for note in notes {
-                    let x0 = roll.left() + note.start_step as f32 / steps_total * roll.width();
-                    let x1 = roll.left()
-                        + note.end_step().min(steps_total as u16) as f32 / steps_total
-                            * roll.width();
-                    let pitch = (note.note.saturating_sub(min_note)) as f32 / span;
-                    let y = roll.bottom() - 2.0 - pitch * (roll.height() - 3.0);
-                    let note_rect = Rect::from_min_max(
-                        Pos2::new(x0.max(roll.left()), y),
-                        Pos2::new((x1.max(x0 + 2.0)).min(roll.right()), y + 2.2),
-                    );
-                    let color = if enabled {
+                draw_mini_roll(
+                    ui.painter(),
+                    roll,
+                    notes,
+                    steps_total,
+                    if enabled {
                         theme::accent_alpha(track_accent, 225)
                     } else {
                         theme::accent_alpha(track_accent, 70)
-                    };
-                    ui.painter()
-                        .rect_filled(note_rect, CornerRadius::same(1), color);
-                }
-                // Loop progress inside the clip.
+                    },
+                );
                 if state.playing && enabled {
                     let progress = (beats / (crate::audio::LOOP_BARS as f32 * 4.0)).clamp(0.0, 1.0);
                     let px = roll.left() + progress * roll.width();
@@ -481,7 +505,7 @@ fn draw_midi_row(
             ui.painter().text(
                 Pos2::new(cell.center().x, cell.center().y + 3.0),
                 Align2::CENTER_CENTER,
-                "EMPTY · REC",
+                "EMPTY · EDIT",
                 theme::mono(5.6),
                 theme::TEXT_FAINT,
             );
@@ -496,32 +520,39 @@ fn draw_midi_row(
             );
         }
 
-        if response.double_clicked() {
-            state.selected_track = track;
-            studio.open_piano_roll(track, state.launched[track].unwrap_or(0));
-        } else if response.clicked() {
-            state.selected_track = track;
-            if has_clip {
-                state.recorded_active[track] = !enabled;
-                let _ = audio.command_tx.push(Command::SetRecordedActive {
-                    track: track as u8,
-                    active: state.recorded_active[track],
-                });
-            }
+        let open_roll = response.double_clicked();
+        let toggle_mute = !open_roll && response.clicked() && has_clip;
+        let select = response.clicked() || open_roll;
+        if open_roll {
+            studio.open_piano_roll(track, scene as u8);
         }
         if response.hovered() {
             response.on_hover_text(if has_clip {
                 format!(
-                    "{} · MIDI clip · {} note(s) · click to {} · double-click to edit",
-                    spec.name,
-                    state.recorded_notes(track).len(),
+                    "{} · slot {} · {} note(s) · click to {} · double-click to edit",
+                    state.track_label(track),
+                    scene + 1,
+                    notes.len(),
                     if enabled { "mute" } else { "enable" }
                 )
             } else {
                 format!(
-                    "{} · no MIDI clip yet. Double-click to program it in the piano roll.",
-                    spec.name
+                    "{} · slot {} has no MIDI clip. Double-click to program it.",
+                    state.track_label(track),
+                    scene + 1
                 )
+            });
+        }
+
+        if select {
+            state.selected_track = track;
+        }
+        if toggle_mute {
+            state.recorded_active[track][scene] = !enabled;
+            let _ = audio.command_tx.push(Command::SetRecordedActive {
+                track: track as u8,
+                scene: scene as u8,
+                active: !enabled,
             });
         }
     }
@@ -534,7 +565,45 @@ fn draw_midi_row(
     );
 }
 
-pub fn draw_mixer(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRuntime) {
+/// Draw a compact piano-roll preview of a clip inside `rect`.
+fn draw_mini_roll(
+    painter: &egui::Painter,
+    rect: Rect,
+    notes: &[crate::audio::RecordedNote],
+    steps_total: f32,
+    color: Color32,
+) {
+    if notes.is_empty() || steps_total <= 0.0 {
+        return;
+    }
+    let mut min_note = 127u8;
+    let mut max_note = 0u8;
+    for note in notes {
+        min_note = min_note.min(note.note);
+        max_note = max_note.max(note.note);
+    }
+    let span = (max_note.saturating_sub(min_note)).max(11) as f32;
+    for note in notes {
+        let x0 = rect.left() + note.start_step as f32 / steps_total * rect.width();
+        let x1 = rect.left()
+            + note.end_step().min(steps_total as u16) as f32 / steps_total * rect.width();
+        let pitch = (note.note.saturating_sub(min_note)) as f32 / span;
+        let y = rect.bottom() - 2.0 - pitch * (rect.height() - 3.0);
+        let note_rect = Rect::from_min_max(
+            Pos2::new(x0.max(rect.left()), y),
+            Pos2::new((x1.max(x0 + 2.0)).min(rect.right()), y + 2.2),
+        );
+        painter.rect_filled(note_rect, CornerRadius::same(1), color);
+    }
+}
+
+pub fn draw_mixer(
+    ui: &mut Ui,
+    rect: Rect,
+    state: &mut UiState,
+    studio: &mut Studio,
+    audio: &mut AudioRuntime,
+) {
     let content = theme::paint_panel(
         ui.painter(),
         rect,
@@ -544,7 +613,7 @@ pub fn draw_mixer(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut Audi
     );
 
     let col_w = content.width() / TRACK_COUNT as f32;
-    for (track, spec) in TRACKS.iter().enumerate() {
+    for (track, _spec) in TRACKS.iter().enumerate() {
         let accent = theme::track_accent(track);
         let strip = Rect::from_min_size(
             Pos2::new(content.left() + track as f32 * col_w, content.top()),
@@ -568,17 +637,31 @@ pub fn draw_mixer(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut Audi
             ui.scope_id().with(("strip_name", track)),
             Sense::click(),
         );
-        if name_hit.clicked() {
+        if name_hit.double_clicked() {
+            state.selected_track = track;
+            studio.begin_rename(track, &state.track_name[track]);
+        } else if name_hit.clicked() {
             state.selected_track = track;
         }
         if name_hit.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            name_hit.on_hover_text("Double-click to rename this track");
         }
-        ui.painter().text(
+        let label = state.track_label(track);
+        let name_painter = ui
+            .painter()
+            .with_clip_rect(name_rect.shrink2(Vec2::new(1.0, 0.0)));
+        let font = theme::fitted_font(
+            &name_painter,
+            label,
+            theme::display(6.8),
+            name_rect.width() - 4.0,
+        );
+        name_painter.text(
             Pos2::new(name_rect.center().x, name_rect.center().y),
             Align2::CENTER_CENTER,
-            spec.name,
-            theme::display(6.8),
+            label,
+            font,
             if selected { accent } else { theme::TEXT_DIM },
         );
 

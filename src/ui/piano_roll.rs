@@ -4,7 +4,7 @@
 
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
-use crate::audio::{AudioRuntime, Command, LOOP_STEPS, TRACKS, TRACK_COUNT};
+use crate::audio::{AudioRuntime, Command, LOOP_STEPS, SCENE_COUNT, TRACK_COUNT};
 use crate::state::UiState;
 use crate::studio::{sync_track_notes, RollDrag, RollDragMode, Studio};
 use crate::theme;
@@ -26,11 +26,13 @@ pub fn draw(
     }
     let mut open = true;
     let track = studio.piano_roll_track.min(TRACK_COUNT - 1);
+    let scene = (studio.piano_roll_scene as usize).min(SCENE_COUNT - 1);
     let accent = theme::track_accent(track);
     egui::Window::new(format!(
-        "PIANO ROLL // TRACK {:02} {}",
+        "PIANO ROLL // TRACK {:02} {} // SLOT {:02}",
         track + 1,
-        TRACKS[track].name
+        state.track_label(track),
+        scene + 1
     ))
     .open(&mut open)
     .frame(
@@ -40,15 +42,15 @@ pub fn draw(
             .corner_radius(CornerRadius::same(3))
             .inner_margin(egui::Margin::same(8)),
     )
-    .default_pos(Pos2::new(140.0, 90.0))
-    .default_size(Vec2::new(1080.0, 700.0))
+    .default_pos(Pos2::new(80.0, 70.0))
+    .default_size(Vec2::new(960.0, 640.0))
     .resizable(true)
     .show(ctx, |ui| {
-        draw_header(ui, studio, state, audio, track, accent);
+        draw_header(ui, studio, state, audio, track, scene, accent);
         ui.add_space(5.0);
-        draw_grid(ui, studio, state, audio, track, accent);
+        draw_grid(ui, studio, state, audio, track, scene, accent);
         ui.add_space(5.0);
-        draw_footer(ui, studio, state, audio, track, accent);
+        draw_footer(ui, studio, state, audio, track, scene, accent);
     });
     if !open {
         studio.piano_roll_open = false;
@@ -56,12 +58,14 @@ pub fn draw(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_header(
     ui: &mut Ui,
     studio: &mut Studio,
     state: &mut UiState,
     audio: &mut AudioRuntime,
     track: usize,
+    scene: usize,
     accent: Color32,
 ) {
     ui.horizontal(|ui| {
@@ -72,14 +76,14 @@ fn draw_header(
         );
         let mut chosen = track;
         egui::ComboBox::from_id_salt("piano_roll_track")
-            .selected_text(format!("{:02} {}", track + 1, TRACKS[track].name))
-            .width(190.0)
+            .selected_text(format!("{:02} {}", track + 1, state.track_label(track)))
+            .width(170.0)
             .show_ui(ui, |ui| {
-                for (index, spec) in TRACKS.iter().enumerate().take(TRACK_COUNT) {
+                for index in 0..TRACK_COUNT {
                     if ui
                         .selectable_label(
                             index == track,
-                            format!("{:02} {}", index + 1, spec.name),
+                            format!("{:02} {}", index + 1, state.track_label(index)),
                         )
                         .clicked()
                     {
@@ -94,23 +98,50 @@ fn draw_header(
             state.selected_track = chosen;
         }
 
-        ui.label(
-            egui::RichText::new(format!(
+        let mut chosen_scene = scene;
+        egui::ComboBox::from_id_salt("piano_roll_scene")
+            .selected_text(format!(
                 "SLOT {:02} · {}",
-                studio.piano_roll_scene + 1,
-                UiState::scene_name(studio.piano_roll_scene as usize)
+                scene + 1,
+                UiState::scene_name(scene)
             ))
-            .font(theme::mono(8.0))
-            .color(theme::TEXT_DIM),
-        );
+            .width(136.0)
+            .show_ui(ui, |ui| {
+                for index in 0..SCENE_COUNT {
+                    if ui
+                        .selectable_label(
+                            index == scene,
+                            format!("{:02} · {}", index + 1, UiState::scene_name(index)),
+                        )
+                        .clicked()
+                    {
+                        chosen_scene = index;
+                    }
+                }
+            });
+        if chosen_scene != scene {
+            studio.piano_roll_scene = chosen_scene as u8;
+            studio.roll_selected = None;
+            studio.roll_drag = None;
+        }
+        let muted = !state.recorded_active[track][scene];
         ui.label(
             egui::RichText::new(format!(
-                "{} NOTE(S) · 16 BARS · LOOP {} STEPS",
-                state.recorded_notes(track).len(),
-                LOOP_STEPS
+                "{count} NOTE{plural}{muted}",
+                count = state.recorded_notes(track, scene).len(),
+                plural = if state.recorded_notes(track, scene).len() == 1 {
+                    ""
+                } else {
+                    "S"
+                },
+                muted = if muted { " · MUTED" } else { "" }
             ))
             .font(theme::mono(8.0))
-            .color(theme::TEXT_FAINT),
+            .color(if muted {
+                theme::AMBER
+            } else {
+                theme::TEXT_FAINT
+            }),
         );
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -123,6 +154,50 @@ fn draw_header(
                 studio.piano_roll_open = false;
                 studio.roll_drag = None;
             }
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("CLEAR SLOT").font(theme::display(8.0)))
+                        .fill(theme::accent_alpha(theme::RED, 28))
+                        .stroke(Stroke::new(1.0, theme::accent_alpha(theme::RED, 120))),
+                )
+                .clicked()
+            {
+                state.clear_recorded(track, scene);
+                studio.roll_selected = None;
+                studio.roll_drag = None;
+                sync_notes(state, audio, track, scene);
+            }
+            let mute_label = if muted { "UNMUTE SLOT" } else { "MUTE SLOT" };
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new(mute_label).font(theme::display(8.0)))
+                        .fill(if muted {
+                            theme::accent_alpha(theme::AMBER, 30)
+                        } else {
+                            theme::PANEL_SUNK
+                        }),
+                )
+                .clicked()
+            {
+                state.recorded_active[track][scene] = !muted;
+                let _ = audio.command_tx.push(Command::SetRecordedActive {
+                    track: track as u8,
+                    scene: scene as u8,
+                    active: !muted,
+                });
+            }
+        });
+    });
+
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new(
+                "CLICK GRID = ADD · DRAG BODY = MOVE · DRAG EDGE = LENGTH · RIGHT-CLICK = DELETE",
+            )
+            .font(theme::mono(6.8))
+            .color(theme::TEXT_FAINT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .add(egui::Button::new(
                     egui::RichText::new("OCT +").font(theme::display(8.0)),
@@ -140,21 +215,6 @@ fn draw_header(
                 studio.roll_base_note = (studio.roll_base_note - 12).max(0);
             }
             if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new("CLEAR CLIP").font(theme::display(8.0)),
-                    )
-                    .fill(theme::accent_alpha(theme::RED, 28))
-                    .stroke(Stroke::new(1.0, theme::accent_alpha(theme::RED, 120))),
-                )
-                .clicked()
-            {
-                state.clear_recorded(track);
-                studio.roll_selected = None;
-                studio.roll_drag = None;
-                sync_notes(state, audio, track);
-            }
-            if ui
                 .add(egui::Button::new(
                     egui::RichText::new("RESET VIEW").font(theme::display(8.0)),
                 ))
@@ -162,13 +222,9 @@ fn draw_header(
             {
                 studio.roll_base_note = 36;
             }
-            ui.label(
-                egui::RichText::new("CLICK GRID = ADD · DRAG BODY = MOVE · DRAG EDGE = LENGTH · RIGHT-CLICK = DELETE")
-                    .font(theme::mono(6.8))
-                    .color(theme::TEXT_FAINT),
-            );
         });
     });
+
     ui.painter().line_segment(
         [
             Pos2::new(ui.min_rect().left(), ui.min_rect().top()),
@@ -178,18 +234,20 @@ fn draw_header(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_grid(
     ui: &mut Ui,
     studio: &mut Studio,
     state: &mut UiState,
     audio: &mut AudioRuntime,
     track: usize,
+    scene: usize,
     accent: Color32,
 ) {
     let base = studio.roll_base_note.clamp(0, 127 - NOTE_SPAN as i32 + 1) as u8;
     let canvas_w = KEY_W + LOOP_STEPS as f32 * STEP_W + 2.0;
     let canvas_h = RULER_H + NOTE_SPAN as f32 * ROW_H + 2.0;
-    let notes = state.recorded_notes(track).to_vec();
+    let notes = state.recorded_notes(track, scene).to_vec();
 
     egui::ScrollArea::both()
         .auto_shrink([false, false])
@@ -375,6 +433,7 @@ fn draw_grid(
                             let pitch = (-delta.y / ROW_H).round() as i32;
                             state.move_note(
                                 track,
+                                scene,
                                 index,
                                 drag.original_start as i32 + steps,
                                 drag.original_note as i32 + pitch,
@@ -410,7 +469,12 @@ fn draw_grid(
                     if let Some(drag) = studio.roll_drag {
                         if drag.note_index == index && drag.mode == RollDragMode::Resize {
                             let steps = (handle.drag_delta().x / STEP_W).round() as i32;
-                            state.resize_note(track, index, drag.original_length as i32 + steps);
+                            state.resize_note(
+                                track,
+                                scene,
+                                index,
+                                drag.original_length as i32 + steps,
+                            );
                             changed = true;
                         }
                     }
@@ -422,7 +486,7 @@ fn draw_grid(
             }
 
             if let Some(index) = delete_note {
-                state.remove_note(track, index);
+                state.remove_note(track, scene, index);
                 studio.roll_selected = None;
                 studio.roll_drag = None;
                 changed = true;
@@ -435,12 +499,14 @@ fn draw_grid(
                     let row = ((pos.y - grid.top()) / ROW_H).floor() as i32;
                     let note = base as i32 + (NOTE_SPAN as i32 - 1 - row);
                     if (0..LOOP_STEPS as i32).contains(&step) && (0..128).contains(&note) {
-                        if let Some(index) = state.add_note(track, note as u8, 100, step as u16, 4)
+                        if let Some(index) =
+                            state.add_note(track, scene, note as u8, 100, step as u16, 4)
                         {
                             studio.roll_selected = Some(index);
-                            state.recorded_active[track] = true;
+                            state.recorded_active[track][scene] = true;
                             let _ = audio.command_tx.push(Command::SetRecordedActive {
                                 track: track as u8,
+                                scene: scene as u8,
                                 active: true,
                             });
                             changed = true;
@@ -452,17 +518,19 @@ fn draw_grid(
             }
 
             if changed {
-                sync_notes(state, audio, track);
+                sync_notes(state, audio, track, scene);
             }
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_footer(
     ui: &mut Ui,
     studio: &mut Studio,
     state: &mut UiState,
     audio: &mut AudioRuntime,
     track: usize,
+    scene: usize,
     accent: Color32,
 ) {
     ui.horizontal(|ui| {
@@ -472,7 +540,7 @@ fn draw_footer(
                 .color(theme::TEXT_FAINT),
         );
         if let Some(selected) = studio.roll_selected {
-            if let Some(note) = state.recorded_notes(track).get(selected).copied() {
+            if let Some(note) = state.recorded_notes(track, scene).get(selected).copied() {
                 let mut velocity = note.velocity as i32;
                 let slider = ui.add(
                     egui::Slider::new(&mut velocity, 1..=127)
@@ -480,8 +548,8 @@ fn draw_footer(
                         .text(""),
                 );
                 if slider.changed() {
-                    state.set_note_velocity(track, selected, velocity as u8);
-                    sync_notes(state, audio, track);
+                    state.set_note_velocity(track, scene, selected, velocity as u8);
+                    sync_notes(state, audio, track, scene);
                 }
                 ui.label(
                     egui::RichText::new(format!(
@@ -516,8 +584,8 @@ fn draw_footer(
     });
 }
 
-fn sync_notes(state: &UiState, audio: &mut AudioRuntime, track: usize) {
-    sync_track_notes(state, audio, track);
+fn sync_notes(state: &UiState, audio: &mut AudioRuntime, track: usize, scene: usize) {
+    sync_track_notes(state, audio, track, scene);
 }
 
 fn is_black(note: u8) -> bool {

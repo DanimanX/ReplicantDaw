@@ -9,7 +9,7 @@ use rtrb::{Consumer, Producer};
 use super::effects::EffectSlot;
 use super::messages::{
     db_to_gain, Command, EffectKind, RecordEvent, RecordedClip, RecordedNote, Telemetry,
-    LOOP_STEPS, MAX_EFFECTS, STEPS_PER_BAR, TRACK_COUNT,
+    LOOP_STEPS, MAX_EFFECTS, SCENE_COUNT, STEPS_PER_BAR, TRACK_COUNT,
 };
 use super::midi::MidiMessage;
 use super::synth::{SynthParams, Voice};
@@ -90,10 +90,12 @@ pub struct Engine {
     cpu_load: f32,
     midi_rx: Option<Consumer<MidiMessage>>,
     record_tx: Option<Producer<RecordEvent>>,
-    recorded: [RecordedClip; TRACK_COUNT],
-    recorded_active: [bool; TRACK_COUNT],
+    /// One MIDI clip per (track, session slot).
+    recorded: [[RecordedClip; SCENE_COUNT]; TRACK_COUNT],
+    recorded_active: [[bool; SCENE_COUNT]; TRACK_COUNT],
     recording: bool,
     record_track: u8,
+    record_scene: u8,
     record_pending: Option<RecordedNote>,
     loop_step: u16,
     plugin_input: Option<Producer<PluginBlock>>,
@@ -105,6 +107,11 @@ pub struct Engine {
     plugin_midi: bool,
     plugin_latency: u16,
     track_plugin: [bool; TRACK_COUNT],
+    /// Internal FM synth audible per track. An instrument plugin replaces it.
+    synth_enabled: [bool; TRACK_COUNT],
+    /// Note-offs scheduled for plugins at a given loop step.
+    plugin_offs: [(u8, u8, u16); 128],
+    plugin_off_count: usize,
     last_midi_note: u8,
 }
 
@@ -162,10 +169,11 @@ impl Engine {
             cpu_load: 0.0,
             midi_rx: io.midi,
             record_tx: io.record_events,
-            recorded: [RecordedClip::default(); TRACK_COUNT],
-            recorded_active: [true; TRACK_COUNT],
+            recorded: [[RecordedClip::default(); SCENE_COUNT]; TRACK_COUNT],
+            recorded_active: [[true; SCENE_COUNT]; TRACK_COUNT],
             recording: false,
             record_track: 0,
+            record_scene: 0,
             record_pending: None,
             loop_step: 0,
             plugin_input: io.plugin_input,
@@ -177,6 +185,9 @@ impl Engine {
             plugin_midi: true,
             plugin_latency: 0,
             track_plugin: [false; TRACK_COUNT],
+            synth_enabled: [true; TRACK_COUNT],
+            plugin_offs: [(0, 0, 0); 128],
+            plugin_off_count: 0,
             last_midi_note: 60,
         }
         .with_default_chain()
@@ -494,7 +505,15 @@ impl Engine {
             sample_rate: self.sample_rate as u32,
             recording: self.recording,
             record_track: self.record_track,
-            recorded_notes: self.recorded.iter().map(|clip| clip.len).sum(),
+            recorded_notes: if self.recording {
+                self.recorded[self.record_track as usize][self.record_scene as usize].len
+            } else {
+                self.recorded
+                    .iter()
+                    .flat_map(|slots| slots.iter())
+                    .map(|clip| clip.len)
+                    .sum()
+            },
             plugin_latency: self.plugin_latency,
         };
         if let Some(tx) = &mut self.telemetry_tx {
@@ -535,6 +554,12 @@ impl Engine {
                 for voice in &mut self.voices {
                     voice.release();
                 }
+                // Release any notes still held by a hosted instrument.
+                for index in 0..self.plugin_off_count {
+                    let (bus, note, _) = self.plugin_offs[index];
+                    self.plugin_pending.push_event(bus, 0, [0x80, note, 0], 3);
+                }
+                self.plugin_off_count = 0;
             }
             Command::SetBpm(bpm) => {
                 if bpm.is_finite() {
@@ -583,34 +608,36 @@ impl Engine {
                     }
                 }
             }
-            Command::RecordStart { track } => {
+            Command::RecordStart { track, scene } => {
                 let track = (track as usize).min(TRACK_COUNT - 1);
+                let scene = (scene as usize).min(SCENE_COUNT - 1);
                 self.record_track = track as u8;
-                self.recorded[track].clear();
-                self.recording = true;
-                // A recorded clip must be audible even if the clip slot was
-                // previously stopped.
+                self.record_scene = scene as u8;
+                // Recording goes into the slot that is playing on this track.
+                self.tracks[track].scene = scene;
                 self.tracks[track].active = true;
+                self.recorded[track][scene].clear();
+                self.recording = true;
                 self.record_pending = None;
                 if !self.playing {
                     self.playing = true;
                 }
-                self.emit_record_reset(track as u8);
+                self.emit_record_reset(track as u8, scene as u8);
             }
             Command::RecordStop => {
                 self.finalize_pending_note(self.loop_step);
                 self.recording = false;
             }
-            Command::ClearRecorded { track } => {
-                if let Some(clip) = self.recorded.get_mut(track as usize) {
-                    clip.clear();
-                    self.emit_record_reset(track);
-                }
+            Command::ClearRecorded { track, scene } => {
+                let track = (track as usize).min(TRACK_COUNT - 1);
+                let scene = (scene as usize).min(SCENE_COUNT - 1);
+                self.recorded[track][scene].clear();
+                self.emit_record_reset(track as u8, scene as u8);
             }
-            Command::SetRecordedClip { track, clip } => {
-                if let Some(slot) = self.recorded.get_mut(track as usize) {
-                    *slot = clip;
-                }
+            Command::SetRecordedClip { track, scene, clip } => {
+                let track = (track as usize).min(TRACK_COUNT - 1);
+                let scene = (scene as usize).min(SCENE_COUNT - 1);
+                self.recorded[track][scene] = clip;
             }
             Command::SetPluginMidi { enabled } => {
                 self.plugin_midi = enabled;
@@ -636,6 +663,11 @@ impl Engine {
                         self.plugin_ready_len = 0;
                         self.plugin_ready_pos = 0;
                     }
+                }
+            }
+            Command::SetTrackSynth { track, enabled } => {
+                if let Some(flag) = self.synth_enabled.get_mut(track as usize) {
+                    *flag = enabled;
                 }
             }
             Command::SetTrackClip {
@@ -712,9 +744,15 @@ impl Engine {
                     self.master_gain.set(gain.clamp(0.0, 2.0));
                 }
             }
-            Command::SetRecordedActive { track, active } => {
-                if let Some(flag) = self.recorded_active.get_mut(track as usize) {
-                    *flag = active;
+            Command::SetRecordedActive {
+                track,
+                scene,
+                active,
+            } => {
+                if let Some(slots) = self.recorded_active.get_mut(track as usize) {
+                    if let Some(flag) = slots.get_mut(scene as usize) {
+                        *flag = active;
+                    }
                 }
             }
         }
@@ -744,6 +782,13 @@ impl Engine {
             self.position = 0;
             self.last_step = u64::MAX;
             self.loop_step = 0;
+            for index in 0..self.plugin_off_count {
+                let (bus, note, _) = self.plugin_offs[index];
+                let offset = self.plugin_pending.frames.saturating_sub(1);
+                self.plugin_pending
+                    .push_event(bus, offset, [0x80, note, 0], 3);
+            }
+            self.plugin_off_count = 0;
         }
 
         let step = (self.position as f64 / self.samples_per_step()) as u64;
@@ -759,15 +804,19 @@ impl Engine {
         let step_samples = self.samples_per_step();
         let loop_step = self.loop_step;
 
+        // Release plugin notes whose gate ended on this step.
+        self.release_plugin_notes(loop_step);
+
         for (track, spec) in TRACKS.iter().enumerate() {
             if !self.tracks[track].active {
                 continue;
             }
 
-            // Recorded MIDI takes precedence over the generative pattern.
-            let clip = self.recorded[track];
+            // Recorded MIDI replaces the generative pattern for this slot.
+            let scene = self.tracks[track].scene.min(SCENE_COUNT - 1);
+            let clip = self.recorded[track][scene];
             if !clip.is_empty() {
-                if !self.recorded_active[track] {
+                if !self.recorded_active[track][scene] {
                     continue;
                 }
                 for note in clip.as_slice() {
@@ -779,17 +828,62 @@ impl Engine {
                         .max(1.0) as u32;
                     let velocity = (note.velocity as f32 / 127.0).clamp(0.05, 1.0);
                     self.trigger_note(track, note.note, velocity, gate, spec);
+                    self.forward_note_on(track, note.note, note.velocity);
+                    self.schedule_plugin_off(track, note.note, note.end_step());
                 }
                 continue;
             }
 
-            let scene = self.tracks[track].scene;
             let Some(note) = note_at(track, scene, step_in_bar) else {
                 continue;
             };
             let gate = (step_samples * spec.gate as f64).round().max(1.0) as u32;
             let velocity = if step_in_bar % 4 == 0 { 1.0 } else { 0.82 };
+            let velocity_byte = (velocity * 100.0) as u8;
             self.trigger_note(track, note, velocity, gate, spec);
+            self.forward_note_on(track, note, velocity_byte);
+            self.schedule_plugin_off(track, note, loop_step + 1);
+        }
+    }
+
+    /// Send a sequencer note to the track's plugin insert.
+    fn forward_note_on(&mut self, track: usize, note: u8, velocity: u8) {
+        if self.plugin_input.is_none() || !self.plugin_midi {
+            return;
+        }
+        let offset = self.plugin_pending.frames.saturating_sub(1);
+        self.plugin_pending.push_event(
+            track as u8,
+            offset,
+            [0x90, note, velocity.clamp(1, 127)],
+            3,
+        );
+    }
+
+    /// Queue a note-off for the plugin at `end_step` of the 16-bar loop.
+    fn schedule_plugin_off(&mut self, track: usize, note: u8, end_step: u16) {
+        if self.plugin_input.is_none() || !self.plugin_midi || self.plugin_off_count >= 128 {
+            return;
+        }
+        let end_step = end_step % LOOP_STEPS as u16;
+        self.plugin_offs[self.plugin_off_count] = (track as u8, note, end_step);
+        self.plugin_off_count += 1;
+    }
+
+    /// Emit pending plugin note-offs and drop them from the schedule.
+    fn release_plugin_notes(&mut self, loop_step: u16) {
+        let mut index = 0;
+        while index < self.plugin_off_count {
+            if self.plugin_offs[index].2 == loop_step {
+                let (bus, note, _) = self.plugin_offs[index];
+                let offset = self.plugin_pending.frames.saturating_sub(1);
+                self.plugin_pending
+                    .push_event(bus, offset, [0x80, note, 0], 3);
+                self.plugin_off_count -= 1;
+                self.plugin_offs[index] = self.plugin_offs[self.plugin_off_count];
+            } else {
+                index += 1;
+            }
         }
     }
 
@@ -876,26 +970,35 @@ impl Engine {
         };
         pending.length_steps = length.max(1);
         let track = self.record_track as usize;
+        let scene = self.record_scene as usize;
 
-        if let Some(clip) = self.recorded.get_mut(track) {
-            clip.push(pending);
+        if let Some(slots) = self.recorded.get_mut(track) {
+            if let Some(clip) = slots.get_mut(scene) {
+                clip.push(pending);
+            }
         }
-        self.emit_record_note(track as u8, pending, false);
+        self.emit_record_note(track as u8, self.record_scene, pending, false);
     }
 
-    fn emit_record_reset(&mut self, track: u8) {
+    fn emit_record_reset(&mut self, track: u8, scene: u8) {
         if let Some(tx) = &mut self.record_tx {
             let _ = tx.push(RecordEvent {
                 track,
+                scene,
                 note: RecordedNote::default(),
                 reset: true,
             });
         }
     }
 
-    fn emit_record_note(&mut self, track: u8, note: RecordedNote, reset: bool) {
+    fn emit_record_note(&mut self, track: u8, scene: u8, note: RecordedNote, reset: bool) {
         if let Some(tx) = &mut self.record_tx {
-            let _ = tx.push(RecordEvent { track, note, reset });
+            let _ = tx.push(RecordEvent {
+                track,
+                scene,
+                note,
+                reset,
+            });
         }
     }
 
@@ -908,9 +1011,9 @@ impl Engine {
         self.plugin_pending.push_event(bus, offset, bytes, len);
     }
 
-    /// Currently recorded clip for a track (used by tests and diagnostics).
-    pub fn recorded_clip(&self, track: usize) -> &RecordedClip {
-        &self.recorded[track.min(TRACK_COUNT - 1)]
+    /// Currently recorded clip for one session slot (tests and diagnostics).
+    pub fn recorded_clip(&self, track: usize, scene: usize) -> &RecordedClip {
+        &self.recorded[track.min(TRACK_COUNT - 1)][scene.min(SCENE_COUNT - 1)]
     }
 
     pub fn is_recording(&self) -> bool {
@@ -925,7 +1028,11 @@ impl Engine {
         gate: u32,
         _spec: &TrackSpec,
     ) {
-        let params = self.synth[track.min(TRACK_COUNT - 1)];
+        let track = track.min(TRACK_COUNT - 1);
+        if !self.synth_enabled[track] {
+            return;
+        }
+        let params = self.synth[track];
         // Prefer a free voice; otherwise steal the quietest, then oldest.
         let slot = self.voices.iter().position(|v| !v.is_active()).or_else(|| {
             self.voices
@@ -1115,7 +1222,7 @@ mod tests {
             },
         );
         engine.apply(Command::SetBpm(120.0));
-        engine.apply(Command::RecordStart { track: 2 });
+        engine.apply(Command::RecordStart { track: 2, scene: 0 });
         assert!(engine.is_playing(), "recording should start the transport");
 
         midi_tx
@@ -1140,7 +1247,7 @@ mod tests {
         }
         engine.apply(Command::RecordStop);
 
-        let clip = engine.recorded_clip(2);
+        let clip = engine.recorded_clip(2, 0);
         assert_eq!(clip.len, 1, "expected exactly one recorded note");
         let note = clip.as_slice()[0];
         assert_eq!(note.note, 60);
@@ -1157,6 +1264,37 @@ mod tests {
     }
 
     #[test]
+    fn recording_targets_only_the_requested_slot() {
+        let mut engine = Engine::offline(48_000.0);
+        engine.apply(Command::RecordStart { track: 3, scene: 5 });
+        assert_eq!(engine.record_track, 3);
+        assert_eq!(engine.record_scene, 5);
+        assert_eq!(engine.tracks[3].scene, 5);
+
+        let mut clip = RecordedClip::default();
+        clip.push(RecordedNote {
+            note: 50,
+            velocity: 100,
+            start_step: 0,
+            length_steps: 2,
+        });
+        engine.apply(Command::SetRecordedClip {
+            track: 3,
+            scene: 5,
+            clip,
+        });
+        assert_eq!(engine.recorded_clip(3, 5).len, 1);
+        for scene in 0..SCENE_COUNT {
+            if scene != 5 {
+                assert!(
+                    engine.recorded_clip(3, scene).is_empty(),
+                    "slot {scene} should be empty"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn recorded_clip_plays_back() {
         let mut engine = Engine::offline(48_000.0);
         let mut clip = RecordedClip::default();
@@ -1166,7 +1304,12 @@ mod tests {
             start_step: 0,
             length_steps: 4,
         });
-        engine.apply(Command::SetRecordedClip { track: 0, clip });
+        engine.apply(Command::SetRecordedClip {
+            track: 0,
+            scene: 0,
+            clip,
+        });
+        engine.apply(Command::LaunchClip { track: 0, scene: 0 });
         engine.apply(Command::SetBpm(120.0));
         engine.apply(Command::Play);
         let out = render(&mut engine, 12_000);
@@ -1174,7 +1317,7 @@ mod tests {
             .iter()
             .fold(0.0_f32, |max, sample| max.max(sample.abs()));
         assert!(peak > 0.01, "recorded clip did not sound (peak {peak})");
-        assert_eq!(engine.recorded_clip(0).len, 1);
+        assert_eq!(engine.recorded_clip(0, 0).len, 1);
     }
 
     #[test]
@@ -1335,11 +1478,18 @@ mod tests {
             start_step: 0,
             length_steps: 8,
         });
-        engine.apply(Command::SetRecordedClip { track: 0, clip });
+        engine.apply(Command::SetRecordedClip {
+            track: 0,
+            scene: 0,
+            clip,
+        });
         engine.apply(Command::SetRecordedActive {
             track: 0,
+            scene: 0,
             active: false,
         });
+        // Point the track at the muted slot so nothing else sounds.
+        engine.apply(Command::LaunchClip { track: 0, scene: 0 });
         for track in 1..TRACK_COUNT {
             engine.apply(Command::SetTrackMute {
                 track: track as u8,
@@ -1350,6 +1500,103 @@ mod tests {
         let out = render(&mut engine, 48_000);
         let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
         assert!(peak < 1e-3, "disabled MIDI clip still sounded ({peak})");
+    }
+
+    #[test]
+    fn session_slots_play_their_own_clip() {
+        let mut engine = Engine::offline(48_000.0);
+        let mut clip = RecordedClip::default();
+        clip.push(RecordedNote {
+            note: 48,
+            velocity: 110,
+            start_step: 0,
+            length_steps: 8,
+        });
+        engine.apply(Command::SetRecordedClip {
+            track: 0,
+            scene: 3,
+            clip,
+        });
+        // Track 0 defaults to scene 1, which has no clip: the generative
+        // pattern still plays there.
+        engine.apply(Command::Play);
+        render(&mut engine, 2_400);
+        assert!(engine.tracks[0].active);
+        assert_eq!(engine.recorded_clip(0, 3).len, 1);
+        assert!(engine.recorded_clip(0, 4).is_empty());
+
+        // Launching the slot with the clip uses it.
+        engine.apply(Command::LaunchClip { track: 0, scene: 3 });
+        let out = render(&mut engine, 24_000);
+        assert!(out.iter().any(|sample| sample.abs() > 0.005));
+    }
+
+    #[test]
+    fn muting_the_synth_silences_the_track() {
+        let mut engine = Engine::offline(48_000.0);
+        engine.apply(Command::SetTrackSynth {
+            track: 0,
+            enabled: false,
+        });
+        for track in 1..TRACK_COUNT {
+            engine.apply(Command::SetTrackMute {
+                track: track as u8,
+                mute: true,
+            });
+        }
+        engine.apply(Command::Play);
+        let out = render(&mut engine, 24_000);
+        let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(peak < 1e-4, "muted synth still sounded ({peak})");
+
+        let mut restored = Engine::offline(48_000.0);
+        restored.apply(Command::Play);
+        let out = render(&mut restored, 24_000);
+        let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.01);
+    }
+
+    #[test]
+    fn sequencer_notes_reach_the_plugin_insert() {
+        let (dry_tx, mut dry_rx) = RingBuffer::new(8);
+        let (mut wet_tx, wet_rx) = RingBuffer::new(8);
+        let mut engine = Engine::new_with_io(
+            48_000.0,
+            EngineIo {
+                plugin_input: Some(dry_tx),
+                plugin_output: Some(wet_rx),
+                ..EngineIo::default()
+            },
+        );
+        engine.apply(Command::SetTrackPlugin {
+            track: 0,
+            active: true,
+        });
+        engine.apply(Command::SetTrackSynth {
+            track: 0,
+            enabled: false,
+        });
+        engine.apply(Command::Play);
+
+        let mut note_on = 0;
+        let mut note_off = 0;
+        let mut buffer = vec![0.0; PLUGIN_BLOCK_FRAMES * 2];
+        for _ in 0..40 {
+            engine.process(&mut buffer);
+            while let Ok(block) = dry_rx.pop() {
+                for event in &block.events[..block.event_count as usize] {
+                    if event.bus == 0 && event.bytes[0] == 0x90 {
+                        note_on += 1;
+                    }
+                    if event.bus == 0 && event.bytes[0] == 0x80 {
+                        note_off += 1;
+                    }
+                }
+                let _ = wet_tx.push(block);
+            }
+        }
+        assert!(note_on > 0, "no note-on events reached the plugin");
+        assert!(note_off > 0, "no note-off events reached the plugin");
     }
 
     #[test]

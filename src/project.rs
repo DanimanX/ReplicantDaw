@@ -10,6 +10,8 @@
 //!   v1 files still load: the legacy `fx` block is translated into a chain.
 //! - v3: per-track plugin inserts and audio-clip envelopes. Older files load
 //!   with neutral defaults (unity clip gain, no fades).
+//! - v4: one MIDI clip per session slot and user-editable track names. v3
+//!   `notes` are migrated into the slot named by the track's `scene`.
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +21,7 @@ use crate::audio::messages::{EffectKind, RecordedNote, SynthParam, TRACK_COUNT};
 use crate::audio::{SynthParams, TRACKS};
 
 pub const PROJECT_EXTENSION: &str = "rproj";
-pub const PROJECT_FORMAT_VERSION: u32 = 3;
+pub const PROJECT_FORMAT_VERSION: u32 = 4;
 
 /// Editable FM synth settings stored per track.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,6 +91,17 @@ impl ProjectEffect {
     }
 }
 
+/// One session slot's MIDI clip.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ProjectClip {
+    /// Session scene index (0-7).
+    pub scene: u8,
+    #[serde(default)]
+    pub notes: Vec<RecordedNote>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectTrack {
     pub name: String,
@@ -101,9 +114,13 @@ pub struct ProjectTrack {
     /// Launched scene, `None` when the clip slot is stopped.
     #[serde(default)]
     pub scene: Option<u8>,
+    /// Session clips, one per non-empty slot.
+    #[serde(default)]
+    pub clips: Vec<ProjectClip>,
+    /// Legacy (v3) single clip. Migrated into `clips` on load.
     #[serde(default)]
     pub notes: Vec<RecordedNote>,
-    /// MIDI clip playback enabled.
+    /// Legacy (v3) clip playback enable.
     #[serde(default = "default_true")]
     pub clip_enabled: bool,
     /// Audio-clip envelope: level plus loop-normalized fades.
@@ -115,6 +132,10 @@ pub struct ProjectTrack {
     pub fade_out: f32,
     #[serde(default)]
     pub synth: Option<ProjectSynth>,
+    /// Instrument slot choice: `Some(true)` = plugin, `Some(false)` = internal
+    /// FM synth, `None` = follow the plugin type.
+    #[serde(default)]
+    pub instrument_plugin: Option<bool>,
 }
 
 /// Legacy (v1) fixed master FX block.
@@ -200,12 +221,14 @@ impl Default for Project {
                 mute: false,
                 solo: false,
                 scene: Some(crate::audio::DEFAULT_SCENES[index] as u8),
+                clips: Vec::new(),
                 notes: Vec::new(),
                 clip_enabled: true,
                 clip_gain_db: 0.0,
                 fade_in: 0.0,
                 fade_out: 0.0,
                 synth: Some(ProjectSynth::default_for_track(index)),
+                instrument_plugin: None,
             })
             .collect();
 
@@ -289,6 +312,19 @@ impl Project {
             ));
         }
 
+        // v3 stored a single clip per track. Move it into its session slot.
+        if project.format_version < 4 {
+            for track in project.tracks.iter_mut() {
+                if track.clips.is_empty() && !track.notes.is_empty() {
+                    track.clips.push(ProjectClip {
+                        scene: track.scene.unwrap_or(0),
+                        notes: std::mem::take(&mut track.notes),
+                        enabled: track.clip_enabled,
+                    });
+                }
+            }
+        }
+
         // A v1 file has no `effects`; translate its fixed FX block.
         if project.format_version < 2 {
             if let Some(legacy) = project.legacy_fx.take() {
@@ -343,18 +379,27 @@ impl Project {
     pub fn from_session(name: &str, bpm: f32, state: &crate::state::UiState) -> Self {
         let tracks = (0..TRACK_COUNT)
             .map(|index| ProjectTrack {
-                name: TRACKS[index].name.to_string(),
+                name: state.track_label(index).to_string(),
                 gain_db: state.track_gain_db[index],
                 pan: state.track_pan[index],
                 mute: state.mute[index],
                 solo: state.solo[index],
                 scene: state.launched[index],
-                notes: state.recorded_notes(index).to_vec(),
-                clip_enabled: state.recorded_active[index],
+                clips: (0..crate::audio::SCENE_COUNT)
+                    .filter(|scene| !state.recorded_notes(index, *scene).is_empty())
+                    .map(|scene| ProjectClip {
+                        scene: scene as u8,
+                        notes: state.recorded_notes(index, scene).to_vec(),
+                        enabled: state.recorded_active[index][scene],
+                    })
+                    .collect(),
+                notes: Vec::new(),
+                clip_enabled: true,
                 clip_gain_db: state.clip_gain_db[index],
                 fade_in: state.clip_fade_in[index],
                 fade_out: state.clip_fade_out[index],
                 synth: Some(ProjectSynth::from_params(&state.synth_params(index))),
+                instrument_plugin: state.instrument_plugin[index],
             })
             .collect();
 
@@ -441,13 +486,17 @@ mod tests {
         project.tracks[2].clip_gain_db = -3.5;
         project.tracks[2].fade_in = 0.25;
         project.tracks[2].fade_out = 0.10;
-        project.tracks[1].notes.push(RecordedNote {
-            note: 60,
-            velocity: 100,
-            start_step: 16,
-            length_steps: 2,
+        project.tracks[2].instrument_plugin = Some(true);
+        project.tracks[1].clips.push(ProjectClip {
+            scene: 2,
+            notes: vec![RecordedNote {
+                note: 60,
+                velocity: 100,
+                start_step: 16,
+                length_steps: 2,
+            }],
+            enabled: false,
         });
-        project.tracks[1].clip_enabled = false;
         project.tracks[1].synth = Some(ProjectSynth {
             ratio: 2.5,
             index: 4.0,
@@ -477,15 +526,42 @@ mod tests {
         assert!((loaded.tracks[2].clip_gain_db + 3.5).abs() < 1e-6);
         assert!((loaded.tracks[2].fade_in - 0.25).abs() < 1e-6);
         assert!((loaded.tracks[2].fade_out - 0.10).abs() < 1e-6);
-        assert!(!loaded.tracks[1].clip_enabled);
-        assert_eq!(loaded.tracks[1].notes.len(), 1);
-        assert_eq!(loaded.tracks[1].notes[0].start_step, 16);
+        assert_eq!(loaded.tracks[2].instrument_plugin, Some(true));
+        assert_eq!(loaded.tracks[1].clips.len(), 1);
+        assert_eq!(loaded.tracks[1].clips[0].scene, 2);
+        assert!(!loaded.tracks[1].clips[0].enabled);
+        assert_eq!(loaded.tracks[1].clips[0].notes.len(), 1);
+        assert_eq!(loaded.tracks[1].clips[0].notes[0].start_step, 16);
         assert_eq!(loaded.effects.len(), 5);
         assert_eq!(loaded.effects[4].kind, "DELAY");
         assert!((loaded.master_gain - 0.75).abs() < 1e-6);
         let synth = loaded.tracks[1].synth.as_ref().unwrap();
         assert!((synth.ratio - 2.5).abs() < 1e-6);
         assert_eq!(loaded.plugins[0].format, "CLAP");
+    }
+
+    #[test]
+    fn v3_single_clip_migrates_into_its_session_slot() {
+        let json = r#"{
+            "format_version": 3,
+            "name": "Old Clips",
+            "bpm": 120.0,
+            "tracks": [
+                { "name": "LEAD", "gain_db": -6.0, "pan": 0.0, "scene": 4,
+                  "clip_enabled": false,
+                  "notes": [ { "note": 67, "velocity": 90,
+                               "start_step": 4, "length_steps": 2 } ] }
+            ]
+        }"#;
+        let project = Project::from_json(json).expect("parse v3 project");
+        assert_eq!(project.format_version, PROJECT_FORMAT_VERSION);
+        let track = &project.tracks[0];
+        assert_eq!(track.name, "LEAD");
+        assert_eq!(track.clips.len(), 1);
+        assert_eq!(track.clips[0].scene, 4);
+        assert!(!track.clips[0].enabled);
+        assert_eq!(track.clips[0].notes.len(), 1);
+        assert!(track.notes.is_empty());
     }
 
     #[test]

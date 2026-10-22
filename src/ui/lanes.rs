@@ -73,7 +73,7 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
     let playhead_x =
         lane_area.left() + (playing_beats / beats_total).clamp(0.0, 1.0) * lane_area.width();
 
-    for (track, spec) in TRACKS.iter().enumerate() {
+    for (track, _spec) in TRACKS.iter().enumerate() {
         let accent = theme::track_accent(track);
         let lane = Rect::from_min_size(
             Pos2::new(lane_area.left(), lane_area.top() + track as f32 * lane_h),
@@ -83,6 +83,20 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
             Pos2::new(content.left(), lane.top()),
             Vec2::new(gutter, lane_h),
         );
+        let gutter_hit = ui.interact(
+            gutter_rect,
+            ui.scope_id().with(("arr_gutter", track)),
+            Sense::click(),
+        );
+        if gutter_hit.double_clicked() {
+            state.selected_track = track;
+            studio.begin_rename(track, &state.track_name[track]);
+        }
+        if gutter_hit.hovered() {
+            gutter_hit.on_hover_text("Double-click to rename this track");
+        }
+        let launched = state.launched[track];
+        let scene = launched.unwrap_or(0) as usize;
         // The lane itself is the fallback double-click target; clip blocks
         // added later sit on top and take priority.
         let lane_hit = ui.interact(
@@ -112,7 +126,7 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
         ui.painter().text(
             Pos2::new(gutter_rect.left() + 8.0, gutter_rect.center().y - 5.0),
             Align2::LEFT_CENTER,
-            spec.name,
+            state.track_label(track),
             theme::display(7.0),
             if state.selected_track == track {
                 accent
@@ -120,8 +134,6 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
                 theme::TEXT_DIM
             },
         );
-        let launched = state.launched[track];
-        let scene = launched.unwrap_or(0) as usize;
         ui.painter().text(
             Pos2::new(gutter_rect.right() - 6.0, gutter_rect.center().y + 5.0),
             Align2::RIGHT_CENTER,
@@ -133,10 +145,11 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
             theme::accent_alpha(accent, 130),
         );
 
-        // Recorded MIDI takes over the lane when present.
-        let notes = state.recorded_notes(track).to_vec();
+        // The launched slot's MIDI clip takes over the lane when present.
+        let notes = state.recorded_notes(track, scene).to_vec();
+        let slot_enabled = state.recorded_active[track][scene];
         if !notes.is_empty() {
-            let enabled = state.recorded_active[track];
+            let enabled = slot_enabled;
             let steps_total = crate::audio::LOOP_STEPS as f32;
             let clip = Rect::from_min_max(
                 Pos2::new(lane.left() + 1.5, lane.top() + 1.5),
@@ -184,7 +197,7 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
             if clip_hit.hovered() {
                 clip_hit.on_hover_text(format!(
                     "{} · MIDI clip · double-click to edit in the piano roll",
-                    spec.name
+                    state.track_label(track)
                 ));
             }
 
@@ -192,7 +205,7 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
             ui.painter().text(
                 Pos2::new(clip.left() + 6.0, header_y),
                 Align2::LEFT_CENTER,
-                "MIDI CLIP",
+                format!("MIDI CLIP · SLOT {:02}", scene + 1),
                 theme::display(6.0),
                 if enabled {
                     theme::accent_alpha(accent, 230)
@@ -252,7 +265,7 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
 
         // Audio clip blocks, one per four bars.
         let block_bars = 4usize;
-        let blocks = if launched.is_some() && state.recorded_notes(track).is_empty() {
+        let blocks = if launched.is_some() && notes.is_empty() {
             TIMELINE_BARS / block_bars
         } else {
             0
@@ -279,7 +292,7 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
             if block_hit.hovered() {
                 block_hit.on_hover_text(format!(
                     "{} · audio clip · double-click to edit the clip envelope",
-                    spec.name
+                    state.track_label(track)
                 ));
             }
             let muted = state.mute[track] || (state.any_solo() && !state.solo[track]);
@@ -340,7 +353,7 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
         }
         if lane_hit.double_clicked() {
             state.selected_track = track;
-            if state.recorded_notes(track).is_empty() {
+            if notes.is_empty() {
                 studio.open_audio_editor(track);
             } else {
                 studio.open_piano_roll(track, launched.unwrap_or(0));
@@ -349,12 +362,8 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
         if lane_hit.hovered() {
             lane_hit.on_hover_text(format!(
                 "{} · double-click to edit the {} clip",
-                spec.name,
-                if state.recorded_notes(track).is_empty() {
-                    "audio"
-                } else {
-                    "MIDI"
-                }
+                state.track_label(track),
+                if notes.is_empty() { "audio" } else { "MIDI" }
             ));
         }
     }

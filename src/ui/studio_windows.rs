@@ -216,6 +216,8 @@ pub fn draw_windows(
 ) {
     draw_rack(ctx, studio, state, audio);
     draw_browser(ctx, studio, state, audio);
+    draw_plugin_editor(ctx, studio, state, audio);
+    draw_rename(ctx, studio, state);
     draw_midi(ctx, studio, state, audio);
     draw_project(ctx, studio, state, audio);
     draw_synth_editor(ctx, studio, state, audio);
@@ -247,7 +249,7 @@ fn section(ui: &mut Ui, title: &str, accent: Color32) {
 fn draw_rack(
     ctx: &egui::Context,
     studio: &mut Studio,
-    _state: &mut UiState,
+    state: &mut UiState,
     audio: &mut AudioRuntime,
 ) {
     if !studio.rack_open {
@@ -272,10 +274,11 @@ fn draw_rack(
             ui.add_space(6.0);
 
             ScrollArea::vertical()
+                .id_salt("rack_tracks")
                 .max_height(340.0)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for (track, spec) in TRACKS.iter().enumerate().take(TRACK_COUNT) {
+                    for (track, _spec) in TRACKS.iter().enumerate().take(TRACK_COUNT) {
                         let info = studio.slots[track].clone();
                         let pending = studio.slot_pending[track];
                         let accent = theme::track_accent(track);
@@ -299,7 +302,7 @@ fn draw_rack(
                                             .color(accent),
                                     );
                                     ui.label(
-                                        RichText::new(spec.name)
+                                        RichText::new(state.track_label(track))
                                             .font(theme::display(8.2))
                                             .color(theme::TEXT),
                                     );
@@ -397,12 +400,15 @@ fn draw_rack(
                                                     ))
                                                     .clicked()
                                             {
-                                                studio.selected_slot = track;
+                                                studio.open_plugin_editor(track, false);
                                             }
                                             ui.label(
-                                                RichText::new(format!("TRACK {}", track + 1))
-                                                    .font(theme::mono(7.0))
-                                                    .color(theme::TEXT_FAINT),
+                                                RichText::new(format!(
+                                                    "TRACK {:02}",
+                                                    track + 1
+                                                ))
+                                                .font(theme::mono(7.0))
+                                                .color(theme::TEXT_FAINT),
                                             );
                                         },
                                     );
@@ -436,6 +442,7 @@ fn draw_rack(
                         theme::CYAN,
                     );
                     ScrollArea::vertical()
+                        .id_salt("rack_params")
                         .max_height(230.0)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -519,7 +526,7 @@ fn draw_rack(
 fn draw_browser(
     ctx: &egui::Context,
     studio: &mut Studio,
-    _state: &mut UiState,
+    state: &mut UiState,
     audio: &mut AudioRuntime,
 ) {
     let mut open = studio.browser_open;
@@ -536,7 +543,7 @@ fn draw_browser(
                     RichText::new(format!(
                         "TARGET TRACK {:02} · {}",
                         studio.browser_target + 1,
-                        TRACKS[studio.browser_target.min(TRACK_COUNT - 1)].name
+                        state.track_label(studio.browser_target.min(TRACK_COUNT - 1))
                     ))
                     .font(theme::display(9.0))
                     .color(theme::CYAN),
@@ -779,10 +786,11 @@ fn draw_midi(
                         studio.notify("Recording stopped");
                     } else {
                         let track = state.selected_track as u8;
+                        let scene = state.launched[track as usize].unwrap_or(0);
                         state.recording = true;
                         state.record_track = track;
-                        state.clear_recorded(track as usize);
-                        let _ = audio.command_tx.push(Command::RecordStart { track });
+                        state.clear_recorded(track as usize, scene as usize);
+                        let _ = audio.command_tx.push(Command::RecordStart { track, scene });
                         studio.notify(format!("Recording on track {:02}", track + 1));
                     }
                 }
@@ -800,17 +808,17 @@ fn draw_midi(
                         .color(theme::TEXT_FAINT),
                 );
                 ComboBox::from_id_salt("midi_track")
-                    .selected_text(format!("{:02}", state.selected_track + 1))
+                    .selected_text(format!(
+                        "{:02} {}",
+                        state.selected_track + 1,
+                        state.track_label(state.selected_track)
+                    ))
                     .show_ui(ui, |ui| {
                         for track in 0..crate::audio::TRACK_COUNT {
                             if ui
                                 .selectable_label(
                                     state.selected_track == track,
-                                    format!(
-                                        "{:02} {}",
-                                        track + 1,
-                                        crate::audio::TRACKS[track].name
-                                    ),
+                                    format!("{:02} {}", track + 1, state.track_label(track)),
                                 )
                                 .clicked()
                             {
@@ -824,15 +832,17 @@ fn draw_midi(
                     });
                 if ui
                     .add(Button::new(
-                        RichText::new("CLEAR CLIP").font(theme::display(8.0)),
+                        RichText::new("CLEAR SLOT").font(theme::display(8.0)),
                     ))
                     .clicked()
                 {
                     let track = state.selected_track;
-                    state.clear_recorded(track);
-                    let _ = audio
-                        .command_tx
-                        .push(Command::ClearRecorded { track: track as u8 });
+                    let scene = state.launched[track].unwrap_or(0);
+                    state.clear_recorded(track, scene as usize);
+                    let _ = audio.command_tx.push(Command::ClearRecorded {
+                        track: track as u8,
+                        scene,
+                    });
                 }
                 let mut midi_to_plugins = state.plugin_midi;
                 if ui
@@ -1133,7 +1143,7 @@ fn draw_synth_editor(
                     .selected_text(format!(
                         "{:02} {}",
                         state.selected_track + 1,
-                        crate::audio::TRACKS[state.selected_track].name
+                        state.track_label(state.selected_track)
                     ))
                     .width(190.0)
                     .show_ui(ui, |ui| {
@@ -1144,7 +1154,7 @@ fn draw_synth_editor(
                                     format!(
                                         "{:02} {}",
                                         track + 1,
-                                        crate::audio::TRACKS[track].name
+                                        state.track_label(track)
                                     ),
                                 )
                                 .clicked()
@@ -1269,7 +1279,7 @@ fn draw_audio_editor(
     egui::Window::new(format!(
         "AUDIO CLIP // TRACK {:02} {}",
         track + 1,
-        TRACKS[track].name
+        state.track_label(track)
     ))
     .open(&mut open)
     .frame(window_frame())
@@ -1284,7 +1294,7 @@ fn draw_audio_editor(
                     .color(theme::TEXT_FAINT),
             );
             egui::ComboBox::from_id_salt("audio_editor_track")
-                .selected_text(format!("{:02} {}", track + 1, TRACKS[track].name))
+                .selected_text(format!("{:02} {}", track + 1, state.track_label(track)))
                 .width(190.0)
                 .show_ui(ui, |ui| {
                     for (index, spec) in TRACKS.iter().enumerate().take(TRACK_COUNT) {
@@ -1536,6 +1546,315 @@ fn draw_audio_editor(
         );
     });
     studio.audio_editor_open = open;
+}
+
+/// Large plugin editor, Ableton-style: the parameter surface can take over
+/// the whole window with `FULLSCREEN` (or F11), and Esc restores it.
+fn draw_plugin_editor(
+    ctx: &egui::Context,
+    studio: &mut Studio,
+    state: &mut UiState,
+    audio: &mut AudioRuntime,
+) {
+    if !studio.plugin_editor_open {
+        return;
+    }
+    let track = studio.plugin_editor_track.min(TRACK_COUNT - 1);
+    let accent = theme::accent_alpha(theme::CYAN, 255);
+    let info = studio.slots[track].clone();
+    let pending = studio.slot_pending[track];
+    let mut open = true;
+
+    let screen = ctx.content_rect();
+    let fullscreen = studio.plugin_editor_fullscreen;
+    let mut window = egui::Window::new(match &info {
+        Some(info) => format!(
+            "PLUGIN EDITOR // TRACK {:02} {} // {}",
+            track + 1,
+            state.track_label(track),
+            info.name
+        ),
+        None => format!(
+            "PLUGIN EDITOR // TRACK {:02} {}",
+            track + 1,
+            state.track_label(track)
+        ),
+    })
+    .open(&mut open)
+    .frame(window_frame())
+    .resizable(!fullscreen)
+    .collapsible(!fullscreen);
+
+    if fullscreen {
+        window = window
+            .fixed_pos(Pos2::new(screen.left() + 6.0, screen.top() + 6.0))
+            .fixed_size(Vec2::new(
+                (screen.width() - 12.0).max(320.0),
+                (screen.height() - 12.0).max(240.0),
+            ));
+    } else {
+        window = window
+            .default_pos(Pos2::new(220.0, 100.0))
+            .default_size(Vec2::new(820.0, 520.0));
+    }
+
+    window.show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    Button::new(
+                        RichText::new(if fullscreen { "RESTORE" } else { "FULLSCREEN" })
+                        .font(theme::display(8.5))
+                        .color(theme::CYAN),
+                    )
+                    .fill(theme::PANEL_SUNK),
+                )
+                .clicked()
+            {
+                studio.plugin_editor_fullscreen = !fullscreen;
+            }
+            ui.label(
+                RichText::new(format!(
+                    "TRACK {:02} {}",
+                    track + 1,
+                    state.track_label(track)
+                ))
+                .font(theme::display(8.5))
+                .color(theme::TEXT_DIM),
+            );
+            if let Some(info) = &info {
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {} · {} params · latency {} smp",
+                        info.format.label(),
+                        info.vendor,
+                        info.params.len(),
+                        info.latency
+                    ))
+                    .font(theme::mono(7.5))
+                    .color(theme::TEXT_FAINT),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(Button::new(
+                        RichText::new("CLOSE").font(theme::display(8.5)),
+                    ))
+                    .clicked()
+                {
+                    studio.plugin_editor_open = false;
+                    studio.plugin_editor_fullscreen = false;
+                }
+                if let Some(info) = &info {
+                    if ui
+                        .add(Button::new(
+                            RichText::new("X").font(theme::display(8.5)),
+                        ))
+                        .clicked()
+                    {
+                        studio.unload_plugin(track, audio);
+                        studio.plugin_editor_open = false;
+                    }
+                    let label = if info.bypass { "BYPASSED" } else { "BYPASS" };
+                    if ui
+                        .add(Button::new(
+                            RichText::new(label).font(theme::display(8.0)),
+                        ))
+                        .clicked()
+                    {
+                        studio.set_bypass(track, !info.bypass);
+                    }
+                }
+                if ui
+                    .add(Button::new(
+                        RichText::new("LOAD…").font(theme::display(8.0)),
+                    ))
+                    .clicked()
+                {
+                    studio.browser_target = track;
+                    studio.browser_open = true;
+                    if studio.scan_results.is_empty() && !studio.scan_running {
+                        studio.start_scan();
+                    }
+                }
+            });
+        });
+
+        ui.add_space(6.0);
+        let Some(info) = info.clone() else {
+            ui.add_space(20.0);
+            let message = if pending {
+                "LOADING PLUGIN…".to_string()
+            } else {
+                format!(
+                    "No plugin on track {:02}. Press LOAD… and pick a CLAP/VST3 instrument or effect.",
+                    track + 1
+                )
+            };
+            ui.label(
+                RichText::new(message)
+                    .font(theme::mono(9.0))
+                    .color(theme::TEXT_DIM),
+            );
+            return;
+        };
+
+        if let Some(error) = &info.error {
+            ui.label(RichText::new(error).font(theme::mono(8.0)).color(theme::RED));
+        }
+
+        ui.add(
+            egui::TextEdit::singleline(&mut studio.plugin_editor_filter)
+                .hint_text("filter parameters…")
+                .desired_width(260.0),
+        );
+        ui.add_space(4.0);
+
+        let filter = studio.plugin_editor_filter.to_lowercase();
+        let params: Vec<_> = info
+            .params
+            .iter()
+            .filter(|param| filter.is_empty() || param.name.to_lowercase().contains(&filter))
+            .cloned()
+            .collect();
+        if params.is_empty() {
+            ui.label(
+                RichText::new("This plugin exposes no parameters, or none match the filter.")
+                    .font(theme::mono(8.0))
+                    .color(theme::TEXT_FAINT),
+            );
+            return;
+        }
+
+        let knob_size = Vec2::new(
+            if fullscreen { 112.0 } else { 100.0 },
+            if fullscreen { 88.0 } else { 74.0 },
+        );
+        let spacing = 8.0;
+        let columns = (((ui.available_width() + spacing) / (knob_size.x + spacing)).floor()
+            as usize)
+            .clamp(1, 10);
+        let mut changes = Vec::new();
+        ScrollArea::vertical()
+            .id_salt("plugin_editor_params")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                Grid::new(("plugin_editor_grid", track))
+                    .num_columns(columns)
+                    .spacing(Vec2::new(8.0, 6.0))
+                    .show(ui, |ui| {
+                        for (index, param) in params.iter().enumerate() {
+                            let mut value = param.value;
+                            let (rect, _) = ui.allocate_exact_size(knob_size, Sense::hover());
+                            let text = format!("{:.0}%", value * 100.0);
+                            if knob(
+                                ui,
+                                rect,
+                                ui.scope_id().with(("plugin_editor_param", track, index)),
+                                &mut value,
+                                0.0..=1.0,
+                                param.value,
+                                &param.name.chars().take(14).collect::<String>(),
+                                &text,
+                                if info.bypass { theme::TEXT_FAINT } else { accent },
+                            ) {
+                                changes.push((param.id, value));
+                            }
+                            if (index + 1) % columns == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+        for (id, value) in changes {
+            if let Some(info) = &studio.slots[track] {
+                if let Some(param) = info.params.iter().find(|p| p.id == id).cloned() {
+                    studio.set_param(track, &param, value);
+                }
+            }
+        }
+    });
+
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) && studio.plugin_editor_fullscreen {
+        studio.plugin_editor_fullscreen = false;
+        ctx.request_repaint();
+    }
+    if !open {
+        studio.plugin_editor_open = false;
+        studio.plugin_editor_fullscreen = false;
+    }
+}
+
+/// Inline track rename prompt used by the session, arrangement and mixer.
+fn draw_rename(ctx: &egui::Context, studio: &mut Studio, state: &mut UiState) {
+    let Some(track) = studio.rename_track else {
+        return;
+    };
+    let track = track.min(TRACK_COUNT - 1);
+    let mut open = true;
+    let mut commit = false;
+    egui::Window::new(format!("RENAME TRACK {:02}", track + 1))
+        .open(&mut open)
+        .frame(window_frame())
+        .resizable(false)
+        .collapsible(false)
+        .default_pos(Pos2::new(480.0, 320.0))
+        .default_width(320.0)
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(
+                    "Track names appear in the session, arrangement, mixer and device chain.",
+                )
+                .font(theme::mono(7.5))
+                .color(theme::TEXT_FAINT),
+            );
+            ui.add_space(4.0);
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut studio.rename_buffer)
+                    .hint_text("track name")
+                    .desired_width(290.0)
+                    .char_limit(24),
+            );
+            if studio.rename_focus {
+                response.request_focus();
+                studio.rename_focus = false;
+            }
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                commit = true;
+            }
+            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                studio.rename_track = None;
+            }
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(Button::new(RichText::new("SAVE").font(theme::display(8.5))))
+                    .clicked()
+                {
+                    commit = true;
+                }
+                if ui
+                    .add(Button::new(
+                        RichText::new("CANCEL").font(theme::display(8.5)),
+                    ))
+                    .clicked()
+                {
+                    studio.rename_track = None;
+                }
+            });
+        });
+    if commit {
+        let name = studio.rename_buffer.clone();
+        state.rename_track(track, &name);
+        studio.rename_track = None;
+        studio.notify(format!(
+            "Track {:02} renamed to {}",
+            track + 1,
+            state.track_label(track)
+        ));
+    } else if !open {
+        studio.rename_track = None;
+    }
 }
 
 fn envelope(progress: f32, fade_in: f32, fade_out: f32) -> f32 {

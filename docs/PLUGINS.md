@@ -56,13 +56,26 @@ REPLICANT_DAW_PLUGIN_PATH="/data/plugins/clap:/data/plugins/vst3" cargo run --re
 ## Using the rack
 
 1. Open **PLUGINS** in the menu bar and press **RESCAN**.
-2. Select a track in the session or device chain, then click **LOAD** in the
-   device chain's `PLUGIN INSERT` module (or in the rack). The plugin is
-   assigned to that track.
-3. **RACK** lists all eight track inserts. Each row has **BYPASS** and **X**
-   (unload), reports its latency, and exposes its parameters as knobs.
-4. State is saved with the project (`Ctrl+S`). VST3 and CLAP state blobs are
+2. Select a track, then click the `PLUGIN` chip in the device chain's
+   `INSTRUMENT` module (or **LOAD** in the rack). The plugin is assigned to that
+   track and its name shows in the instrument slot.
+3. **RACK** lists all eight track inserts. Each row has **EDIT**, **LOAD**,
+   **BYPASS** and **X** (unload), reports its latency, and exposes its
+   parameters as knobs.
+4. **EDIT** (or the `OPEN EDITOR` button in the instrument module) opens the
+   plugin editor: a parameter surface that can fill the whole window with
+   **FULLSCREEN** (F11 toggles it, Esc restores it) and filters parameters by
+   name.
+5. State is saved with the project (`Ctrl+S`). VST3 and CLAP state blobs are
    stored base64-encoded in the `.rproj` file.
+
+Instrument vs effect:
+
+- If the loaded plugin reports itself as an instrument, the slot switches from
+  `FM` to `PLUGIN` and the internal synth is muted for that track. Pick `FM`
+  again to go back.
+- If it is an effect, the FM synth keeps sounding and the plugin is a track
+  insert. You can still force either source with the two chips.
 
 Routing rules:
 
@@ -74,6 +87,8 @@ Routing rules:
   the internal synth is not lost when you add a synth plugin.
 - **MIDI → PLUGINS** in the MIDI window forwards live notes, CC and pitch bend
   to the insert on the selected input track. It is on by default.
+- The sequencer and the piano roll also send note on/off to the instrument
+  insert, so hosted instruments play session clips and recorded MIDI.
 
 ## Unloading and teardown
 

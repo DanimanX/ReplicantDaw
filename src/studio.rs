@@ -69,6 +69,17 @@ pub struct Studio {
     pub audio_editor_open: bool,
     pub audio_editor_track: usize,
 
+    /// Full plugin parameter editor (opens maximized, like a plugin window).
+    pub plugin_editor_open: bool,
+    pub plugin_editor_track: usize,
+    pub plugin_editor_fullscreen: bool,
+    pub plugin_editor_filter: String,
+
+    /// Inline track rename prompt.
+    pub rename_track: Option<usize>,
+    pub rename_buffer: String,
+    pub rename_focus: bool,
+
     pub project_name: String,
     pub project_path: Option<PathBuf>,
     pub projects: Vec<PathBuf>,
@@ -106,6 +117,13 @@ impl Studio {
             roll_drag: None,
             audio_editor_open: false,
             audio_editor_track: 0,
+            plugin_editor_open: false,
+            plugin_editor_track: 0,
+            plugin_editor_fullscreen: false,
+            plugin_editor_filter: String::new(),
+            rename_track: None,
+            rename_buffer: String::new(),
+            rename_focus: false,
             project_name: "Untitled".to_string(),
             project_path: None,
             projects: Project::list_available(),
@@ -430,20 +448,31 @@ impl Studio {
                 }
             }
 
-            let mut clip = RecordedClip::default();
-            state.set_recorded(index, track.notes.clone());
-            for note in &track.notes {
-                clip.push(*note);
+            state.rename_track(index, &track.name);
+            for scene in 0..crate::audio::SCENE_COUNT {
+                state.set_recorded(index, scene, Vec::new());
+                state.recorded_active[index][scene] = true;
+                let _ = audio.command_tx.push(Command::SetRecordedClip {
+                    track: index as u8,
+                    scene: scene as u8,
+                    clip: RecordedClip::default(),
+                });
             }
-            let _ = audio.command_tx.push(Command::SetRecordedClip {
-                track: index as u8,
-                clip,
-            });
-            state.recorded_active[index] = track.clip_enabled;
-            let _ = audio.command_tx.push(Command::SetRecordedActive {
-                track: index as u8,
-                active: track.clip_enabled,
-            });
+            for entry in &track.clips {
+                let scene = (entry.scene as usize).min(crate::audio::SCENE_COUNT - 1);
+                state.set_recorded(index, scene, entry.notes.clone());
+                state.recorded_active[index][scene] = entry.enabled;
+                let _ = audio.command_tx.push(Command::SetRecordedClip {
+                    track: index as u8,
+                    scene: scene as u8,
+                    clip: clip_from_notes(&entry.notes),
+                });
+                let _ = audio.command_tx.push(Command::SetRecordedActive {
+                    track: index as u8,
+                    scene: scene as u8,
+                    active: entry.enabled,
+                });
+            }
 
             if let Some(synth) = &track.synth {
                 let params = synth.to_params();
@@ -457,6 +486,7 @@ impl Studio {
                 }
             }
 
+            state.instrument_plugin[index] = track.instrument_plugin;
             state.clip_gain_db[index] = track.clip_gain_db;
             state.clip_fade_in[index] = track.fade_in;
             state.clip_fade_out[index] = track.fade_out;
@@ -554,6 +584,43 @@ impl Studio {
         self.audio_editor_open = true;
         self.audio_editor_track = track.min(TRACK_COUNT - 1);
     }
+
+    /// Open the large plugin editor. `fullscreen` fills the whole viewport.
+    pub fn open_plugin_editor(&mut self, track: usize, fullscreen: bool) {
+        self.plugin_editor_open = true;
+        self.plugin_editor_track = track.min(TRACK_COUNT - 1);
+        self.plugin_editor_fullscreen = fullscreen;
+        self.selected_slot = track.min(TRACK_COUNT - 1);
+    }
+
+    /// Keep each track's internal synth mute in line with its instrument slot.
+    ///
+    /// Runs every frame, so a plugin loaded on a track that is not currently
+    /// selected still takes over that track's sound source.
+    pub fn sync_instrument_sources(&mut self, state: &mut UiState, audio: &mut AudioRuntime) {
+        for track in 0..TRACK_COUNT {
+            let loaded = self.slots[track].is_some();
+            let plugin_is_instrument = self.slots[track]
+                .as_ref()
+                .is_some_and(|slot| slot.is_instrument);
+            let want_synth =
+                desired_synth(loaded, plugin_is_instrument, state.instrument_plugin[track]);
+            if state.synth_enabled[track] != want_synth {
+                state.synth_enabled[track] = want_synth;
+                let _ = audio.command_tx.push(Command::SetTrackSynth {
+                    track: track as u8,
+                    enabled: want_synth,
+                });
+            }
+        }
+    }
+
+    /// Start renaming a track in the small inline prompt.
+    pub fn begin_rename(&mut self, track: usize, current: &str) {
+        self.rename_track = Some(track.min(TRACK_COUNT - 1));
+        self.rename_buffer = current.to_string();
+        self.rename_focus = true;
+    }
 }
 
 impl PluginDescriptor {
@@ -572,9 +639,22 @@ impl PluginDescriptor {
     }
 }
 
-/// Convenience for the UI: does this track have recorded material?
-pub fn has_recorded(state: &UiState, track: usize) -> bool {
-    !state.recorded_notes(track).is_empty()
+/// Should the internal FM synth sound, given the instrument slot state?
+///
+/// `choice` is the user's explicit source (`Some(true)` = plugin); `None`
+/// follows the plugin type, so loading an instrument takes over the track.
+pub fn desired_synth(
+    plugin_loaded: bool,
+    plugin_is_instrument: bool,
+    choice: Option<bool>,
+) -> bool {
+    let plugin_selected = choice.unwrap_or(plugin_is_instrument);
+    !(plugin_selected && plugin_loaded)
+}
+
+/// Convenience for the UI: does this session slot hold recorded material?
+pub fn has_recorded(state: &UiState, track: usize, scene: usize) -> bool {
+    !state.recorded_notes(track, scene).is_empty()
 }
 
 /// Convert recorded notes to the fixed-capacity engine clip.
@@ -586,14 +666,15 @@ pub fn clip_from_notes(notes: &[RecordedNote]) -> RecordedClip {
     clip
 }
 
-/// Push a track's edited notes to the audio engine.
-pub fn sync_track_notes(state: &UiState, audio: &mut AudioRuntime, track: usize) {
-    if track >= TRACK_COUNT {
+/// Push one session slot's edited notes to the audio engine.
+pub fn sync_track_notes(state: &UiState, audio: &mut AudioRuntime, track: usize, scene: usize) {
+    if track >= TRACK_COUNT || scene >= crate::audio::SCENE_COUNT {
         return;
     }
-    let clip = clip_from_notes(state.recorded_notes(track));
+    let clip = clip_from_notes(state.recorded_notes(track, scene));
     let _ = audio.command_tx.push(Command::SetRecordedClip {
         track: track as u8,
+        scene: scene as u8,
         clip,
     });
 }
@@ -634,6 +715,21 @@ mod tests {
         let clip = clip_from_notes(&notes);
         assert_eq!(clip.len, 2);
         assert_eq!(clip.as_slice(), notes.as_slice());
+    }
+
+    #[test]
+    fn instrument_slot_decides_the_sound_source() {
+        // No plugin: the FM synth always sounds.
+        assert!(desired_synth(false, false, None));
+        assert!(desired_synth(false, false, Some(true)));
+
+        // Instrument plugin: takes over automatically.
+        assert!(!desired_synth(true, true, None));
+        // Effect plugin: the synth keeps sounding.
+        assert!(desired_synth(true, false, None));
+        // Explicit choices win.
+        assert!(!desired_synth(true, false, Some(true)));
+        assert!(desired_synth(true, true, Some(false)));
     }
 
     #[test]

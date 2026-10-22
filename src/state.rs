@@ -57,6 +57,8 @@ pub struct UiState {
     pub solo: [bool; TRACK_COUNT],
     /// Currently launched scene per track (`None` = clip stopped).
     pub launched: [Option<u8>; TRACK_COUNT],
+    /// User-editable track names (defaults come from the track specs).
+    pub track_name: [String; TRACK_COUNT],
     pub peaks: [f32; TRACK_COUNT],
     pub master_peaks: [f32; 2],
     pub cpu: f32,
@@ -68,7 +70,12 @@ pub struct UiState {
     pub clip_fade_in: [f32; TRACK_COUNT],
     pub clip_fade_out: [f32; TRACK_COUNT],
     pub synth: [SynthParams; TRACK_COUNT],
-    pub recorded_active: [bool; TRACK_COUNT],
+    /// Internal FM synth audible on this track.
+    pub synth_enabled: [bool; TRACK_COUNT],
+    /// Explicit instrument source choice; `None` follows the plugin type.
+    pub instrument_plugin: [Option<bool>; TRACK_COUNT],
+    /// Per-slot clip playback enable, indexed by (track, scene).
+    pub recorded_active: [[bool; SCENE_COUNT]; TRACK_COUNT],
     /// Floating "add effect" menu state.
     pub add_effect_open: bool,
     pub add_menu_pos: egui::Pos2,
@@ -78,8 +85,8 @@ pub struct UiState {
     pub analyzer: SpectrumAnalyzer,
     pub selected_track: usize,
     pub hovered_scene: Option<usize>,
-    /// Mirror of the engine's recorded clips, used for display and saving.
-    pub recorded: [Vec<RecordedNote>; TRACK_COUNT],
+    /// Mirror of the engine's session clips, one per (track, scene).
+    pub recorded: [[Vec<RecordedNote>; SCENE_COUNT]; TRACK_COUNT],
     pub recording: bool,
     pub record_track: u8,
     pub input_track: u8,
@@ -107,6 +114,7 @@ impl UiState {
             mute: [false; TRACK_COUNT],
             solo: [false; TRACK_COUNT],
             launched,
+            track_name: std::array::from_fn(|index| TRACKS[index].name.to_string()),
             peaks: [0.0; TRACK_COUNT],
             master_peaks: [0.0; 2],
             cpu: 0.0,
@@ -117,7 +125,9 @@ impl UiState {
             clip_fade_in: [0.0; TRACK_COUNT],
             clip_fade_out: [0.0; TRACK_COUNT],
             synth: std::array::from_fn(|index| SynthParams::from_spec(&TRACKS[index])),
-            recorded_active: [true; TRACK_COUNT],
+            synth_enabled: [true; TRACK_COUNT],
+            instrument_plugin: [None; TRACK_COUNT],
+            recorded_active: [[true; SCENE_COUNT]; TRACK_COUNT],
             add_effect_open: false,
             add_menu_pos: egui::Pos2::new(200.0, 200.0),
             pending_chain_reset: false,
@@ -126,7 +136,7 @@ impl UiState {
             analyzer: SpectrumAnalyzer::new(48_000.0),
             selected_track: 0,
             hovered_scene: None,
-            recorded: std::array::from_fn(|_| Vec::new()),
+            recorded: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
             recording: false,
             record_track: 0,
             input_track: 0,
@@ -182,47 +192,76 @@ impl UiState {
     /// Apply a recording event mirrored from the engine.
     pub fn apply_record_event(&mut self, event: RecordEvent) {
         let track = event.track as usize;
-        if track >= TRACK_COUNT {
+        let scene = event.scene as usize;
+        if track >= TRACK_COUNT || scene >= SCENE_COUNT {
             return;
         }
         if event.reset {
-            self.recorded[track].clear();
+            self.recorded[track][scene].clear();
             return;
         }
-        if self.recorded[track].len() < crate::audio::messages::MAX_RECORDED_NOTES {
-            self.recorded[track].push(event.note);
+        if self.recorded[track][scene].len() < crate::audio::messages::MAX_RECORDED_NOTES {
+            self.recorded[track][scene].push(event.note);
         }
     }
 
-    pub fn recorded_notes(&self, track: usize) -> &[RecordedNote] {
+    pub fn recorded_notes(&self, track: usize, scene: usize) -> &[RecordedNote] {
         self.recorded
             .get(track)
+            .and_then(|slots| slots.get(scene))
             .map(|notes| notes.as_slice())
             .unwrap_or(&[])
     }
 
-    pub fn clear_recorded(&mut self, track: usize) {
-        if let Some(notes) = self.recorded.get_mut(track) {
-            notes.clear();
+    pub fn clear_recorded(&mut self, track: usize, scene: usize) {
+        if let Some(slot) = self.recorded.get_mut(track).and_then(|s| s.get_mut(scene)) {
+            slot.clear();
         }
     }
 
-    pub fn set_recorded(&mut self, track: usize, notes: Vec<RecordedNote>) {
-        if let Some(slot) = self.recorded.get_mut(track) {
+    pub fn set_recorded(&mut self, track: usize, scene: usize, notes: Vec<RecordedNote>) {
+        if let Some(slot) = self.recorded.get_mut(track).and_then(|s| s.get_mut(scene)) {
             *slot = notes;
         }
+    }
+
+    /// User-facing track name (falls back to the static spec).
+    pub fn track_label(&self, track: usize) -> &str {
+        self.track_name
+            .get(track)
+            .map(|name| name.as_str())
+            .unwrap_or(TRACKS[track.min(TRACK_COUNT - 1)].name)
+    }
+
+    pub fn rename_track(&mut self, track: usize, name: &str) {
+        if let Some(slot) = self.track_name.get_mut(track) {
+            let cleaned = name.trim();
+            *slot = if cleaned.is_empty() {
+                TRACKS[track.min(TRACK_COUNT - 1)].name.to_string()
+            } else {
+                cleaned.chars().take(24).collect()
+            };
+        }
+    }
+
+    /// Does any session slot of this track hold a MIDI clip?
+    pub fn track_has_clips(&self, track: usize) -> bool {
+        self.recorded
+            .get(track)
+            .is_some_and(|slots| slots.iter().any(|notes| !notes.is_empty()))
     }
 
     /// Append a note to a track's clip. Returns the new note index.
     pub fn add_note(
         &mut self,
         track: usize,
+        scene: usize,
         note: u8,
         velocity: u8,
         start_step: u16,
         length_steps: u16,
     ) -> Option<usize> {
-        let notes = self.recorded.get_mut(track)?;
+        let notes = self.recorded.get_mut(track)?.get_mut(scene)?;
         if notes.len() >= crate::audio::messages::MAX_RECORDED_NOTES {
             return None;
         }
@@ -235,8 +274,8 @@ impl UiState {
         Some(notes.len() - 1)
     }
 
-    pub fn remove_note(&mut self, track: usize, index: usize) {
-        if let Some(notes) = self.recorded.get_mut(track) {
+    pub fn remove_note(&mut self, track: usize, scene: usize, index: usize) {
+        if let Some(notes) = self.recorded.get_mut(track).and_then(|s| s.get_mut(scene)) {
             if index < notes.len() {
                 notes.remove(index);
             }
@@ -244,8 +283,15 @@ impl UiState {
     }
 
     /// Move a note to a new start step and pitch, clamped to the loop.
-    pub fn move_note(&mut self, track: usize, index: usize, start_step: i32, note: i32) {
-        if let Some(notes) = self.recorded.get_mut(track) {
+    pub fn move_note(
+        &mut self,
+        track: usize,
+        scene: usize,
+        index: usize,
+        start_step: i32,
+        note: i32,
+    ) {
+        if let Some(notes) = self.recorded.get_mut(track).and_then(|s| s.get_mut(scene)) {
             if let Some(target) = notes.get_mut(index) {
                 target.start_step = start_step.clamp(0, crate::audio::LOOP_STEPS as i32 - 1) as u16;
                 target.note = note.clamp(0, 127) as u8;
@@ -256,8 +302,8 @@ impl UiState {
     }
 
     /// Resize a note, keeping at least one step and staying inside the loop.
-    pub fn resize_note(&mut self, track: usize, index: usize, length_steps: i32) {
-        if let Some(notes) = self.recorded.get_mut(track) {
+    pub fn resize_note(&mut self, track: usize, scene: usize, index: usize, length_steps: i32) {
+        if let Some(notes) = self.recorded.get_mut(track).and_then(|s| s.get_mut(scene)) {
             if let Some(target) = notes.get_mut(index) {
                 let max = crate::audio::LOOP_STEPS as i32 - target.start_step as i32;
                 target.length_steps = length_steps.clamp(1, max.max(1)) as u16;
@@ -265,8 +311,8 @@ impl UiState {
         }
     }
 
-    pub fn set_note_velocity(&mut self, track: usize, index: usize, velocity: u8) {
-        if let Some(notes) = self.recorded.get_mut(track) {
+    pub fn set_note_velocity(&mut self, track: usize, scene: usize, index: usize, velocity: u8) {
+        if let Some(notes) = self.recorded.get_mut(track).and_then(|s| s.get_mut(scene)) {
             if let Some(target) = notes.get_mut(index) {
                 target.velocity = velocity.clamp(1, 127);
             }
@@ -351,12 +397,22 @@ impl UiState {
     pub fn clip_waveform(&self, track: usize, scene: usize, points: usize) -> Vec<f32> {
         let mut out = Vec::with_capacity(points);
         let accent_phase = (track * 7 + scene * 3) as f32 * 0.37;
+        let recorded = self.recorded_notes(track, scene);
         for i in 0..points {
             let t = i as f32 / points.max(1) as f32;
             let step = (t * 16.0) as usize;
-            let gate = match crate::audio::note_at(track, scene, step) {
-                Some(note) => ((note % 12) as f32 / 12.0 * 0.5 + 0.5) * 0.6,
-                None => 0.0,
+            let gate = if recorded.is_empty() {
+                match crate::audio::note_at(track, scene, step) {
+                    Some(note) => ((note % 12) as f32 / 12.0 * 0.5 + 0.5) * 0.6,
+                    None => 0.0,
+                }
+            } else {
+                let loop_step = (t * crate::audio::LOOP_STEPS as f32) as u16;
+                recorded
+                    .iter()
+                    .find(|note| loop_step >= note.start_step && loop_step < note.end_step())
+                    .map(|note| ((note.note % 12) as f32 / 12.0 * 0.5 + 0.5) * 0.7)
+                    .unwrap_or(0.0)
             };
             let carrier = (t * TAU * (7.0 + track as f32 * 0.8) + accent_phase).sin();
             let harmonic = (t * TAU * (17.0 + scene as f32) + accent_phase * 2.0).sin();
@@ -452,25 +508,51 @@ mod tests {
     #[test]
     fn note_editing_helpers_clamp_to_the_loop() {
         let mut state = UiState::new();
-        let index = state.add_note(2, 64, 100, 8, 4).expect("add note");
-        assert_eq!(state.recorded_notes(2).len(), 1);
+        let index = state.add_note(2, 3, 64, 100, 8, 4).expect("add note");
+        assert_eq!(state.recorded_notes(2, 3).len(), 1);
 
-        state.move_note(2, index, -20, 200);
-        let note = state.recorded_notes(2)[0];
+        state.move_note(2, 3, index, -20, 200);
+        let note = state.recorded_notes(2, 3)[0];
         assert_eq!(note.start_step, 0);
         assert_eq!(note.note, 127);
 
-        state.resize_note(2, index, 999);
+        state.resize_note(2, 3, index, 999);
         assert_eq!(
-            state.recorded_notes(2)[0].length_steps,
+            state.recorded_notes(2, 3)[0].length_steps,
             crate::audio::LOOP_STEPS as u16
         );
 
-        state.set_note_velocity(2, index, 0);
-        assert_eq!(state.recorded_notes(2)[0].velocity, 1);
+        state.set_note_velocity(2, 3, index, 0);
+        assert_eq!(state.recorded_notes(2, 3)[0].velocity, 1);
 
-        state.remove_note(2, index);
-        assert!(state.recorded_notes(2).is_empty());
+        state.remove_note(2, 3, index);
+        assert!(state.recorded_notes(2, 3).is_empty());
+    }
+
+    #[test]
+    fn session_slots_hold_independent_clips() {
+        let mut state = UiState::new();
+        state.add_note(1, 0, 60, 100, 0, 2).expect("slot 0");
+        state.add_note(1, 5, 72, 90, 16, 4).expect("slot 5");
+        assert_eq!(state.recorded_notes(1, 0).len(), 1);
+        assert_eq!(state.recorded_notes(1, 0)[0].note, 60);
+        assert_eq!(state.recorded_notes(1, 5)[0].note, 72);
+        assert!(state.recorded_notes(1, 1).is_empty());
+
+        state.clear_recorded(1, 0);
+        assert!(state.recorded_notes(1, 0).is_empty());
+        assert_eq!(state.recorded_notes(1, 5).len(), 1);
+    }
+
+    #[test]
+    fn track_names_are_editable_and_bounded() {
+        let mut state = UiState::new();
+        state.rename_track(0, "  MY BASS  ");
+        assert_eq!(state.track_label(0), "MY BASS");
+        state.rename_track(0, "   ");
+        assert_eq!(state.track_label(0), TRACKS[0].name);
+        state.rename_track(1, &"X".repeat(80));
+        assert_eq!(state.track_label(1).chars().count(), 24);
     }
 
     #[test]

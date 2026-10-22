@@ -225,10 +225,11 @@ pub fn draw(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRunti
             state.recording = false;
         } else {
             let track = state.selected_track as u8;
-            state.clear_recorded(track as usize);
+            let scene = state.launched[track as usize].unwrap_or(0);
+            state.clear_recorded(track as usize, scene as usize);
             state.recording = true;
             state.record_track = track;
-            let _ = audio.command_tx.push(Command::RecordStart { track });
+            let _ = audio.command_tx.push(Command::RecordStart { track, scene });
         }
     }
     if state.recording && rec_rect.right() < rect.right() - 10.0 {

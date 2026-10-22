@@ -53,6 +53,25 @@ pub fn body(size: f32) -> FontId {
     FontId::new(size, FontFamily::Proportional)
 }
 
+/// Shrink a font until `text` fits `max_width`, with a readable floor.
+///
+/// Used for user-editable track names, which can be longer than the fixed
+/// slots that display them (session headers and mixer strips).
+pub fn fitted_font(painter: &Painter, text: &str, font: FontId, max_width: f32) -> FontId {
+    if max_width <= 1.0 {
+        return font;
+    }
+    let width = painter
+        .layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE)
+        .size()
+        .x;
+    if width <= max_width || width <= 0.0 {
+        return font;
+    }
+    let size = (font.size * max_width / width).max(4.5);
+    FontId::new(size, font.family)
+}
+
 pub fn accent_alpha(color: Color32, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }

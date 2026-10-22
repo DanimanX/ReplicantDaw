@@ -1,7 +1,9 @@
-//! Bottom device chain: editable FM synth, modular effects and the master bus.
+//! Bottom device chain: instrument slot, modular effects and the master bus.
 //!
-//! Modules are painted left to right in signal order. Every effect can be
-//! bypassed, reordered, closed (removed) and re-added from the `+ FX` menu.
+//! The first module is the track's instrument slot. It holds the internal
+//! `NEURAL GEN V5` FM synth and the CLAP/VST3 instrument insert, and lets you
+//! choose which one sounds. Modules are painted left to right in signal order;
+//! every effect can be bypassed, reordered, closed and re-added from `+ FX`.
 
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
@@ -33,7 +35,7 @@ pub fn draw(
     studio: &mut Studio,
     audio: &mut AudioRuntime,
 ) {
-    let tag = format!("SYNTH → PLUGIN → {} FX → MASTER", state.effects.len());
+    let tag = format!("INSTRUMENT → {} FX → MASTER", state.effects.len());
     let content = theme::paint_panel(
         ui.painter(),
         rect,
@@ -45,19 +47,16 @@ pub fn draw(
         return;
     }
 
-    // Width weights: synth and master are wider, the add button is compact.
+    // Width weights: the instrument slot and master are wider, the add
+    // button is compact.
     let effect_count = state.effects.len();
-    let synth_weight = 1.55_f32;
-    let plugin_weight = 1.12_f32;
+    let instrument_weight = 2.55_f32;
     let effect_weight = 1.0_f32;
     let add_weight = 0.58_f32;
-    let master_weight = 0.92_f32;
-    let modules = effect_count + 4;
-    let weights = synth_weight
-        + plugin_weight
-        + effect_weight * effect_count as f32
-        + add_weight
-        + master_weight;
+    let master_weight = 0.95_f32;
+    let modules = effect_count + 3;
+    let weights =
+        instrument_weight + effect_weight * effect_count as f32 + add_weight + master_weight;
     let usable = content.width() - GAP * (modules.saturating_sub(1)) as f32;
     let unit = (usable / weights).max(46.0);
 
@@ -66,21 +65,13 @@ pub fn draw(
     let mut param_change: Option<(usize, usize, f32)> = None;
     let mut synth_change: Option<(usize, SynthParam, f32)> = None;
 
-    // ---- Synth module ---------------------------------------------------
-    let synth_rect = Rect::from_min_size(
+    // ---- Instrument slot (internal FM synth + plugin insert) ------------
+    let instrument_rect = Rect::from_min_size(
         Pos2::new(x, content.top()),
-        Vec2::new(unit * synth_weight, content.height()),
+        Vec2::new(unit * instrument_weight, content.height()),
     );
-    draw_synth(ui, synth_rect, state, &mut synth_change);
-    x += synth_rect.width() + GAP;
-
-    // ---- Per-track plugin insert ----------------------------------------
-    let plugin_rect = Rect::from_min_size(
-        Pos2::new(x, content.top()),
-        Vec2::new(unit * plugin_weight, content.height()),
-    );
-    draw_plugin(ui, plugin_rect, studio, state, audio);
-    x += plugin_rect.width() + GAP;
+    draw_instrument(ui, instrument_rect, studio, state, audio, &mut synth_change);
+    x += instrument_rect.width() + GAP;
 
     // ---- Effect modules -------------------------------------------------
     for index in 0..effect_count {
@@ -196,14 +187,15 @@ fn module_shell(ui: &Ui, rect: Rect, title: &str, badge: &str, accent: Color32) 
         .shrink2(Vec2::new(7.0, 0.0))
         .with_max_x(header.right() - 44.0);
     let clipped = painter.with_clip_rect(title_rect);
+    let font = theme::fitted_font(&clipped, title, theme::display(7.6), title_rect.width());
     clipped.text(
         Pos2::new(title_rect.left(), header.center().y),
         Align2::LEFT_CENTER,
         title,
-        theme::display(7.6),
+        font,
         accent,
     );
-    if !badge.is_empty() {
+    if !badge.is_empty() && rect.width() >= 150.0 {
         painter.text(
             Pos2::new(title_rect.right(), header.center().y),
             Align2::RIGHT_CENTER,
@@ -277,73 +269,178 @@ fn norm_to_value(norm: f32, min: f32, max: f32, log: bool) -> f32 {
     }
 }
 
-fn draw_synth(
+/// The track's instrument slot: internal FM synth plus the CLAP/VST3 insert.
+///
+/// Ableton-style: one slot, two possible sound sources. `FM` plays the
+/// internal `NEURAL GEN V5` engine, `PLUGIN` plays the hosted instrument. The
+/// choice is pushed to the engine so only one source sounds per track.
+fn draw_instrument(
     ui: &mut Ui,
     rect: Rect,
+    studio: &mut Studio,
     state: &mut UiState,
+    audio: &mut AudioRuntime,
     change: &mut Option<(usize, SynthParam, f32)>,
 ) {
     let track = state.selected_track.min(crate::audio::TRACK_COUNT - 1);
     let accent = theme::track_accent(track);
+    let info = studio.slots[track].clone();
+    let pending = studio.slot_pending[track];
+    let plugin_is_instrument = info.as_ref().is_some_and(|slot| slot.is_instrument);
+    let plugin_selected = state.instrument_plugin[track].unwrap_or(plugin_is_instrument);
+    let plugin_source = plugin_selected && info.is_some();
+
     let inner = module_shell(
         ui,
         rect,
-        "NEURAL GEN V5",
+        "INSTRUMENT",
         &format!("TRK {:02}", track + 1),
         accent,
     );
 
-    // Clicking the track badge cycles the edited track.
-    let selector = Rect::from_min_size(inner.min, Vec2::new(inner.width(), 15.0));
-    let hit = ui.interact(
-        selector,
-        ui.scope_id().with("synth_track_select"),
+    // ---- Source selector + plugin actions -------------------------------
+    let row_h = 16.0;
+    let chip_w = (inner.width() * 0.24).clamp(42.0, 78.0);
+    let fm_chip = Rect::from_min_size(inner.min, Vec2::new(chip_w, row_h));
+    let plugin_chip = Rect::from_min_size(
+        Pos2::new(fm_chip.right() + 3.0, inner.top()),
+        Vec2::new((inner.width() * 0.42).clamp(60.0, 150.0), row_h),
+    );
+    let track_select = Rect::from_min_size(
+        Pos2::new(plugin_chip.right() + 3.0, inner.top()),
+        Vec2::new((inner.right() - plugin_chip.right() - 3.0).max(20.0), row_h),
+    );
+
+    if source_chip(
+        ui,
+        fm_chip,
+        "FM",
+        !plugin_source,
+        accent,
+        ui.scope_id().with(("instrument_fm", track)),
+    ) {
+        state.instrument_plugin[track] = Some(false);
+    }
+    let plugin_label = match &info {
+        Some(info) => info.name.chars().take(14).collect::<String>(),
+        None => "+ VST3 / CLAP".to_string(),
+    };
+    if source_chip(
+        ui,
+        plugin_chip,
+        &plugin_label,
+        plugin_source,
+        theme::GREEN,
+        ui.scope_id().with(("instrument_plugin", track)),
+    ) {
+        if info.is_some() {
+            state.instrument_plugin[track] = Some(true);
+        } else {
+            studio.browser_target = track;
+            studio.browser_open = true;
+            if studio.scan_results.is_empty() && !studio.scan_running {
+                studio.start_scan();
+            }
+        }
+    }
+
+    // Clicking the track name cycles the edited track.
+    let track_hit = ui.interact(
+        track_select,
+        ui.scope_id().with(("instrument_track", track)),
         Sense::click(),
     );
-    if hit.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
     ui.painter().rect_filled(
-        selector,
+        track_select,
         CornerRadius::same(1),
-        if hit.hovered() {
+        if track_hit.hovered() {
             theme::accent_alpha(accent, 30)
         } else {
             theme::PANEL_SUNK
         },
     );
-    ui.painter().text(
-        Pos2::new(selector.left() + 4.0, selector.center().y),
+    let track_painter = ui
+        .painter()
+        .with_clip_rect(track_select.shrink2(Vec2::new(2.0, 0.0)));
+    track_painter.text(
+        Pos2::new(track_select.left() + 4.0, track_select.center().y),
         Align2::LEFT_CENTER,
-        crate::audio::TRACKS[track].name,
+        state.track_label(track),
         theme::mono(7.0),
         accent,
     );
-    ui.painter().text(
-        Pos2::new(selector.right() - 4.0, selector.center().y),
-        Align2::RIGHT_CENTER,
-        format!("EDIT ▸ {:02}", track + 1),
-        theme::mono(6.0),
-        theme::TEXT_FAINT,
-    );
-    if hit.clicked() {
+    if track_hit.clicked() {
         state.selected_track = (track + 1) % crate::audio::TRACK_COUNT;
     }
+    if track_hit.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        track_hit.on_hover_text("Click to edit the next track");
+    }
 
+    // ---- Plugin actions on the right of the selector --------------------
+    let button = 13.0;
+    let y = rect.top() + (HEADER_H - button) * 0.5;
+    let right = rect.right() - 4.0;
+    let close = Rect::from_min_size(Pos2::new(right - button, y), Vec2::splat(button));
+    let bypass = Rect::from_min_size(
+        Pos2::new(close.left() - button - 2.0, y),
+        Vec2::splat(button),
+    );
+    let edit = Rect::from_min_size(
+        Pos2::new(bypass.left() - button - 2.0, y),
+        Vec2::splat(button),
+    );
+    if info.is_some() {
+        if icon_button(ui, edit, "E", accent) {
+            studio.open_plugin_editor(track, false);
+        }
+        if icon_button(
+            ui,
+            bypass,
+            if info.as_ref().is_some_and(|slot| slot.bypass) {
+                "B"
+            } else {
+                "b"
+            },
+            accent,
+        ) {
+            let bypass_now = !info.as_ref().is_some_and(|slot| slot.bypass);
+            studio.set_bypass(track, bypass_now);
+        }
+        if icon_button(ui, close, "X", theme::RED) {
+            studio.unload_plugin(track, audio);
+            state.instrument_plugin[track] = None;
+        }
+    }
+
+    let content_top = inner.top() + row_h + 4.0;
+    // Leave room for the engine badge under the synth knobs.
+    let content = Rect::from_min_max(
+        Pos2::new(inner.left(), content_top),
+        Pos2::new(inner.right(), inner.bottom() - 13.0),
+    );
+
+    if plugin_source {
+        if let Some(info) = &info {
+            draw_plugin_parameters(ui, content, studio, track, info, accent);
+            return;
+        }
+    }
+
+    // ---- Internal FM synth (NEURAL GEN V5) ------------------------------
     let params = state.synth[track];
-    let knob_area = Rect::from_min_max(Pos2::new(inner.left(), selector.bottom() + 3.0), inner.max);
-    let columns = ((knob_area.width() / 58.0).floor() as usize).clamp(2, 4);
+    let columns = ((content.width() / 62.0).floor() as usize).clamp(2, 4);
     let rows = SynthParam::ALL.len().div_ceil(columns);
-    let cell_w = knob_area.width() / columns as f32;
-    let cell_h = (knob_area.height() / rows as f32).max(34.0);
+    let cell_w = content.width() / columns as f32;
+    let cell_h = (content.height() / rows as f32).max(32.0);
 
     for (index, param) in SynthParam::ALL.iter().enumerate() {
         let row = index / columns;
         let column = index % columns;
         let cell = Rect::from_min_size(
             Pos2::new(
-                knob_area.left() + column as f32 * cell_w,
-                knob_area.top() + row as f32 * cell_h,
+                content.left() + column as f32 * cell_w,
+                content.top() + row as f32 * cell_h,
             ),
             Vec2::new(cell_w, cell_h),
         );
@@ -379,152 +476,211 @@ fn draw_synth(
             *change = Some((track, *param, value));
         }
     }
+
+    // Badge that names the internal engine and opens the full editor.
+    let badge = Rect::from_min_size(
+        Pos2::new(inner.left(), content.bottom() + 1.0),
+        Vec2::new(content.width(), 11.0),
+    );
+    let badge_hit = ui.interact(
+        badge,
+        ui.scope_id().with(("synth_editor_open", track)),
+        Sense::click(),
+    );
+    ui.painter().text(
+        Pos2::new(badge.left() + 2.0, badge.center().y),
+        Align2::LEFT_CENTER,
+        "NEURAL GEN V5 · 2-OP FM",
+        theme::mono(6.0),
+        theme::TEXT_FAINT,
+    );
+    ui.painter().text(
+        Pos2::new(badge.right() - 2.0, badge.center().y),
+        Align2::RIGHT_CENTER,
+        if badge_hit.hovered() {
+            "OPEN ▸"
+        } else {
+            "EDITOR ▸"
+        },
+        theme::mono(6.0),
+        if badge_hit.hovered() {
+            accent
+        } else {
+            theme::TEXT_FAINT
+        },
+    );
+    if badge_hit.clicked() {
+        studio.synth_open = true;
+    }
+    if badge_hit.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        badge_hit.on_hover_text("Open the FM voice editor");
+    }
+
+    let _ = pending;
 }
 
-fn draw_plugin(
+/// Small selectable chip used by the instrument source row.
+fn source_chip(
     ui: &mut Ui,
     rect: Rect,
-    studio: &mut Studio,
-    state: &mut UiState,
-    audio: &mut AudioRuntime,
-) {
-    let track = state.selected_track.min(crate::audio::TRACK_COUNT - 1);
-    let accent = theme::GREEN;
-    let inner = module_shell(
-        ui,
+    label: &str,
+    active: bool,
+    accent: Color32,
+    id: egui::Id,
+) -> bool {
+    let hit = ui.interact(rect, id, Sense::click());
+    let hovered = hit.hovered();
+    ui.painter().rect_filled(
         rect,
-        "PLUGIN INSERT",
-        &format!("TRK {:02}", track + 1),
+        CornerRadius::same(1),
+        if active {
+            theme::accent_alpha(accent, 45)
+        } else if hovered {
+            theme::accent_alpha(accent, 20)
+        } else {
+            theme::PANEL_SUNK
+        },
+    );
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(1),
+        Stroke::new(
+            1.0,
+            if active {
+                accent
+            } else if hovered {
+                theme::accent_alpha(accent, 120)
+            } else {
+                theme::BORDER_SOFT
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    let painter = ui
+        .painter()
+        .with_clip_rect(rect.shrink2(Vec2::new(3.0, 0.0)));
+    painter.text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        theme::display(6.6),
+        if active { accent } else { theme::TEXT_DIM },
+    );
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    hit.clicked()
+}
+
+/// Parameter grid + edit controls for the hosted plugin instrument.
+fn draw_plugin_parameters(
+    ui: &mut Ui,
+    content: Rect,
+    studio: &mut Studio,
+    track: usize,
+    info: &crate::plugins::PluginSlotInfo,
+    accent: Color32,
+) {
+    let bypass = info.bypass;
+    let header = Rect::from_min_size(content.min, Vec2::new(content.width(), 13.0));
+    ui.painter().text(
+        Pos2::new(header.left() + 2.0, header.top() + 2.0),
+        Align2::LEFT_TOP,
+        format!("{} · {}", info.format.label(), info.vendor),
+        theme::mono(6.0),
+        theme::TEXT_FAINT,
+    );
+    let open = Rect::from_min_size(
+        Pos2::new(header.right() - 62.0, header.top()),
+        Vec2::new(60.0, 12.0),
+    );
+    let open_hit = ui.interact(
+        open,
+        ui.scope_id().with(("plugin_open_editor", track)),
+        Sense::click(),
+    );
+    ui.painter().rect_filled(
+        open,
+        CornerRadius::same(1),
+        if open_hit.hovered() {
+            theme::accent_alpha(accent, 45)
+        } else {
+            theme::PANEL_SUNK
+        },
+    );
+    ui.painter().rect_stroke(
+        open,
+        CornerRadius::same(1),
+        Stroke::new(1.0, theme::accent_alpha(accent, 120)),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        open.center(),
+        Align2::CENTER_CENTER,
+        "OPEN EDITOR",
+        theme::display(6.0),
         accent,
     );
-    let info = studio.slots[track].clone();
-    let pending = studio.slot_pending[track];
+    if open_hit.clicked() {
+        studio.open_plugin_editor(track, false);
+    }
+    if open_hit.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        open_hit.on_hover_text("Open the plugin editor full screen");
+    }
 
-    match info {
-        None => {
-            let hit = ui.interact(
-                inner,
-                ui.scope_id().with(("plugin_load", track)),
-                Sense::click(),
-            );
-            let hovered = hit.hovered();
-            if hovered {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            ui.painter().rect_filled(
-                inner,
-                CornerRadius::same(2),
-                if hovered {
-                    theme::accent_alpha(accent, 18)
-                } else {
-                    theme::PANEL_SUNK
-                },
-            );
-            ui.painter().rect_stroke(
-                inner,
-                CornerRadius::same(2),
-                Stroke::new(1.0, theme::accent_alpha(accent, 70)),
-                egui::StrokeKind::Inside,
-            );
-            let center = inner.center();
-            ui.painter().text(
-                Pos2::new(center.x, center.y - 12.0),
-                Align2::CENTER_CENTER,
-                if pending { "LOADING…" } else { "VST3 / CLAP" },
-                theme::display(7.6),
-                accent,
-            );
-            ui.painter().text(
-                Pos2::new(center.x, center.y + 5.0),
-                Align2::CENTER_CENTER,
-                if pending { "" } else { "+ LOAD PLUGIN" },
-                theme::display(8.4),
-                if hovered { Color32::WHITE } else { theme::TEXT },
-            );
-            ui.painter().text(
-                Pos2::new(center.x, center.y + 20.0),
-                Align2::CENTER_CENTER,
-                "ASSIGNED TO THIS TRACK",
-                theme::mono(5.8),
-                theme::TEXT_FAINT,
-            );
-            if hit.clicked() {
-                studio.browser_target = track;
-                studio.browser_open = true;
-                if studio.scan_results.is_empty() && !studio.scan_running {
-                    studio.start_scan();
-                }
-            }
-            if hovered {
-                hit.on_hover_text("Load a CLAP or VST3 insert for the selected track");
-            }
+    let knob_area = Rect::from_min_max(
+        Pos2::new(content.left(), header.bottom() + 2.0),
+        Pos2::new(content.right(), content.bottom()),
+    );
+    if info.params.is_empty() {
+        ui.painter().text(
+            knob_area.center(),
+            Align2::CENTER_CENTER,
+            "NO PARAMETERS · OPEN THE EDITOR",
+            theme::mono(6.4),
+            theme::TEXT_FAINT,
+        );
+        return;
+    }
+
+    let columns = ((knob_area.width() / 62.0).floor() as usize).clamp(2, 4);
+    let visible = (columns * 2).min(info.params.len());
+    let rows = visible.div_ceil(columns);
+    let cell_w = knob_area.width() / columns as f32;
+    let cell_h = (knob_area.height() / rows as f32).max(32.0);
+    let mut changes = Vec::new();
+    for (index, param) in info.params.iter().take(visible).enumerate() {
+        let row = index / columns;
+        let column = index % columns;
+        let cell = Rect::from_min_size(
+            Pos2::new(
+                knob_area.left() + column as f32 * cell_w,
+                knob_area.top() + row as f32 * cell_h,
+            ),
+            Vec2::new(cell_w, cell_h),
+        );
+        let mut value = param.value;
+        let text = format!("{:.0}%", value * 100.0);
+        if knob(
+            ui,
+            cell,
+            ui.scope_id().with(("instrument_param", track, index)),
+            &mut value,
+            0.0..=1.0,
+            param.value,
+            &param.name.chars().take(9).collect::<String>(),
+            &text,
+            if bypass { theme::TEXT_FAINT } else { accent },
+        ) {
+            changes.push((param.id, value));
         }
-        Some(info) => {
-            let name = info.name.clone();
-            let vendor = info.vendor.clone();
-            let format = info.format.label();
-            let bypass = info.bypass;
-            ui.painter().text(
-                Pos2::new(inner.left() + 2.0, inner.top() + 2.0),
-                Align2::LEFT_TOP,
-                name.chars().take(22).collect::<String>(),
-                theme::display(7.4),
-                if bypass { theme::TEXT_DIM } else { accent },
-            );
-            ui.painter().text(
-                Pos2::new(inner.left() + 2.0, inner.top() + 14.0),
-                Align2::LEFT_TOP,
-                format!(
-                    "{} · {}",
-                    format,
-                    vendor.chars().take(16).collect::<String>()
-                ),
-                theme::mono(6.0),
-                theme::TEXT_FAINT,
-            );
-            ui.painter().text(
-                Pos2::new(inner.left() + 2.0, inner.top() + 25.0),
-                Align2::LEFT_TOP,
-                format!("{} params · {} smp", info.params.len(), info.latency),
-                theme::mono(5.8),
-                theme::TEXT_FAINT,
-            );
-
-            let button = 13.0;
-            let y = inner.bottom() - button;
-            let load = Rect::from_min_size(
-                Pos2::new(inner.left(), y),
-                Vec2::new((inner.width() - 2.0 * (button + 2.0)).max(20.0), button),
-            );
-            if icon_button(ui, load, "LOAD", accent) {
-                studio.browser_target = track;
-                studio.browser_open = true;
-                if studio.scan_results.is_empty() && !studio.scan_running {
-                    studio.start_scan();
-                }
-            }
-            let bypass_rect =
-                Rect::from_min_size(Pos2::new(load.right() + 2.0, y), Vec2::splat(button));
-            let close =
-                Rect::from_min_size(Pos2::new(bypass_rect.right() + 2.0, y), Vec2::splat(button));
-            if icon_button(ui, bypass_rect, if bypass { "B" } else { "b" }, accent) {
-                studio.set_bypass(track, !bypass);
-            }
-            if icon_button(ui, close, "X", theme::RED) {
-                studio.unload_plugin(track, audio);
-            }
-            let hit = ui.interact(
-                Rect::from_min_max(inner.min, Pos2::new(inner.right(), y - 2.0)),
-                ui.scope_id().with(("plugin_params", track)),
-                Sense::click(),
-            );
-            if hit.clicked() {
-                studio.selected_slot = track;
-                studio.rack_open = true;
-            }
-            if hit.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                hit.on_hover_text("Open the plugin rack to edit parameters");
+    }
+    for (id, value) in changes {
+        if let Some(info) = &studio.slots[track] {
+            if let Some(param) = info.params.iter().find(|p| p.id == id).cloned() {
+                studio.set_param(track, &param, value);
             }
         }
     }

@@ -163,7 +163,14 @@ fn apply_action(action: ModuleAction, state: &mut UiState, audio: &mut AudioRunt
     }
 }
 
-fn module_shell(ui: &Ui, rect: Rect, title: &str, badge: &str, accent: Color32) -> Rect {
+fn module_shell(
+    ui: &Ui,
+    rect: Rect,
+    title: &str,
+    badge: &str,
+    accent: Color32,
+    header_reserve: f32,
+) -> Rect {
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(2), theme::PANEL_RAISED);
     painter.rect_stroke(
@@ -183,9 +190,10 @@ fn module_shell(ui: &Ui, rect: Rect, title: &str, badge: &str, accent: Color32) 
         CornerRadius::same(1),
         accent,
     );
+    // The caller owns the header buttons; the title must not run under them.
     let title_rect = header
         .shrink2(Vec2::new(7.0, 0.0))
-        .with_max_x(header.right() - 44.0);
+        .with_max_x(header.right() - header_reserve);
     let clipped = painter.with_clip_rect(title_rect);
     let font = theme::fitted_font(&clipped, title, theme::display(7.6), title_rect.width());
     clipped.text(
@@ -296,22 +304,31 @@ fn draw_instrument(
         state.instrument[track] = source;
     }
 
-    let title = match source {
-        InstrumentSource::Synth => "INSTRUMENT // SURGE WT SYNTH",
-        InstrumentSource::Plugin => {
-            if let Some(info) = &info {
-                &info.name
-            } else {
-                "INSTRUMENT // LOADING PLUGIN…"
-            }
-        }
-        InstrumentSource::Empty => "INSTRUMENT // EMPTY (AUDIO ONLY)",
+    // The slot holds one of three things, and the panel shows exactly that.
+    // There is no separate "source" switch: it would let the synth and a
+    // loaded plugin claim the same track.
+    let title = match (&info, pending, source) {
+        (Some(info), _, _) if info.is_instrument => info.name.clone(),
+        // An effect plugin is a track insert; the synth is still the source.
+        (Some(info), _, _) => format!("{} · FX INSERT", info.name),
+        (None, true, _) => "LOADING PLUGIN…".into(),
+        (None, false, InstrumentSource::Synth) => "SURGE WT SYNTH".into(),
+        (None, false, _) => "INSTRUMENT // EMPTY".into(),
     };
 
-    let inner = module_shell(ui, rect, title, &format!("TRK {:02}", track + 1), accent);
+    // GUI + E + b + X sit in the header when a plugin is loaded.
+    let header_reserve = if info.is_some() { 84.0 } else { 40.0 };
+    let inner = module_shell(
+        ui,
+        rect,
+        &title,
+        &format!("TRK {:02}", track + 1),
+        accent,
+        header_reserve,
+    );
 
     // ---- Empty slot: the call to action --------------------------------
-    if source == InstrumentSource::Empty && info.is_none() {
+    if info.is_none() && !pending && source != InstrumentSource::Synth {
         let hit = ui.interact(
             inner,
             ui.scope_id().with(("instrument_add", track)),
@@ -351,15 +368,21 @@ fn draw_instrument(
             theme::display(26.0),
             if hovered { Color32::WHITE } else { accent },
         );
-        ui.painter().text(
+        let cta = "SELECT SYNTH OR VST/CLAP";
+        let cta_painter = ui
+            .painter()
+            .with_clip_rect(inner.shrink2(Vec2::new(4.0, 0.0)));
+        let cta_font = theme::fitted_font(
+            &cta_painter,
+            cta,
+            theme::display(10.0),
+            inner.width() - 12.0,
+        );
+        cta_painter.text(
             Pos2::new(center.x, center.y + 6.0),
             Align2::CENTER_CENTER,
-            if pending {
-                "LOADING…"
-            } else {
-                "SELECT SURGE WT SYNTH OR VST/CLAP"
-            },
-            theme::display(10.0),
+            cta,
+            cta_font,
             if hovered { Color32::WHITE } else { theme::TEXT },
         );
         ui.painter().text(
@@ -380,56 +403,10 @@ fn draw_instrument(
         return;
     }
 
-    // ---- Mutually Exclusive Selector Header ----------------------------
-    let row_h = 18.0;
-    let tab_w = ((inner.width() - 40.0) * 0.45).clamp(80.0, 150.0);
-    let synth_tab = Rect::from_min_size(inner.min, Vec2::new(tab_w, row_h));
-    let plugin_tab = Rect::from_min_size(
-        Pos2::new(synth_tab.right() + 4.0, inner.top()),
-        Vec2::new(tab_w, row_h),
-    );
-    let track_select = Rect::from_min_size(
-        Pos2::new(plugin_tab.right() + 4.0, inner.top()),
-        Vec2::new((inner.right() - plugin_tab.right() - 4.0).max(30.0), row_h),
-    );
+    // ---- Header strip: which track this module edits -------------------
+    let row_h = 16.0;
+    let track_select = Rect::from_min_size(inner.min, Vec2::new(inner.width(), row_h));
 
-    // [ ⚡ SURGE WT SYNTH ] Tab
-    let synth_active = source == InstrumentSource::Synth;
-    if source_chip(
-        ui,
-        synth_tab,
-        "⚡ SURGE WT SYNTH",
-        synth_active,
-        accent,
-        ui.scope_id().with(("instrument_synth", track)),
-    ) {
-        state.instrument[track] = InstrumentSource::Synth;
-        source = InstrumentSource::Synth;
-    }
-
-    // [ 🔌 VST3 / CLAP ] Tab
-    let plugin_active = source == InstrumentSource::Plugin;
-    let plugin_label = match &info {
-        Some(info) => format!("🔌 {}", info.name.chars().take(11).collect::<String>()),
-        None => "🔌 + VST/CLAP".to_string(),
-    };
-    if source_chip(
-        ui,
-        plugin_tab,
-        &plugin_label,
-        plugin_active,
-        theme::GREEN,
-        ui.scope_id().with(("instrument_plugin", track)),
-    ) {
-        if info.is_some() {
-            state.instrument[track] = InstrumentSource::Plugin;
-            source = InstrumentSource::Plugin;
-        } else {
-            studio.open_instrument_browser(track);
-        }
-    }
-
-    // Track selector chip
     let track_hit = ui.interact(
         track_select,
         ui.scope_id().with(("instrument_track", track)),
@@ -473,7 +450,7 @@ fn draw_instrument(
     let y = rect.top() + (HEADER_H - button) * 0.5;
     let right = rect.right() - 4.0;
 
-    if source == InstrumentSource::Plugin && info.is_some() {
+    if info.is_some() {
         let close = Rect::from_min_size(Pos2::new(right - button, y), Vec2::splat(button));
         let bypass = Rect::from_min_size(
             Pos2::new(close.left() - button - 3.0, y),
@@ -518,7 +495,7 @@ fn draw_instrument(
                 }
             }
         }
-    } else if source == InstrumentSource::Synth {
+    } else if !pending && source == InstrumentSource::Synth {
         let edit = Rect::from_min_size(Pos2::new(right - 34.0, y), Vec2::new(34.0, button));
         if icon_button(ui, edit, "EDIT", accent) {
             studio.synth_open = true;
@@ -526,26 +503,30 @@ fn draw_instrument(
     }
 
     let content_top = inner.top() + row_h + 4.0;
-    // Leave room for the engine badge under the synth knobs.
+    let synth_mode = info.is_none() && !pending && source == InstrumentSource::Synth;
+    // The synth panel keeps one line at the bottom for its engine badge.
     let content = Rect::from_min_max(
         Pos2::new(inner.left(), content_top),
-        Pos2::new(inner.right(), inner.bottom() - 14.0),
+        Pos2::new(
+            inner.right(),
+            inner.bottom() - if synth_mode { 14.0 } else { 0.0 },
+        ),
     );
 
-    // ---- If Plugin is selected, render Plugin Controls ONLY ------------
-    if source == InstrumentSource::Plugin {
-        if let Some(info) = &info {
-            draw_plugin_parameters(ui, content, studio, track, info, accent);
-        } else {
-            // The instance is still loading on the plugin worker thread.
-            ui.painter().text(
-                content.center(),
-                Align2::CENTER_CENTER,
-                "LOADING PLUGIN…",
-                theme::mono(9.0),
-                theme::TEXT_DIM,
-            );
-        }
+    // ---- A loaded plugin owns the panel ---------------------------------
+    if let Some(info) = &info {
+        draw_plugin_parameters(ui, content, studio, track, info, accent);
+        return;
+    }
+    if pending {
+        // The instance is still starting on the plugin worker thread.
+        ui.painter().text(
+            content.center(),
+            Align2::CENTER_CENTER,
+            "LOADING PLUGIN…",
+            theme::mono(9.0),
+            theme::TEXT_DIM,
+        );
         return;
     }
 
@@ -633,59 +614,6 @@ fn draw_instrument(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         badge_hit.on_hover_text("Open the Surge WT Synth full editor");
     }
-}
-
-/// Small selectable chip used by the instrument source row.
-fn source_chip(
-    ui: &mut Ui,
-    rect: Rect,
-    label: &str,
-    active: bool,
-    accent: Color32,
-    id: egui::Id,
-) -> bool {
-    let hit = ui.interact(rect, id, Sense::click());
-    let hovered = hit.hovered();
-    ui.painter().rect_filled(
-        rect,
-        CornerRadius::same(1),
-        if active {
-            theme::accent_alpha(accent, 45)
-        } else if hovered {
-            theme::accent_alpha(accent, 20)
-        } else {
-            theme::PANEL_SUNK
-        },
-    );
-    ui.painter().rect_stroke(
-        rect,
-        CornerRadius::same(1),
-        Stroke::new(
-            1.0,
-            if active {
-                accent
-            } else if hovered {
-                theme::accent_alpha(accent, 120)
-            } else {
-                theme::BORDER_SOFT
-            },
-        ),
-        egui::StrokeKind::Inside,
-    );
-    let painter = ui
-        .painter()
-        .with_clip_rect(rect.shrink2(Vec2::new(3.0, 0.0)));
-    painter.text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        theme::display(6.6),
-        if active { accent } else { theme::TEXT_DIM },
-    );
-    if hovered {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    hit.clicked()
 }
 
 /// Parameter grid + edit controls for the hosted plugin instrument.
@@ -821,6 +749,7 @@ fn draw_effect(
         } else {
             accent
         },
+        46.0,
     );
 
     // Header controls: close, bypass, reorder.
@@ -1065,7 +994,7 @@ pub fn draw_add_menu(ctx: &egui::Context, state: &mut UiState, audio: &mut Audio
 }
 
 fn draw_master(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRuntime) {
-    let inner = module_shell(ui, rect, "MASTER BUS", "STEREO", theme::MAGENTA);
+    let inner = module_shell(ui, rect, "MASTER BUS", "STEREO", theme::MAGENTA, 40.0);
     let meter_w = 7.0;
     let meter_h = (inner.height() - 26.0).clamp(20.0, 90.0);
     for channel in 0..2 {

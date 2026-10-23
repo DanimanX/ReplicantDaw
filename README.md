@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.3.3** · MIT, Linux, macOS and Windows.
+**Version 1.3.4** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -26,6 +26,24 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Plugin editor at full screen](docs/plugin-editor.png)
 
 ![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
+
+## What's new in 1.3.4
+
+- **The source switch is gone, so the track has one instrument by
+  construction.** The `SURGE WT SYNTH` / `VST3 / CLAP` chips let you pick the
+  synth while a plugin still occupied the slot; the panel then showed Surge
+  parameters over a sounding plugin, and the two could be heard together. The
+  device chain now shows what the slot actually holds — the plugin's panel when
+  one is loaded, the synth's when it is not — and choosing the synth from the
+  browser unloads the plugin first.
+- **CLAP instruments are classified by their feature tags**, not only by
+  whether an audio input port exists. Samplers that expose an input (TAL-Sampler
+  among them) were treated as effects, so the synth kept playing under them.
+  Verified against the plugins installed here: TAL-Sampler now reports
+  `instrument=true`.
+- **Projects without an instrument id keep their synth.** Files written before
+  the slot existed — including the bundled `examples/Demo.rproj` — loaded with
+  an empty instrument slot and played nothing.
 
 ## What's new in 1.3.3
 

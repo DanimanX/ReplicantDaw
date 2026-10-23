@@ -215,7 +215,7 @@ pub fn draw_windows(
     audio: &mut AudioRuntime,
 ) {
     draw_rack(ctx, studio, state, audio);
-    draw_browser(ctx, studio, state);
+    draw_browser(ctx, studio, state, audio);
     draw_plugin_editor(ctx, studio, state, audio);
     draw_rename(ctx, studio, state);
     draw_midi(ctx, studio, state, audio);
@@ -542,7 +542,12 @@ fn draw_rack(
     studio.rack_open = open;
 }
 
-fn draw_browser(ctx: &egui::Context, studio: &mut Studio, state: &mut UiState) {
+fn draw_browser(
+    ctx: &egui::Context,
+    studio: &mut Studio,
+    state: &mut UiState,
+    audio: &mut AudioRuntime,
+) {
     let mut open = studio.browser_open;
     // Selecting something must close the picker; `open` is captured before the
     // click is handled, so a flag is needed to carry the decision to the end.
@@ -717,7 +722,7 @@ fn draw_browser(ctx: &egui::Context, studio: &mut Studio, state: &mut UiState) {
             );
             if choose_synth {
                 let track = studio.browser_target;
-                studio.select_synth(state, track);
+                studio.select_synth(state, track, audio);
                 close = true;
                 studio.notify(format!(
                     "Track {:02} now plays the internal synth",

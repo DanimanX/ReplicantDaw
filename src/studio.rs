@@ -470,6 +470,19 @@ impl Studio {
                 for info in infos {
                     let slot = info.slot;
                     if slot < MAX_PLUGIN_SLOTS {
+                        if self.slots[slot].is_none() {
+                            // Classification decides whether the insert owns the
+                            // track's sound or processes the synth bus, so make
+                            // the verdict visible when diagnosing "two
+                            // instruments" reports.
+                            log::debug!(
+                                "slot {:02} loaded {} ({}) instrument={}",
+                                slot + 1,
+                                info.name,
+                                info.format.label(),
+                                info.is_instrument
+                            );
+                        }
                         self.slots[slot] = Some(info);
                     }
                 }
@@ -509,10 +522,23 @@ impl Studio {
     }
 
     /// Choose the internal synth as the instrument source for `track`.
-    pub fn select_synth(&mut self, state: &mut UiState, track: usize) {
-        if track < TRACK_COUNT {
-            state.instrument[track] = crate::state::InstrumentSource::Synth;
+    ///
+    /// The slot holds one instrument, so picking the synth unloads whatever
+    /// plugin occupied it. Without this the plugin would keep sounding (or keep
+    /// processing the bus) under a synth the user believes is alone.
+    pub fn select_synth(&mut self, state: &mut UiState, track: usize, audio: &mut AudioRuntime) {
+        if track >= TRACK_COUNT {
+            return;
         }
+        if self.slots[track].is_some() || self.slot_pending[track] {
+            self.unload_plugin(track, audio);
+        }
+        self.slots[track] = None;
+        self.slot_pending[track] = false;
+        state.instrument[track] = crate::state::InstrumentSource::Synth;
+        // `sync_instrument_sources` sends the commands; mirroring the flags
+        // here would silently skip them.
+        self.plugin_sent[track] = (false, false);
     }
 
     pub fn start_scan(&mut self) {
@@ -1019,6 +1045,12 @@ impl Studio {
             let loaded = slot.is_some();
             let is_instrument = slot.is_some_and(|slot| slot.is_instrument);
 
+            // The slot decides the source: a generator owns the track, an
+            // effect is a track insert the synth plays through. Correcting the
+            // state here keeps every UI path honest, even one that forgot.
+            state.instrument[track] =
+                source_for_slot(state.instrument[track], loaded, is_instrument);
+
             // A load that never produced a slot (bad path, unsupported format)
             // must not leave the track pointing at a plugin that is not there.
             if !loaded
@@ -1075,6 +1107,30 @@ impl PluginDescriptor {
             .map(|stem| stem.to_string_lossy().to_string())
             .unwrap_or_else(|| "Plugin".to_string());
         Some(Self { name, path, format })
+    }
+}
+
+/// What the instrument source must be, given what the slot holds.
+///
+/// A loaded generator always owns the track; a loaded effect is only an
+/// insert, so the internal synth stays the source; an empty slot keeps
+/// whatever the user chose.
+pub fn source_for_slot(
+    current: crate::state::InstrumentSource,
+    loaded: bool,
+    instrument: bool,
+) -> crate::state::InstrumentSource {
+    use crate::state::InstrumentSource;
+    match (loaded, instrument) {
+        (false, _) => current,
+        (true, true) => InstrumentSource::Plugin,
+        (true, false) => {
+            if current == InstrumentSource::Plugin {
+                InstrumentSource::Synth
+            } else {
+                current
+            }
+        }
     }
 }
 
@@ -1200,6 +1256,47 @@ mod tests {
         );
         assert_eq!(
             source_after_unload(InstrumentSource::Synth),
+            InstrumentSource::Synth
+        );
+    }
+
+    #[test]
+    fn the_slot_contents_decide_the_source() {
+        use crate::state::InstrumentSource;
+
+        // An empty slot keeps the user's choice.
+        assert_eq!(
+            source_for_slot(InstrumentSource::Synth, false, false),
+            InstrumentSource::Synth
+        );
+        assert_eq!(
+            source_for_slot(InstrumentSource::Empty, false, false),
+            InstrumentSource::Empty
+        );
+
+        // A loaded generator always owns the track. This is what stops the
+        // synth from sounding under a plugin that was mislabelled or set by a
+        // stale UI path.
+        assert_eq!(
+            source_for_slot(InstrumentSource::Synth, true, true),
+            InstrumentSource::Plugin
+        );
+        assert_eq!(
+            source_for_slot(InstrumentSource::Empty, true, true),
+            InstrumentSource::Plugin
+        );
+
+        // A loaded effect is a track insert: the synth stays the source.
+        assert_eq!(
+            source_for_slot(InstrumentSource::Plugin, true, false),
+            InstrumentSource::Synth
+        );
+        assert_eq!(
+            source_for_slot(InstrumentSource::Empty, true, false),
+            InstrumentSource::Empty
+        );
+        assert_eq!(
+            source_for_slot(InstrumentSource::Synth, true, false),
             InstrumentSource::Synth
         );
     }

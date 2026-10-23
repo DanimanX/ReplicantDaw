@@ -307,7 +307,10 @@ pub struct ClapInstance {
     vendor: String,
     version: String,
     params: Vec<ParamInfo>,
+    /// Whether the plugin declares an audio input port (used for wiring).
     has_audio_input: bool,
+    /// Whether the plugin is a generator rather than a track effect.
+    is_instrument: bool,
     sample_rate: f32,
     gui: Option<ClapGui>,
     /// Whether the plugin reported GUI support when it was loaded.
@@ -689,6 +692,22 @@ impl ClapInstance {
             .version()
             .map(|version| version.to_string_lossy().to_string())
             .unwrap_or_else(|| "?".to_string());
+        // The descriptor's feature tags are the authoritative generator/effect
+        // signal: many instruments (samplers with an audio input, for one)
+        // expose an input bus and would otherwise look like effects.
+        let features: Vec<String> = first
+            .features()
+            .map(|feature| feature.to_string_lossy().to_lowercase())
+            .collect();
+        let tagged_instrument = features
+            .iter()
+            .any(|feature| matches!(feature.as_str(), "instrument" | "synthesizer" | "sampler"));
+        let tagged_effect = features.iter().any(|feature| {
+            matches!(
+                feature.as_str(),
+                "audio-effect" | "note-effect" | "analyzer"
+            )
+        });
 
         let host_info = HostInfo::new(
             "Replicant DAW",
@@ -724,6 +743,14 @@ impl ClapInstance {
             .get_extension::<PluginAudioPorts>()
             .map(|ports| ports.count(&instance.plugin_handle(), true) > 0)
             .unwrap_or(true);
+        // Features win; the bus layout is the fallback for untagged plugins.
+        let is_instrument = if tagged_instrument {
+            true
+        } else if tagged_effect {
+            false
+        } else {
+            !has_audio_input
+        };
 
         let mut this = Self {
             processor: None,
@@ -738,6 +765,7 @@ impl ClapInstance {
             version,
             params,
             has_audio_input,
+            is_instrument,
             sample_rate,
             gui: None,
             gui_supported,
@@ -828,7 +856,7 @@ impl ClapInstance {
     }
 
     pub fn is_instrument(&self) -> bool {
-        !self.has_audio_input
+        self.is_instrument
     }
 
     /// Re-read every parameter from the plugin.

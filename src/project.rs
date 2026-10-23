@@ -384,6 +384,16 @@ impl Project {
             }
         }
 
+        // A track without an instrument id predates the slot (the bundled demo
+        // still is one): back then the internal synth was always audible, so
+        // that is what those files must keep doing. An explicit `empty` stays
+        // empty.
+        for track in project.tracks.iter_mut() {
+            if track.instrument.trim().is_empty() {
+                track.instrument = "synth".to_string();
+            }
+        }
+
         // A v1 file has no `effects`; translate its fixed FX block.
         if project.format_version < 2 {
             if let Some(legacy) = project.legacy_fx.take() {
@@ -761,6 +771,31 @@ mod tests {
         let first = project.tracks[0].synth.as_ref().unwrap().to_patch();
         let expected = SynthXt::from_track(0);
         assert_eq!(first, expected);
+    }
+
+    #[test]
+    fn a_track_without_an_instrument_id_keeps_its_synth() {
+        // The bundled demo is a v6 file with no `instrument` key: the synth was
+        // the only source back then, so it must stay audible.
+        let json = r#"{
+            "format_version": 6,
+            "app_version": "1.2.0",
+            "name": "Legacy",
+            "bpm": 120.0,
+            "effects": [],
+            "master_gain": 0.9,
+            "tracks": [
+                { "name": "Old", "gain_db": 0.0, "pan": 0.0, "mute": false,
+                  "solo": false, "scene": 0, "clips": [], "notes": [] },
+                { "name": "Off", "gain_db": 0.0, "pan": 0.0, "mute": false,
+                  "solo": false, "scene": 0, "clips": [], "notes": [],
+                  "instrument": "empty" }
+            ]
+        }"#;
+        let project = Project::from_json(json).expect("parse");
+        assert_eq!(project.tracks[0].instrument, "synth");
+        // An explicit choice is respected.
+        assert_eq!(project.tracks[1].instrument, "empty");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! Modules are painted left to right in signal order; every effect can be
 //! bypassed, reordered, closed and re-added from `+ FX`.
 
-use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
+use egui::{Align2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use crate::audio::{gain_to_db, AudioRuntime, Command, EffectKind, EffectKnob};
 use crate::state::{UiEffect, UiState};
@@ -493,7 +493,11 @@ fn draw_instrument(
     }
 }
 
-/// Parameter grid + edit controls for the hosted plugin instrument.
+/// Scrollable parameter grid for the hosted plugin.
+///
+/// Plugins commonly expose dozens (or hundreds) of parameters, so the panel
+/// never truncates the list: everything is laid out in a grid inside a
+/// vertical scroll area, and the header stays fixed.
 fn draw_plugin_parameters(
     ui: &mut Ui,
     content: Rect,
@@ -502,12 +506,19 @@ fn draw_plugin_parameters(
     info: &crate::plugins::PluginSlotInfo,
     accent: Color32,
 ) {
+    const CELL: Vec2 = Vec2::new(62.0, 58.0);
+
     let bypass = info.bypass;
     let header = Rect::from_min_size(content.min, Vec2::new(content.width(), 13.0));
     ui.painter().text(
         Pos2::new(header.left() + 2.0, header.top() + 2.0),
         Align2::LEFT_TOP,
-        format!("{} · {}", info.format.label(), info.vendor),
+        format!(
+            "{} · {} · {} PARAMS · SCROLL ↓",
+            info.format.label(),
+            info.vendor,
+            info.params.len()
+        ),
         theme::mono(6.0),
         theme::TEXT_FAINT,
     );
@@ -550,53 +561,83 @@ fn draw_plugin_parameters(
         open_hit.on_hover_text("Open the plugin editor full screen");
     }
 
-    let knob_area = Rect::from_min_max(
+    let body = Rect::from_min_max(
         Pos2::new(content.left(), header.bottom() + 2.0),
-        Pos2::new(content.right(), content.bottom()),
+        content.max,
     );
-    if info.params.is_empty() {
-        ui.painter().text(
-            knob_area.center(),
-            Align2::CENTER_CENTER,
-            "NO PARAMETERS · OPEN THE EDITOR",
-            theme::mono(6.4),
-            theme::TEXT_FAINT,
-        );
+    if body.height() < 24.0 {
         return;
     }
 
-    let columns = ((knob_area.width() / 62.0).floor() as usize).clamp(2, 4);
-    let visible = (columns * 2).min(info.params.len());
-    let rows = visible.div_ceil(columns);
-    let cell_w = knob_area.width() / columns as f32;
-    let cell_h = (knob_area.height() / rows as f32).max(32.0);
-    let mut changes = Vec::new();
-    for (index, param) in info.params.iter().take(visible).enumerate() {
-        let row = index / columns;
-        let column = index % columns;
-        let cell = Rect::from_min_size(
-            Pos2::new(
-                knob_area.left() + column as f32 * cell_w,
-                knob_area.top() + row as f32 * cell_h,
-            ),
-            Vec2::new(cell_w, cell_h),
-        );
-        let mut value = param.value;
-        let text = format!("{:.0}%", value * 100.0);
-        if knob(
-            ui,
-            cell,
-            ui.scope_id().with(("instrument_param", track, index)),
-            &mut value,
-            0.0..=1.0,
-            param.value,
-            &param.name.chars().take(9).collect::<String>(),
-            &text,
-            if bypass { theme::TEXT_FAINT } else { accent },
-        ) {
-            changes.push((param.id, value));
-        }
-    }
+    let params = info.params.clone();
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(body)
+            .layout(egui::Layout::top_down(egui::Align::Min)),
+    );
+    child.set_clip_rect(body);
+    child.spacing_mut().item_spacing = Vec2::new(3.0, 2.0);
+
+    let mut changes: Vec<(u32, f32)> = Vec::new();
+    egui::ScrollArea::vertical()
+        .id_salt(("instrument_params", track))
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .max_height(body.height())
+        .show(&mut child, |ui| {
+            if params.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("NO PARAMETERS EXPOSED · OPEN EDITOR")
+                        .font(theme::mono(7.0))
+                        .color(theme::TEXT_FAINT),
+                );
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("REFRESH").font(theme::display(7.0)))
+                            .fill(theme::PANEL_SUNK),
+                    )
+                    .clicked()
+                {
+                    studio
+                        .plugins
+                        .send(crate::plugins::PluginCommand::RefreshParams);
+                }
+                return;
+            }
+            let columns = ((ui.available_width() / CELL.x).floor() as usize).max(1);
+            let width = ui.available_width();
+            egui::Grid::new(("instrument_param_grid", track))
+                .num_columns(columns)
+                .spacing(Vec2::new(0.0, 2.0))
+                .show(ui, |ui| {
+                    for (index, param) in params.iter().enumerate() {
+                        let (_, cell) =
+                            ui.allocate_space(Vec2::new(width / columns as f32, CELL.y));
+                        let mut value = param.value;
+                        let text = format!("{:.0}%", value * 100.0);
+                        let label: String = param.name.chars().take(10).collect();
+                        let color = if bypass { theme::TEXT_FAINT } else { accent };
+                        if knob(
+                            ui,
+                            cell,
+                            ui.scope_id().with(("instrument_param", track, param.id)),
+                            &mut value,
+                            0.0..=1.0,
+                            param.value,
+                            &label,
+                            &text,
+                            color,
+                        ) {
+                            changes.push((param.id, value));
+                        }
+                        if (index + 1) % columns == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
+
     for (id, value) in changes {
         if let Some(info) = &studio.slots[track] {
             if let Some(param) = info.params.iter().find(|p| p.id == id).cloned() {
@@ -1021,5 +1062,76 @@ mod tests {
                 assert_ne!(color, other);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+    use crate::audio::{AudioRuntime, MidiRuntime};
+    use crate::plugins::{PluginFormat, PluginRuntime, PluginSlotInfo};
+    use crate::state::UiState;
+    use crate::studio::Studio;
+    use std::path::PathBuf;
+
+    #[test]
+    fn every_plugin_parameter_is_reachable_in_the_panel() {
+        let (plugins, _input, _output) = PluginRuntime::start(48_000.0);
+        let mut studio = Studio::new(MidiRuntime::new(), plugins);
+        let mut state = UiState::new();
+        let mut audio = AudioRuntime::start_silent(Some("test".into()));
+        // A plugin with more parameters than fit on screen at once.
+        let params = (0..40)
+            .map(|index| crate::plugins::ParamInfo {
+                id: index,
+                name: format!("PARAM {index}"),
+                value: 0.5,
+                text: "50%".into(),
+            })
+            .collect();
+        studio.slots[0] = Some(PluginSlotInfo {
+            slot: 0,
+            name: "BIG".into(),
+            vendor: "TEST".into(),
+            version: "1".into(),
+            format: PluginFormat::Clap,
+            path: PathBuf::from("/tmp/Big.clap"),
+            bypass: false,
+            params,
+            latency: 0,
+            is_instrument: true,
+            has_editor: false,
+            gui_open: false,
+            error: None,
+        });
+        state.instrument[0] = crate::state::InstrumentSource::Plugin;
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 300.0));
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            time: Some(1.0),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            draw(ui, screen, &mut state, &mut studio, &mut audio);
+        });
+        output.textures_delta.clear();
+
+        // Every parameter is laid out, not truncated at the first row the
+        // panel used to show. The scroll area clips the overflow visually,
+        // but the grid still contains each control.
+        let labels: Vec<String> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.text().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.iter().any(|label| label.contains("PARAM 39")),
+            "the panel truncated the plugin's parameters"
+        );
     }
 }

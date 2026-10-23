@@ -13,6 +13,26 @@ use crate::studio::Studio;
 use crate::theme;
 use crate::ui::widgets::{fader, knob, meter, mini_roll, toggle_chip, MiniRollView};
 
+/// One session cell's rectangle inside a panel painted by [`theme::paint_panel`].
+///
+/// Drawn and hit-tested through the same helper so drag and drop targets line
+/// up with what the user sees.
+pub fn cell_rect(content: Rect, track: usize, scene: usize) -> Rect {
+    let header_h = 34.0;
+    let launch_w = 22.0;
+    let cols = TRACK_COUNT as f32;
+    let rows = SCENE_COUNT as f32;
+    let col_w = (content.width() - launch_w) / cols;
+    let midi_gap = 4.0;
+    let midi_h = ((content.height() - header_h) / (rows + 1.35)).clamp(26.0, 58.0);
+    let row_h = (content.height() - header_h - midi_h - midi_gap) / rows;
+    let midi_top = content.top() + header_h;
+    let rows_top = midi_top + midi_h + midi_gap;
+    let x = content.left() + launch_w + track as f32 * col_w;
+    let y = rows_top + scene as f32 * row_h;
+    Rect::from_min_size(Pos2::new(x, y + 1.5), Vec2::new(col_w - 2.0, row_h - 3.0))
+}
+
 pub fn draw_matrix(
     ui: &mut Ui,
     rect: Rect,
@@ -163,11 +183,8 @@ pub fn draw_matrix(
     let rows_top = midi_top + midi_h + midi_gap;
     for (track, _spec) in TRACKS.iter().enumerate() {
         let accent = theme::track_accent(track);
-        let x = content.left() + launch_w + track as f32 * col_w;
         for scene in 0..SCENE_COUNT {
-            let y = rows_top + scene as f32 * row_h;
-            let cell =
-                Rect::from_min_size(Pos2::new(x, y + 1.5), Vec2::new(col_w - 2.0, row_h - 3.0));
+            let cell = cell_rect(content, track, scene);
             if cell.width() < 8.0 || cell.height() < 8.0 {
                 continue;
             }
@@ -184,7 +201,19 @@ pub fn draw_matrix(
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
 
-            let bg = if launched {
+            let drop_hover = studio.clip_drag.is_some()
+                && ui.input(|input| {
+                    input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|pos| cell.contains(pos))
+                });
+            if drop_hover {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            }
+            let bg = if drop_hover {
+                theme::accent_alpha(theme::MAGENTA, 34)
+            } else if launched {
                 Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 26)
             } else if hovered {
                 theme::PANEL_RAISED
@@ -196,14 +225,14 @@ pub fn draw_matrix(
                 cell,
                 CornerRadius::same(2),
                 Stroke::new(
-                    if sample_hover {
+                    if drop_hover || sample_hover {
                         1.8
                     } else if launched {
                         1.2
                     } else {
                         1.0
                     },
-                    if sample_hover {
+                    if drop_hover || sample_hover {
                         theme::MAGENTA
                     } else if launched {
                         accent
@@ -229,11 +258,19 @@ pub fn draw_matrix(
             let notes = state.recorded_notes(track, scene);
             let sample = state.sample_clip(track, scene).cloned();
             if let Some(clip) = &sample {
-                response.dnd_set_drag_payload(ClipDrag::Session {
+                let drag = ClipDrag::Session {
                     track,
                     scene,
                     clip: Arc::clone(clip),
-                });
+                };
+                response.dnd_set_drag_payload(drag.clone());
+                // The session matrix and the arrangement are separate panels,
+                // so the clip also travels in `Studio` state. That keeps the
+                // drag alive while the pointer crosses from one panel to the
+                // other, which egui's per-widget payload does not guarantee.
+                if response.drag_started() {
+                    studio.clip_drag = Some(drag);
+                }
             }
             let has_clip = !notes.is_empty();
             let has_sample = sample.is_some();
@@ -396,6 +433,34 @@ pub fn draw_matrix(
             }
 
             let mut dropped = false;
+            // Drop a clip that is being carried by `Studio` (from the
+            // arrangement or from another cell) onto this cell.
+            if let Some(drag) = studio.clip_drag.clone() {
+                let released = ui.input(|input| input.pointer.any_released());
+                let over = ui.input(|input| {
+                    input
+                        .pointer
+                        .interact_pos()
+                        .is_some_and(|pos| cell.contains(pos))
+                });
+                if released && over {
+                    match &drag {
+                        ClipDrag::Session {
+                            track: source_track,
+                            scene: source_scene,
+                            ..
+                        } if *source_track == track && *source_scene == scene => {}
+                        ClipDrag::Arrangement { id, .. } => {
+                            studio.move_arrangement_to_session(state, audio, *id, track, scene);
+                        }
+                        other => {
+                            studio.assign_sample(state, audio, track, scene, other.clip().clone());
+                        }
+                    }
+                    studio.clip_drag = None;
+                    dropped = true;
+                }
+            }
             if let Some(payload) = response.dnd_release_payload::<ClipDrag>() {
                 match &*payload {
                     ClipDrag::Session {
@@ -1073,4 +1138,124 @@ fn draw_sample_wave(painter: &egui::Painter, rect: Rect, sample: &SampleClip, co
         [Pos2::new(rect.left(), mid), Pos2::new(rect.right(), mid)],
         Stroke::new(0.6, theme::accent_alpha(color, 45)),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::MidiRuntime;
+    use crate::plugins::PluginRuntime;
+    use crate::state::UiState;
+
+    fn frame(
+        ctx: &egui::Context,
+        screen: Rect,
+        events: Vec<egui::Event>,
+        mut draw: impl FnMut(&mut egui::Ui),
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| draw(ui));
+        output.textures_delta.clear();
+    }
+
+    fn button(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    #[test]
+    fn an_arrangement_clip_dropped_on_a_cell_lands_in_the_matrix() {
+        let (plugins, _input, _output) = PluginRuntime::start(48_000.0);
+        let mut studio = Studio::new(MidiRuntime::new(), plugins);
+        let mut state = UiState::new();
+        let mut audio = AudioRuntime::start_silent(Some("test".into()));
+
+        let clip = SampleClip::from_tone("TIMELINE", 330.0, 0.5, 48_000);
+        let id = state.add_arrangement_clip(0, 0, clip.clone(), true, 0.0);
+        studio.clip_drag = Some(ClipDrag::Arrangement {
+            id,
+            clip: clip.clone(),
+        });
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 640.0));
+        let content = theme::panel_content(screen);
+        let cell = cell_rect(content, 2, 5);
+        let pos = cell.center();
+
+        let ctx = egui::Context::default();
+        frame(
+            &ctx,
+            screen,
+            vec![egui::Event::PointerMoved(pos), button(pos, false)],
+            |ui| {
+                draw_matrix(ui, screen, &mut state, &mut studio, &mut audio);
+            },
+        );
+
+        assert!(
+            state.arrangement.is_empty(),
+            "the clip moved out of the timeline"
+        );
+        assert!(
+            state.sample_clip(2, 5).is_some(),
+            "the clip should land in track 3 / slot 6"
+        );
+        assert!(studio.clip_drag.is_none());
+    }
+
+    #[test]
+    fn dragging_a_sample_cell_starts_a_clip_drag() {
+        let (plugins, _input, _output) = PluginRuntime::start(48_000.0);
+        let mut studio = Studio::new(MidiRuntime::new(), plugins);
+        let mut state = UiState::new();
+        let mut audio = AudioRuntime::start_silent(Some("test".into()));
+
+        let clip = SampleClip::from_tone("PICK ME", 440.0, 0.4, 48_000);
+        studio.assign_sample(&mut state, &mut audio, 1, 1, clip);
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 640.0));
+        let content = theme::panel_content(screen);
+        let cell = cell_rect(content, 1, 1);
+        let start = cell.center();
+
+        let ctx = egui::Context::default();
+        // A warm-up frame registers the cell rectangles for hit-testing.
+        frame(&ctx, screen, Vec::new(), |ui| {
+            draw_matrix(ui, screen, &mut state, &mut studio, &mut audio);
+        });
+        // Place the pointer and press on the cell.
+        frame(
+            &ctx,
+            screen,
+            vec![egui::Event::PointerMoved(start), button(start, true)],
+            |ui| {
+                draw_matrix(ui, screen, &mut state, &mut studio, &mut audio);
+            },
+        );
+        // Moving past the click threshold turns the press into a drag.
+        let moved = start + Vec2::new(20.0, 0.0);
+        frame(&ctx, screen, vec![egui::Event::PointerMoved(moved)], |ui| {
+            draw_matrix(ui, screen, &mut state, &mut studio, &mut audio);
+        });
+
+        assert!(
+            matches!(
+                studio.clip_drag,
+                Some(ClipDrag::Session {
+                    track: 1,
+                    scene: 1,
+                    ..
+                })
+            ),
+            "dragging a sample cell must carry its clip"
+        );
+    }
 }

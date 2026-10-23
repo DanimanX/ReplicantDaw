@@ -64,6 +64,9 @@ REPLICANT_DAW_PLUGIN_PATH="/data/plugins/clap:/data/plugins/vst3" cargo run --re
 3. **RACK** lists all eight track inserts. Each row has **EDIT**, **LOAD**,
    **BYPASS** and **X** (unload), reports its latency, and exposes its
    parameters as knobs.
+   The device chain at the bottom of the window shows the loaded plugin's
+   controls in a scrollable grid, so plugins with dozens or hundreds of
+   parameters are fully reachable without opening the editor.
 4. **EDIT** (or the `OPEN EDITOR` button in the instrument module) opens the
    plugin editor: a parameter surface that can fill the whole window with
    **FULLSCREEN** (F11 toggles it, Esc restores it) and filters parameters by
@@ -115,6 +118,9 @@ source switch, so a track cannot play two generators at once.
 
 - A loaded **instrument** owns the track and the panel shows its parameters.
   Unload it with `X` to free the slot.
+- Choosing another plugin always starts from a clean slot: the previous
+  instance is retired and the engine drops its one-block plugin pipeline, so
+  the old sound cannot trail under the new selection.
 - A loaded **effect** is a track insert. The module header reads
   `NAME · FX INSERT`.
 - Classification uses the CLAP feature tags (`instrument`, `synthesizer`,

@@ -69,6 +69,9 @@ pub struct Studio {
     pub slot_pending: [bool; MAX_PLUGIN_SLOTS],
     /// Routing last handed to the engine: `(active, is_instrument)`.
     pub plugin_sent: [(bool, bool); MAX_PLUGIN_SLOTS],
+    /// Audio clip currently held by the pointer, for moving it between the
+    /// session matrix and the arrangement.
+    pub clip_drag: Option<ClipDrag>,
     pub selected_slot: usize,
 
     pub scan_results: Vec<PluginDescriptor>,
@@ -147,6 +150,7 @@ impl Studio {
             slots: std::array::from_fn(|_| None),
             slot_pending: [false; MAX_PLUGIN_SLOTS],
             plugin_sent: [(false, false); MAX_PLUGIN_SLOTS],
+            clip_drag: None,
             selected_slot: 0,
             scan_results: Vec::new(),
             scan_running: false,
@@ -610,26 +614,38 @@ impl Studio {
     fn handle_plugin_event(&mut self, event: PluginEvent) {
         match event {
             PluginEvent::Slots(infos) => {
-                self.slots = std::array::from_fn(|_| None);
+                let previous = std::mem::take(&mut self.slots);
                 self.slot_pending = [false; MAX_PLUGIN_SLOTS];
+                let mut fresh = false;
                 for info in infos {
                     let slot = info.slot;
                     if slot < MAX_PLUGIN_SLOTS {
-                        if self.slots[slot].is_none() {
-                            // Classification decides whether the insert owns the
-                            // track's sound or processes the synth bus, so make
-                            // the verdict visible when diagnosing "two
+                        // A slot that just appeared (or was replaced by a
+                        // different plugin) may not have reported all of its
+                        // parameters yet. Ask once for a full refresh.
+                        let changed = previous[slot]
+                            .as_ref()
+                            .is_none_or(|old| old.name != info.name || old.path != info.path);
+                        if changed {
+                            fresh = true;
+                            // Classification decides whether the insert owns
+                            // the track's sound or processes the synth bus, so
+                            // make the verdict visible when diagnosing "two
                             // instruments" reports.
                             log::debug!(
-                                "slot {:02} loaded {} ({}) instrument={}",
+                                "slot {:02} loaded {} ({}) instrument={} params={}",
                                 slot + 1,
                                 info.name,
                                 info.format.label(),
-                                info.is_instrument
+                                info.is_instrument,
+                                info.params.len()
                             );
                         }
                         self.slots[slot] = Some(info);
                     }
+                }
+                if fresh {
+                    self.plugins.send(PluginCommand::RefreshParams);
                 }
             }
             PluginEvent::State { .. } => {
@@ -683,7 +699,13 @@ impl Studio {
         self.notify("Scanning plugin directories…");
     }
 
-    pub fn load_plugin(&mut self, slot: usize, descriptor: &PluginDescriptor, state: &mut UiState) {
+    pub fn load_plugin(
+        &mut self,
+        slot: usize,
+        descriptor: &PluginDescriptor,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+    ) {
         if slot >= MAX_PLUGIN_SLOTS {
             return;
         }
@@ -694,8 +716,27 @@ impl Studio {
             ));
             return;
         }
+        // A new selection always starts from a clean slot: the previous
+        // instance is retired, the engine drops its one-block plugin pipeline
+        // (and any queued processed audio) and the track stays silent until
+        // the new instance reports in. Without this the tail of the previous
+        // plugin could still be heard under the new one.
+        if self.slots[slot].is_some() || self.slot_pending[slot] {
+            self.plugins
+                .send(PluginCommand::Unload { slot: slot as u8 });
+        }
+        self.slots[slot] = None;
+        self.plugin_sent[slot] = (false, false);
+        let _ = audio.command_tx.push(Command::SetTrackPlugin {
+            track: slot as u8,
+            active: false,
+            instrument: false,
+        });
         self.slot_pending[slot] = true;
         self.selected_slot = slot;
+        // The device chain follows the slot that was just loaded, so its
+        // parameter panel is visible without another click.
+        state.selected_track = slot.min(TRACK_COUNT - 1);
         // Loading into the instrument slot makes the plugin this track's sound
         // source at once, so the panel already shows what is coming.
         state.instrument[slot] = crate::state::InstrumentSource::Plugin;

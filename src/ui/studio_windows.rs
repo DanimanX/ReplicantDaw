@@ -541,7 +541,7 @@ fn draw_browser(
     ctx: &egui::Context,
     studio: &mut Studio,
     state: &mut UiState,
-    _audio: &mut AudioRuntime,
+    audio: &mut AudioRuntime,
 ) {
     let mut open = studio.browser_open;
     // Selecting something must close the picker; `open` is captured before the
@@ -676,7 +676,7 @@ fn draw_browser(
                     }
                     if let Some(descriptor) = to_load {
                         let slot = studio.browser_target;
-                        studio.load_plugin(slot, &descriptor, state);
+                        studio.load_plugin(slot, &descriptor, state, audio);
                         close = true;
                     }
                 });

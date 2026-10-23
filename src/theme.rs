@@ -276,8 +276,16 @@ pub fn paint_panel(painter: &Painter, rect: Rect, title: &str, tag: &str, accent
 
     paint_corners(painter, rect, accent_alpha(accent, 90), 7.0);
 
+    panel_content(rect)
+}
+
+/// Interior of a panel painted by [`paint_panel`].
+///
+/// Shared with the layout helpers so hit-testing (drag and drop) uses exactly
+/// the rectangles the paint code uses.
+pub fn panel_content(rect: Rect) -> Rect {
     Rect::from_min_max(
-        Pos2::new(rect.left() + 8.0, header.bottom() + 7.0),
+        Pos2::new(rect.left() + 8.0, rect.top() + HEADER_H + 7.0),
         Pos2::new(rect.right() - 8.0, rect.bottom() - 7.0),
     )
 }

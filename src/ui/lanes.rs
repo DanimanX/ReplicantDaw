@@ -12,6 +12,25 @@ use crate::ui::widgets::{mini_roll, MiniRollView};
 
 pub const TIMELINE_BARS: usize = 16;
 
+/// One arrangement lane's rectangle inside a panel painted by
+/// [`theme::paint_panel`].
+///
+/// Shared by painting and drop hit-testing so a clip lands where the ghost
+/// block is drawn.
+pub fn lane_rect(content: Rect, track: usize) -> Rect {
+    let gutter = 88.0;
+    let ruler_h = 16.0;
+    let lane_area = Rect::from_min_max(
+        Pos2::new(content.left() + gutter, content.top() + ruler_h),
+        content.max,
+    );
+    let lane_h = lane_area.height() / TRACK_COUNT as f32;
+    Rect::from_min_size(
+        Pos2::new(lane_area.left(), lane_area.top() + track as f32 * lane_h),
+        Vec2::new(lane_area.width(), lane_h),
+    )
+}
+
 pub fn draw_lanes(
     ui: &mut Ui,
     rect: Rect,
@@ -83,10 +102,7 @@ pub fn draw_lanes(
 
     for (track, _spec) in TRACKS.iter().enumerate() {
         let accent = theme::track_accent(track);
-        let lane = Rect::from_min_size(
-            Pos2::new(lane_area.left(), lane_area.top() + track as f32 * lane_h),
-            Vec2::new(lane_area.width(), lane_h),
-        );
+        let lane = lane_rect(content, track);
         let gutter_rect = Rect::from_min_size(
             Pos2::new(content.left(), lane.top()),
             Vec2::new(gutter, lane_h),
@@ -414,10 +430,14 @@ pub fn draw_lanes(
             if block_hit.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             }
-            block_hit.dnd_set_drag_payload(ClipDrag::Arrangement {
+            let payload = ClipDrag::Arrangement {
                 id: clip.id,
                 clip: std::sync::Arc::clone(&clip.clip),
-            });
+            };
+            block_hit.dnd_set_drag_payload(payload.clone());
+            if block_hit.drag_started() {
+                studio.clip_drag = Some(payload);
+            }
 
             let muted = state.mute[track] || (state.any_solo() && !state.solo[track]);
             let fill = if muted {
@@ -506,12 +526,23 @@ pub fn draw_lanes(
         }
 
         // Ghost of the clip being dragged, and the highlight for OS file drops.
+        let pointer = ui.input(|input| input.pointer.interact_pos());
+        let over_lane = pointer.is_some_and(|pos| lane.contains(pos));
+        let carried = studio.clip_drag.is_some() && over_lane;
+        if studio.clip_drag.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
         let drag_payload = lane_hit.dnd_hover_payload::<ClipDrag>();
         let files_hovered = ui.ctx().input(|input| !input.raw.hovered_files.is_empty());
-        if drag_payload.is_some() || (files_hovered && lane_hit.contains_pointer()) {
-            let length = drag_payload
+        if carried || drag_payload.is_some() || (files_hovered && over_lane) {
+            let source = studio
+                .clip_drag
                 .as_ref()
-                .map(|drag| state.steps_for_duration(drag.clip().duration_secs(), drop_step))
+                .map(|drag| drag.clip().clone())
+                .or_else(|| drag_payload.as_ref().map(|drag| drag.clip().clone()));
+            let length = source
+                .as_ref()
+                .map(|clip| state.steps_for_duration(clip.duration_secs(), drop_step))
                 .unwrap_or(16);
             let x0 = lane.left() + drop_step as f32 / LOOP_STEPS as f32 * lane.width();
             let x1 = lane.left()
@@ -649,8 +680,27 @@ pub fn draw_lanes(
         }
 
         // A clip dragged from the session matrix (or another lane) lands here.
-        if let Some(payload) = lane_hit.dnd_release_payload::<ClipDrag>() {
-            studio.drop_clip_on_arrangement(state, audio, (*payload).clone(), track, drop_step);
+        // The pointer is tested against the lane rect instead of the widget
+        // hover, because egui suppresses hover on other widgets while a drag
+        // is live.
+        let released = ui.input(|input| input.pointer.any_released());
+        if released {
+            if let Some(pos) = pointer {
+                if lane.contains(pos) {
+                    if let Some(drag) = studio.clip_drag.clone() {
+                        studio.drop_clip_on_arrangement(state, audio, drag, track, drop_step);
+                        studio.clip_drag = None;
+                    } else if let Some(payload) = lane_hit.dnd_release_payload::<ClipDrag>() {
+                        studio.drop_clip_on_arrangement(
+                            state,
+                            audio,
+                            (*payload).clone(),
+                            track,
+                            drop_step,
+                        );
+                    }
+                }
+            }
         }
 
         // Audio files dropped from the desktop become arrangement clips.
@@ -662,7 +712,7 @@ pub fn draw_lanes(
                 .map(|file| file.path().to_path_buf())
                 .collect()
         });
-        if !dropped.is_empty() && lane_hit.contains_pointer() {
+        if !dropped.is_empty() && pointer.is_some_and(|pos| lane.contains(pos)) {
             ui.ctx().input_mut(|input| input.raw.dropped_files.clear());
             for (index, path) in dropped.iter().enumerate() {
                 let start =
@@ -941,5 +991,139 @@ fn draw_peaks(painter: &egui::Painter, rect: Rect, peaks: &[f32], color: Color32
             ],
             Stroke::new(1.0, theme::accent_alpha(color, 200)),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::{AudioRuntime, MidiRuntime};
+    use crate::plugins::PluginRuntime;
+    use crate::samples::SampleClip;
+    use crate::state::UiState;
+
+    /// One frame with the pointer released at `pos`, to exercise a drop.
+    fn release_at(
+        ctx: &egui::Context,
+        screen: Rect,
+        pos: Pos2,
+        mut draw: impl FnMut(&mut egui::Ui),
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| draw(ui));
+        output.textures_delta.clear();
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        screen: Rect,
+        events: Vec<egui::Event>,
+        mut draw: impl FnMut(&mut egui::Ui),
+    ) {
+        let input = egui::RawInput {
+            screen_rect: Some(screen),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| draw(ui));
+        output.textures_delta.clear();
+    }
+
+    fn press(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    #[test]
+    fn dragging_an_arrangement_clip_starts_a_clip_drag() {
+        let (plugins, _input, _output) = PluginRuntime::start(48_000.0);
+        let mut studio = Studio::new(MidiRuntime::new(), plugins);
+        let mut state = UiState::new();
+        let mut audio = AudioRuntime::start_silent(Some("test".into()));
+
+        let clip = SampleClip::from_tone("PICK ME", 220.0, 0.5, 48_000);
+        let id = state.add_arrangement_clip(2, 8, clip, true, 0.0);
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        let content = theme::panel_content(screen);
+        let lane = lane_rect(content, 2);
+        let start = Pos2::new(lane.left() + lane.width() * 0.04, lane.center().y);
+
+        let ctx = egui::Context::default();
+        frame(&ctx, screen, Vec::new(), |ui| {
+            draw_lanes(ui, screen, &mut state, &mut studio, &mut audio);
+        });
+        frame(
+            &ctx,
+            screen,
+            vec![egui::Event::PointerMoved(start), press(start, true)],
+            |ui| {
+                draw_lanes(ui, screen, &mut state, &mut studio, &mut audio);
+            },
+        );
+        let moved = start + Vec2::new(20.0, 0.0);
+        frame(&ctx, screen, vec![egui::Event::PointerMoved(moved)], |ui| {
+            draw_lanes(ui, screen, &mut state, &mut studio, &mut audio);
+        });
+
+        assert!(
+            matches!(studio.clip_drag, Some(ClipDrag::Arrangement { id: dragged, .. }) if dragged == id),
+            "dragging an arrangement clip must carry it"
+        );
+    }
+
+    #[test]
+    fn a_session_clip_dropped_on_a_lane_lands_on_the_timeline() {
+        let (plugins, _input, _output) = PluginRuntime::start(48_000.0);
+        let mut studio = Studio::new(MidiRuntime::new(), plugins);
+        let mut state = UiState::new();
+        let mut audio = AudioRuntime::start_silent(Some("test".into()));
+
+        let clip = SampleClip::from_tone("DRAGGED", 220.0, 0.5, 48_000);
+        studio.assign_sample(&mut state, &mut audio, 0, 0, clip);
+        let clip = state.sample_clip(0, 0).cloned().expect("session sample");
+        studio.clip_drag = Some(ClipDrag::Session {
+            track: 0,
+            scene: 0,
+            clip,
+        });
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
+        let content = theme::panel_content(screen);
+        let lane = lane_rect(content, 3);
+        let pos = Pos2::new(lane.left() + lane.width() * 0.25, lane.center().y);
+
+        let ctx = egui::Context::default();
+        release_at(&ctx, screen, pos, |ui| {
+            draw_lanes(ui, screen, &mut state, &mut studio, &mut audio);
+        });
+
+        assert!(
+            state.sample_clip(0, 0).is_none(),
+            "the session copy should move, not duplicate"
+        );
+        let placed = state
+            .arrangement
+            .iter()
+            .find(|clip| clip.track == 3)
+            .expect("clip should land on the lane");
+        assert!(placed.start_step > 0);
+        assert!(studio.clip_drag.is_none());
     }
 }

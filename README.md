@@ -7,7 +7,7 @@ modular master chain, MIDI recording and versioned `.rproj` projects.
 Built with `eframe`/`egui` on `wgpu`; audio is rendered by `cpal` through
 lock-free `rtrb` rings.
 
-**Version 1.4.0** · MIT · Linux, macOS and Windows.
+**Version 1.4.1** · MIT · Linux, macOS and Windows.
 
 ![Replicant DAW session and arrangement](docs/screenshot.png)
 
@@ -15,25 +15,21 @@ lock-free `rtrb` rings.
 > the status reads `SILENT FALLBACK`. A fresh session starts with an empty
 > instrument slot and the plugins already scanned.
 
-## What's new in 1.4.0
+## What's new in 1.4.1
 
-- **The built-in NEURAL GEN synth is gone; tracks host external plugins only.**
-  Removing the internal generator also removes the path that could leave it
-  sounding under a VST/CLAP instance. New tracks are silent until a CLAP or
-  VST3 instrument is loaded, and selecting another plugin replaces the previous
-  instance in the same slot.
-- **Arrangement audio clips.** Drag a `.wav`, `.flac` or `.mp3` file from the
-  desktop onto an arrangement lane and it becomes an audio clip at that bar.
-  Clips play at their timeline position, through the track fader, effects and
-  master chain.
-- **Drag between arrangement and session.** Drag a session sample cell onto a
-  lane to move it to the timeline; drag an arrangement clip onto any session
-  cell to move it back. A translucent `DROP AUDIO` block previews the target.
-- **Project format v9** stores arrangement clips and drops the retired synth
-  patch. Older projects still load; their `synth` instrument id becomes an
-  empty slot.
-- **Documentation regenerated** for the synth-free device chain and the new
-  arrangement workflow.
+- **Choosing another plugin cleans the slot first.** The previous instance is
+  retired, the engine drops its one-block plugin pipeline and any queued
+  processed audio, and the track stays silent until the new instance reports
+  in. The old sound can no longer trail under the new selection.
+- **The device chain shows every plugin parameter.** The panel used to stop
+  after the first few knobs; it now lays out the full parameter list in a
+  scrollable grid, so all controls of a large VST/CLAP are reachable without
+  opening the editor.
+- **Drag and drop between the arrangement and the session works.** The clip is
+  carried in DAW state instead of egui's per-widget payload, so it survives
+  crossing from one panel to the other. Drop targets highlight, the ghost block
+  follows the pointer, and the move is verified by simulated-input tests.
+- **Donation link restored** in the README.
 
 ## Screenshots
 
@@ -46,6 +42,8 @@ lock-free `rtrb` rings.
 ![Audio clip editor with its loop region](docs/sample-clip.png)
 
 ![Piano roll clip editor](docs/piano-roll.png)
+
+![Plugin controls in the device chain](docs/device-chain.png)
 
 ## Features
 
@@ -185,12 +183,26 @@ error.
 - Windows and macOS are covered by CI builds but were not manually auditioned
   for this release.
 
+## Support
+
+Replicant DAW is free and open source. If it earns a place in your setup and
+you feel like saying thanks, you can buy me a coffee — completely optional.
+
+<p align="center">
+  <a href="https://paypal.me/DanimanX?locale.x=en_US&amp;country.x=CL">
+    <img src="https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&amp;logoColor=white&amp;style=for-the-badge" alt="Donate with PayPal">
+  </a>
+</p>
+
+<p align="center">
+  <sub><a href="https://paypal.me/DanimanX?locale.x=en_US&amp;country.x=CL">paypal.me/DanimanX</a></sub>
+</p>
+
+---
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
 The embedded fonts are licensed under the SIL Open Font License; license texts
 are in [`assets/licenses/`](assets/licenses).
-
-If this project earns a place in your setup, you can buy me a coffee:
-[paypal.me/DanimanX](https://paypal.me/DanimanX?locale.x=en_US&country.x=CL).

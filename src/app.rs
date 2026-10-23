@@ -99,7 +99,7 @@ impl ReplicantApp {
                 path: std::path::PathBuf::from(path),
                 format,
             };
-            studio.load_plugin(0, &descriptor, &mut state);
+            studio.load_plugin(0, &descriptor, &mut state, &mut audio);
         } else if let Ok(slot) = std::env::var("REPLICANT_DAW_OPEN_SLOT") {
             if let Ok(index) = slot.parse::<usize>() {
                 studio.selected_slot = index.min(crate::plugins::MAX_PLUGIN_SLOTS - 1);
@@ -400,6 +400,12 @@ impl ReplicantApp {
             &mut self.audio,
         );
         ui::devices::draw_add_menu(ui.ctx(), &mut self.state, &mut self.audio);
+
+        // A released pointer ends any clip drag. Drop targets already ran
+        // during this frame, so this only clears a drag that ended nowhere.
+        if ui.ctx().input(|input| input.pointer.any_released()) {
+            self.studio.clip_drag = None;
+        }
     }
 
     fn maybe_screenshot(&mut self, ctx: &egui::Context) {

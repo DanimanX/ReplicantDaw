@@ -899,6 +899,7 @@ impl Engine {
                 instrument,
             } => {
                 let track = (track as usize).min(TRACK_COUNT - 1);
+                let was_active = self.track_plugin.get(track).copied().unwrap_or(false);
                 if let Some(flag) = self.track_plugin.get_mut(track) {
                     *flag = active;
                     self.track_plugin_instrument[track] = instrument;
@@ -916,6 +917,13 @@ impl Engine {
                         self.plugin_pending.clear_events();
                         self.plugin_ready_len = 0;
                         self.plugin_ready_pos = 0;
+                        // Queued blocks were processed by the previous
+                        // instance (or by the one being replaced). Dropping
+                        // them is what stops an old sound trailing into the
+                        // new selection.
+                        if let Some(rx) = &mut self.plugin_output {
+                            while rx.pop().is_ok() {}
+                        }
                     }
                 }
                 // One instrument per track: an active instrument insert owns
@@ -925,9 +933,9 @@ impl Engine {
                     self.synth_enabled[track] = false;
                     self.stop_synth_voices(track);
                 }
-                // Dropping the insert must not leave notes held inside the
+                // Losing the insert must not leave notes held inside the
                 // instance: they would resume the moment it is routed again.
-                if !active && self.plugin_midi && self.track_plugin.iter().any(|enabled| *enabled) {
+                if was_active && !active && self.plugin_midi {
                     self.plugin_pending
                         .push_event(track as u8, 0, [0xB0, 123, 0], 3);
                 }
@@ -2498,6 +2506,60 @@ mod tests {
         let out = render(&mut restored, 24_000);
         let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
         assert!(peak > 0.01);
+    }
+
+    #[test]
+    fn re_routing_a_track_drops_queued_plugin_audio() {
+        let (dry_tx, mut dry_rx) = RingBuffer::new(8);
+        let (mut wet_tx, wet_rx) = RingBuffer::new(8);
+        let mut engine = Engine::new_with_io(
+            48_000.0,
+            EngineIo {
+                plugin_input: Some(dry_tx),
+                plugin_output: Some(wet_rx),
+                ..EngineIo::default()
+            },
+        );
+        engine.apply(Command::SetTrackPlugin {
+            track: 0,
+            active: true,
+            instrument: true,
+        });
+        engine.apply(Command::Play);
+
+        // Simulate a previous instance: loud processed blocks in the return
+        // ring, waiting for the engine to consume them.
+        let mut buffer = vec![0.0_f32; PLUGIN_BLOCK_FRAMES * 2];
+        for _ in 0..3 {
+            engine.process(&mut buffer);
+            while let Ok(mut block) = dry_rx.pop() {
+                for bus in block.left.iter_mut().chain(block.right.iter_mut()) {
+                    for sample in bus.iter_mut() {
+                        *sample = 0.5;
+                    }
+                }
+                let _ = wet_tx.push(block);
+            }
+        }
+
+        // Loading another plugin deactivates and re-activates the slot. The
+        // queued audio belongs to the old instance and must not be heard.
+        engine.apply(Command::SetTrackPlugin {
+            track: 0,
+            active: false,
+            instrument: false,
+        });
+        engine.apply(Command::SetTrackPlugin {
+            track: 0,
+            active: true,
+            instrument: true,
+        });
+        let out = render(&mut engine, PLUGIN_BLOCK_FRAMES * 2);
+        assert!(
+            peak(&out) < 1.0e-6,
+            "queued audio from the previous plugin was played: peak {}",
+            peak(&out)
+        );
     }
 
     #[test]

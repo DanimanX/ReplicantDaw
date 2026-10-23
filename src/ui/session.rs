@@ -7,7 +7,7 @@ use egui::{Align2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, U
 use crate::audio::{
     db_to_gain, gain_to_db, AudioRuntime, Command, SCENE_COUNT, TRACKS, TRACK_COUNT,
 };
-use crate::samples::SampleClip;
+use crate::samples::{ClipDrag, SampleClip};
 use crate::state::UiState;
 use crate::studio::Studio;
 use crate::theme;
@@ -174,12 +174,12 @@ pub fn draw_matrix(
             let response = ui.interact(
                 cell,
                 ui.scope_id().with(("clip", track, scene)),
-                Sense::click(),
+                Sense::click_and_drag(),
             );
             let launched = state.launched[track] == Some(scene as u8);
             let active = launched && state.playing;
             let hovered = response.hovered();
-            let sample_hover = response.dnd_hover_payload::<Arc<SampleClip>>().is_some();
+            let sample_hover = response.dnd_hover_payload::<ClipDrag>().is_some();
             if hovered {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -228,6 +228,13 @@ pub fn draw_matrix(
             // pattern preview when the slot is empty.
             let notes = state.recorded_notes(track, scene);
             let sample = state.sample_clip(track, scene).cloned();
+            if let Some(clip) = &sample {
+                response.dnd_set_drag_payload(ClipDrag::Session {
+                    track,
+                    scene,
+                    clip: Arc::clone(clip),
+                });
+            }
             let has_clip = !notes.is_empty();
             let has_sample = sample.is_some();
             let clip_enabled = state.recorded_active[track][scene];
@@ -389,9 +396,20 @@ pub fn draw_matrix(
             }
 
             let mut dropped = false;
-            if let Some(payload) = response.dnd_release_payload::<Arc<SampleClip>>() {
-                let clip = (*payload).clone();
-                studio.assign_sample(state, audio, track, scene, clip);
+            if let Some(payload) = response.dnd_release_payload::<ClipDrag>() {
+                match &*payload {
+                    ClipDrag::Session {
+                        track: source_track,
+                        scene: source_scene,
+                        ..
+                    } if *source_track == track && *source_scene == scene => {}
+                    ClipDrag::Arrangement { id, .. } => {
+                        studio.move_arrangement_to_session(state, audio, *id, track, scene);
+                    }
+                    drag => {
+                        studio.assign_sample(state, audio, track, scene, drag.clip().clone());
+                    }
+                }
                 dropped = true;
             }
 

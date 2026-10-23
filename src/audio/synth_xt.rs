@@ -1,4 +1,4 @@
-//! NEURAL GEN XT: a hybrid wavetable/subtractive synthesizer.
+//! Legacy offline synth used only by engine unit tests.
 //!
 //! The architecture follows the classic hybrid synths (Surge XT among them):
 //! two oscillators with unison, two multimode filters, three envelopes, two

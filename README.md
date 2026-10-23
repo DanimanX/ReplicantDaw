@@ -1,366 +1,75 @@
 # Replicant DAW
 
-A cyberpunk Digital Audio Workstation (DAW) in Rust: real-time Surge XT wavetable synthesis and stereo mix bus
-driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
-lock-free `rtrb` queues between the threads, MIDI recording, project files, a
-modular effect chain and in-process CLAP/VST3 plugin hosting.
+A cyberpunk digital audio workstation in Rust: external CLAP/VST3 instruments,
+an 8 × 8 session matrix, a 16-bar arrangement with draggable audio clips, a
+modular master chain, MIDI recording and versioned `.rproj` projects.
 
-**Version 1.3.4** · MIT, Linux, macOS and Windows.
+Built with `eframe`/`egui` on `wgpu`; audio is rendered by `cpal` through
+lock-free `rtrb` rings.
 
-![Replicant DAW session view](docs/screenshot.png)
+**Version 1.4.0** · MIT · Linux, macOS and Windows.
 
-> Captured headlessly from the real binary with the silent fallback clock (no
-> audio device attached), so the badges show `SILENT FALLBACK`. A fresh session
-> starts with an empty instrument slot and the plugins already scanned.
+![Replicant DAW session and arrangement](docs/screenshot.png)
 
-![Instrument browser listing the plugins installed on the system](docs/instrument-browser.png)
+> Captured headlessly from the real binary with the silent fallback clock, so
+> the status reads `SILENT FALLBACK`. A fresh session starts with an empty
+> instrument slot and the plugins already scanned.
 
-![SURGE WT SYNTH wavetable editor](docs/synth.png)
+## What's new in 1.4.0
 
-![Piano roll clip editor](docs/piano-roll.png)
+- **The built-in NEURAL GEN synth is gone; tracks host external plugins only.**
+  Removing the internal generator also removes the path that could leave it
+  sounding under a VST/CLAP instance. New tracks are silent until a CLAP or
+  VST3 instrument is loaded, and selecting another plugin replaces the previous
+  instance in the same slot.
+- **Arrangement audio clips.** Drag a `.wav`, `.flac` or `.mp3` file from the
+  desktop onto an arrangement lane and it becomes an audio clip at that bar.
+  Clips play at their timeline position, through the track fader, effects and
+  master chain.
+- **Drag between arrangement and session.** Drag a session sample cell onto a
+  lane to move it to the timeline; drag an arrangement clip onto any session
+  cell to move it back. A translucent `DROP AUDIO` block previews the target.
+- **Project format v9** stores arrangement clips and drops the retired synth
+  patch. Older projects still load; their `synth` instrument id becomes an
+  empty slot.
+- **Documentation regenerated** for the synth-free device chain and the new
+  arrangement workflow.
 
-![Sample clip editor with its loop region](docs/sample-clip.png)
+## Screenshots
+
+![Arrangement lanes with audio clips](docs/arrangement.png)
+
+![Instrument browser listing external CLAP/VST3 plugins](docs/instrument-browser.png)
 
 ![Per-track plugin rack hosting a real CLAP instrument](docs/plugins.png)
 
-![Plugin editor at full screen](docs/plugin-editor.png)
+![Audio clip editor with its loop region](docs/sample-clip.png)
 
-![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
-
-## What's new in 1.3.4
-
-- **The source switch is gone, so the track has one instrument by
-  construction.** The `SURGE WT SYNTH` / `VST3 / CLAP` chips let you pick the
-  synth while a plugin still occupied the slot; the panel then showed Surge
-  parameters over a sounding plugin, and the two could be heard together. The
-  device chain now shows what the slot actually holds — the plugin's panel when
-  one is loaded, the synth's when it is not — and choosing the synth from the
-  browser unloads the plugin first.
-- **CLAP instruments are classified by their feature tags**, not only by
-  whether an audio input port exists. Samplers that expose an input (TAL-Sampler
-  among them) were treated as effects, so the synth kept playing under them.
-  Verified against the plugins installed here: TAL-Sampler now reports
-  `instrument=true`.
-- **Projects without an instrument id keep their synth.** Files written before
-  the slot existed — including the bundled `examples/Demo.rproj` — loaded with
-  an empty instrument slot and played nothing.
-
-## What's new in 1.3.3
-
-- **One instrument per track, enforced in the engine.** Selecting the Surge WT
-  synth and then loading a VST used to leave both sounding: the insert was
-  activated on load while the internal synth was still audible, and the synth
-  only stopped *triggering* notes rather than releasing the ones already
-  ringing. The engine now owns the rule — an active instrument insert silences
-  the synth and fades its voices out over 12 ms, and choosing the synth drops
-  the instrument insert. Effect inserts still process the track bus, so
-  `synth → effect` racks keep working.
-- **The device panel follows the instrument that is actually loaded.** Loading a
-  plugin into the instrument slot switches the panel immediately (with a
-  `LOADING PLUGIN…` state while the instance starts) instead of leaving the
-  Surge editor on screen with a silent, unrouted plugin behind it.
-- **VST3 instruments are classified by their bus layout**, not only by the
-  category string, so generators that report an empty or unusual category are no
-  longer mistaken for effects.
-
-## What's new in 1.3.2
-
-- **1:1 Surge XT Wavetable Architecture:** The included synthesizer now features
-  a dedicated wavetable oscillator engine with 10 morphing wavetable banks
-  (*Basic Shapes*, *Surge Classic*, *Vocal Formants*, *Cyber Metal*, *Harmonic Spectrum*,
-  *PWM Modern*, *Analog Warmth*, *Sub Drone*, *Resonance Sweep*, *Digital Acid*),
-  continuous multi-frame interpolation, real-time `MORPH` modulation via LFOs,
-  envelopes, and mod matrix (`OSC 1 MORPH` / `OSC 2 MORPH`), and an interactive
-  3D glowing wavetable visualizer in the editor.
-- **Ableton-Style Clip Workflow (Audio & MIDI):** Every matrix slot now seamlessly
-  supports both audio samples and MIDI clips. Double-clicking or right-clicking
-  provides immediate access to both the Piano Roll note editor and the Audio Clip
-  waveform/loop editor, with unified view switchers in both editors.
-- **Mutually Exclusive Instrument Selection:** The device chain below now clearly
-  and unambiguously presents `[ ⚡ SURGE WT SYNTH ]` and `[ 🔌 VST3 / CLAP ]`
-  with mutually exclusive activation per track. When a plugin is loaded or selected,
-  only the plugin controls are active and routed; when the built-in synth is selected,
-  only the synth is active and routed.
-- **UI Readability & HiDPI Scaling:** All base font sizes and widgets have been
-  scaled up for high-resolution displays. Default zoom is optimized for 1080p and
-  2K/1440p monitors, with zoom steps up to 200% via shortcuts (`Ctrl +` / `Ctrl -`)
-  or the menu bar.
-- **Production DAW Architecture:** Transitioned from prototype status to full
-  production digital audio workstation architecture with robust error recovery,
-  expanded serialization, and clean modular isolation.
-
-## What's new in 1.3.0
-
-- **The playhead follows the clip loop.** The piano roll, the session MIDI row
-  and the arrangement clip block now draw the engine's own clip phase, which
-  wraps inside the selected loop region. Previously they mapped the global
-  16-bar transport position, so the cursor kept running past a short loop
-  while the audio repeated inside it.
-- **Sample browser drawer.** The `SAMPLES` tab on the right of the clip matrix
-  opens a drawer that navigates folders and lists `.wav`, `.flac` and `.mp3`
-  files. Selecting a file opens the sample editor.
-- **Sample editor.** Waveform with draggable trim handles, gain, normalize,
-  reverse, fade in/out, a one-shot preview through the master bus, and live
-  re-rendering. Once rendered, the `DRAG TO A CLIP CELL` handle assigns the
-  sample to any session slot; the clip matrix draws its waveform and the audio
-  engine plays it on launch.
-- **Samples are saved with the project** (format v7) as a path plus edit
-  settings, and restored on load.
-
-## Fixes in 1.2.3
-
-- **The loop reads as the part that plays.** Notes outside the clip's loop are
-  now drawn faded in the piano roll instead of looking equally active, so a
-  short loop no longer appears to run to the end of the grid.
-- **Mini clip views show the clip, not the timeline.** The session matrix and
-  the MIDI row draw the loop region scaled to the cell (measured: a 40-step
-  loop now fills the cell with its own notes) and `MIDI · n N` summaries keep
-  their meaning. In the arrangement the block keeps its absolute position on
-  the 16-bar ruler but is drawn only as long as the loop, with the loop range
-  in its header (`SLOT 02 · 2.2–4.3`) instead of "16 BARS".
-- **No overlapping clip labels.** Narrow blocks shorten the header text
-  (`MIDI CLIP · SLOT 02` → `SLOT 02` → `02`) in clipped boxes, so the name and
-  the loop readout never collide.
-- **Loop handles stay inside the ruler** at both extremes, and the footer shows
-  the last played position (`2.2 – 4.3`), not one step past it.
-
-## Fixes in 1.2.2
-
-- **Moving and resizing notes works after inserting them.** The drag handlers
-  used egui's `drag_delta`, which is the pointer motion of the *last frame*, as
-  if it were the offset since the drag started: every frame recomputed the note
-  from its original position plus one frame of movement, so the note snapped
-  back and appeared stuck. Dragging is now absolute — the offset from where you
-  grabbed the note — which makes moving, lengthening and shortening reliable.
-  Verified end to end: a drag of +3 steps / +2 semitones produced exactly
-  `(60, step 0)` → `(62, step 3)`, and a right-edge drag of 4 steps changed a
-  2-step note into a 5-step one.
-- **Loop edges resize independently.** The ruler had a single drag handler, so
-  grabbing a loop handle started a brand-new region instead of moving that
-  edge. Start and end now have their own hit areas (9 px), each edge only moves
-  itself and can never cross the other, and dragging empty ruler still draws a
-  new region — snapped to where you pressed. Verified: start handle 0 → 32 with
-  the end untouched; a fresh region drawn 20 → 60.
-
-## Fixes in 1.2.1
-
-- **Windows build** — the plugin window's transient parent used `c_ulong`,
-  which is `u32` on Windows and `u64` on Unix: the comparison to the stored
-  `u64` failed to compile there. The conversion is now explicit on both.
-
-## What's new in 1.2.0
-
-- **Clip loops in the piano roll** — drag on the ruler to set a loop start and
-  end; the region is highlighted, everything outside it is dimmed, and playback
-  repeats only that region while the rest of the session keeps its own timeline.
-  `LOOP ALL` resets it to the whole 16 bars, and the loop is saved with the
-  project (format v6).
-- **Floating plugin windows** — plugin editors are now real floating utility
-  windows: transient for the DAW, kept above it, movable on their own, and
-  carrying the editor's exact size hints so nothing is clipped. Plugins that
-  expose their own floating window are asked for it first.
-- **The plugin picker closes when you choose** — selecting a plugin (or the
-  internal synth) closes the browser immediately instead of leaving it open on
-  top of the new instrument.
-
-## Fixes in 1.1.3
-
-- **macOS build** — the file-descriptor polling added in 1.1.2 used `libc`,
-  which was only declared for Linux while the code is compiled for every
-  `unix`. The dependency now covers `cfg(unix)`, so the macOS builds compile
-  again.
-
-## Fixes in 1.1.2
-
-- **Plugin windows respond to the mouse.** The host now registers the CLAP
-  `timer` and `posix_fd` extensions and drives the VST3 Linux run loop, and the
-  plugin worker services them on every tick instead of only when idle. GUI
-  toolkits such as JUCE (Dexed, JC303, TAL) build their editor loop on those
-  callbacks, so without them the editor drew once and then ignored every click.
-  Verified: dragging knobs changes real parameters in Dexed (2 of 128) and in a
-  VST3 instrument (9 of 2097), and hover repaints in both.
-- **Editor windows are sized and kept in sync.** The host window is created at
-  the plugin's own canvas size, centered, focused and raised; it follows the
-  plugin when it re-lays out, and pushes user resizes down to resizable editors
-  or snaps back for fixed-size ones. Nothing is clipped.
-- **Host knobs follow the plugin window.** While an editor is open, the worker
-  re-reads the plugin's parameters every 400 ms, so changes made in the
-  vendor's window show up in the rack and the parameter editor.
-
-## Fixes in 1.1.1
-
-- **CLAP plugin windows no longer abort the app.** The editor setup called
-  `clap_plugin_gui.get_size()` while negotiating the window mode, before
-  `create()` — which CLAP forbids. Plugins that validate the sequence (u-he
-  prints `clap_plugin_gui.size() was called without a prior call to
-  clap_plugin_gui.create()` and then calls `terminate`) killed the process.
-  Sizing now happens strictly after `create`, and a regression test fails the
-  build if a sizing call ever moves ahead of it again.
-- Verified opening and closing the native window of **Bazille, Diva, Zebra3,
-  Dexed, JC303, TAL-Sampler (CLAP)** and **Replicant303, Scyllascope (VST3)**
-  without crashes.
-
-## What's new in 1.1.0
-
-- **Tracks start empty** — a new session has no synth loaded. The device chain
-  opens with a single `ADD PLUGIN / INSTRUMENT` button; the internal
-  `NEURAL GEN V5` FM synth is now one choice in that browser, next to the
-  plugins.
-- **Plugins are preloaded** — the plugin scanner runs automatically at startup,
-  so the picker already lists everything installed under the standard CLAP and
-  VST3 locations (42 plugins on the test machine).
-- **Native plugin windows** — `PLUGIN GUI` opens the plugin's own window instead
-  of only the parameter surface. CLAP editors are embedded into a host-owned
-  X11 window with the `clap.gui`, `clap.thread-check`, `clap.timer` and
-  `clap.posix-fd` host extensions registered; VST3 editors use the editor window
-  provided by the VST3 host and its Linux run loop. The button lives in the
-  instrument module, the rack row and the plugin editor.
-- **Instrument source is explicit** — each track records whether it plays
-  nothing, the FM synth, or the plugin, and project format v5 stores it. v4
-  files keep playing their synth.
-
-## Fixes in 1.0.5
-
-- **Windows build** — the 1.0.4 release failed its Windows self-test with a
-  stack overflow. Session clips now live in a heap-allocated grid, which takes
-  `Engine` from ~260 KiB back to ~70 KiB and keeps the whole app inside the
-  1 MiB main-thread stack Windows provides. A regression test now fails if the
-  struct grows past 128 KiB or if four engines cannot run on a 1 MiB stack.
-
-## What's new in 1.0.4
-
-- **Independent session clips** — every one of the 8 × 8 slots now owns its own
-  MIDI clip. Programming a slot no longer copies the pattern to the slots below
-  it; each slot can be empty, hold generative material, or hold its own MIDI
-  clip, and the piano roll switches slots with a selector.
-- **Editable track names** — double-click a track name in the session header,
-  mixer strip or arrangement gutter to rename it. Names appear everywhere and
-  are saved in the project.
-- **Instrument slot** — the device chain starts with a single `INSTRUMENT`
-  module: `FM` plays the internal `NEURAL GEN V5` synth, `PLUGIN` plays the
-  hosted CLAP/VST3 instrument, and loading an instrument plugin takes over the
-  track automatically. Sequencer and recorded MIDI now reach the plugin insert
-  too, including note-offs.
-- **Full-screen plugin editor** — open any track insert in a large parameter
-  editor and press `FULLSCREEN` (or `Esc` to restore). Plugin parameters can be
-  filtered by name.
-- **Project format v4** — stores per-slot MIDI clips, track names and the
-  instrument-slot choice. v3 files migrate their single clip into the slot they
-  played from; v1/v2 files still load.
-- **Project format v6** — adds each clip's loop region (`loop_start`,
-  `loop_end`). Older files load with the full 16-bar loop, i.e. unchanged
-  playback.
+![Piano roll clip editor](docs/piano-roll.png)
 
 ## Features
 
-- **Two-thread audio architecture**
-  - Audio thread: the `cpal` output callback renders stereo at 48 kHz, 32-bit
-    float when the device supports it.
-  - UI thread: `eframe` + `egui` with the `wgpu` renderer.
-  - Lock-free SPSC `rtrb` rings for commands, telemetry, scope samples, MIDI,
-    recording events and plugin audio blocks.
-- **Instrument slots**
-  - Each track has one instrument slot and starts empty.
-  - `ADD PLUGIN / INSTRUMENT` opens a browser with the internal 2-op FM synth
-    plus every CLAP/VST3 plugin found on the system (scanned at startup).
-  - Loading an instrument plugin makes it the track's sound source; effect
-    plugins stay inserts and keep the current source.
-  - `PLUGIN GUI` opens the plugin's own native window (CLAP embedded in a
-    host-owned X11 window, VST3 through its editor window).
-  - Full-screen parameter editor per insert, with a name filter, as a fallback.
-- **Synthesis**
-  - 8 tracks with a 32-voice polyphonic two-operator FM engine.
-  - Per-track editable FM ratio, modulation index and ADSR envelope.
-  - Per-track gain, pan, mute and solo; equal-power stereo bus.
-  - Generative 16-step clip patterns across 8 scenes in a 16-bar loop.
-- **Modular master chain**
-  - `SYNAPSE DRIVE`: saturation, wet mix and output trim.
-  - `NEURAL GEN V5`: high-cut tone filter.
-  - `QUANTUM RESONATOR`: resonant topology-preserving state-variable low-pass.
-  - `MIRROR WIDTH`: mid/side stereo width.
-  - `ECHO MEMORY`: stereo delay with feedback and wet mix.
-  - Add, reorder, bypass and close modules; master gain, soft clip, DC blocking
-    and a hard output guard stay fixed at the end of the chain.
-- **MIDI recording**
-  - Live MIDI input through `midir` (ALSA, CoreMIDI, WinMM), with rescan and
-    device selection.
-  - Arm a track, hit `REC`, and play: notes are captured at 16th-note
-    resolution into the track's launched session slot, replacing its generative
-    pattern. Other slots keep their own material.
-  - An on-screen two-octave keyboard feeds the same MIDI path, so the workflow
-    is testable without hardware.
-  - Clips are visible in the session matrix and the arrangement, and can be
-    muted without deleting them.
-- **Piano roll and audio clip editing**
-  - Double-click a session or arrangement clip to program MIDI for that slot.
-  - Drag on the ruler to draw a loop region; drag either amber handle to move
-    that edge. Playback repeats the region only, and notes outside it stay
-    silent.
-  - 16-bar grid at 16th-note resolution, four-octave view with octave shift.
-  - Add, move, resize, delete, mute and set velocity per note.
-  - Each session slot is independent; the editor has a slot selector.
-  - Audio clips expose clip gain and loop-normalized fade-in/fade-out.
-- **Track management**
-  - Rename tracks from the session, mixer or arrangement; names are saved.
-  - Track names drive the session, arrangement, mixer, rack and editors.
-- **Project save / load**
-  - Versioned JSON `.rproj` files: tempo, mix, scenes, track names, per-slot
-    MIDI clips, synth parameters, effect chain, master gain and plugin state
-    (base64).
-  - `Ctrl+S` quick save, a project browser, and `--project <path>` on startup.
-  - Format v1 files still load; the legacy fixed FX block becomes a chain.
-  - `examples/Demo.rproj` ships with MIDI clips and a five-module chain.
-- **Plugin hosting**
-  - **CLAP**: in-process hosting with audio, note/parameter events and state.
-  - **VST3**: in-process hosting with audio, MIDI, parameters and state.
-  - **VST2**: discovered and listed, but not hostable because the Steinberg SDK
-    is proprietary and not vendored (see [docs/PLUGINS.md](docs/PLUGINS.md)).
-  - **Audio Unit**: not implemented (macOS only).
-  - One insert slot per track (8 total), bypass, per-slot parameter knobs and
-    latency reporting. Inserts run on the track bus before the master chain.
-- **Session UI**
-  - Menu bar with project, plugin, synth, MIDI and zoom controls.
-  - Transport with bar/beat/step counter, editable BPM, play/stop, REC, audio
-    callback CPU meter, master meter and link status.
-  - Clip matrix (8 × 8) plus a MIDI row, with a per-slot piano-roll preview,
-    live step progress and scene launch.
-  - Mixer strips with vertical faders, LED dB meters, pan and mute/solo.
-  - Arrangement lanes with a 16-bar ruler, animated playhead and MIDI clip
-    containers.
-  - Live spectral waterfall computed with a 1024-point Hann-windowed FFT and
-    rendered as a coloured 3D mesh with `egui::Painter`.
-- **Robust host handling**
-  - Prefers a 48 kHz stereo F32 device configuration and converts to the
-    device's sample format when needed.
-  - If no output device exists, a real-time silent clock keeps the engine,
-    meters, FFT and plugin chain running and the UI shows `SILENT FALLBACK`.
-
-## Plugin support
-
-| Format | Scan | Host | Notes |
-| --- | --- | --- | --- |
-| CLAP | yes | yes | audio + note/param events + state |
-| VST3 | yes | yes | audio + MIDI + params + state |
-| VST2 | yes | no | proprietary SDK not vendored |
-| AU / AUv3 | no | no | macOS-only, not implemented |
-
-Plugins run on a dedicated worker thread, exchanging 512-frame stereo blocks
-with the engine through lock-free rings. Each block carries one stereo bus per
-track, so an insert processes only the track it is assigned to. This keeps
-`!Send` plugin handles out of the audio callback and isolates load/state cost
-from the UI.
-
-**VST3 unload workaround:** some third-party VST3s (verified with OB-Xd) crash
-asynchronously inside their own teardown. Closing such a slot stops its DSP and
-parks the instance for the lifetime of the process instead of destroying it, so
-the application stays stable. The trade-off is that the parked plugin's memory
-is only reclaimed when the app exits; CLAP instances are destroyed normally.
-
-Details, scan paths and troubleshooting: [docs/PLUGINS.md](docs/PLUGINS.md).
+- **One external instrument slot per track** — CLAP and VST3 are hosted
+  in-process on a worker thread; VST2 is listed but not hostable.
+- **Session matrix** — 8 tracks × 8 scenes, independent MIDI clips, audio
+  samples, per-clip loops and mute.
+- **Arrangement** — 16-bar timeline with audio clips, a beat grid and an
+  animated playhead. Drag audio in from the desktop or from the session view.
+- **Audio clip editor** — waveform, trim, gain, normalize, reverse, fades,
+  loop region and one-shot preview.
+- **Piano roll** — add, move, resize and delete notes; per-clip loop region;
+  velocity editing.
+- **Mixer and master chain** — gain, pan, mute/solo, drive, tone, filter,
+  width and delay modules, master gain and output protection.
+- **Plugin hosting** — parameter surface, full-screen editor, native plugin
+  windows, state save/restore, latency reporting.
+- **Projects** — versioned JSON, quick save and a project browser.
+- **Headless fallback** — the silent clock keeps meters, playhead and plugins
+  running when no audio device is available.
 
 ## Requirements
 
-- Rust 1.85 or newer (stable toolchain).
+- Rust 1.85 or newer.
 - Linux: ALSA development headers and the usual windowing libraries.
 
   ```bash
@@ -373,10 +82,10 @@ Details, scan paths and troubleshooting: [docs/PLUGINS.md](docs/PLUGINS.md).
       libX11-devel libXi-devel
   ```
 
-- macOS: Xcode command line tools; no extra packages.
-- Windows: MSVC build tools; no extra packages. WASAPI is used through `cpal`.
+- macOS: Xcode command line tools.
+- Windows: MSVC build tools; WASAPI is used through `cpal`.
 
-Fonts and the app icon are embedded, so there are no runtime asset paths.
+Fonts and the app icon are embedded.
 
 ## Run
 
@@ -387,26 +96,22 @@ cargo run --release
 ```bash
 cargo run --release -- --devices        # list audio output devices
 cargo run --release -- --audio-check    # open the default device and verify telemetry
-cargo run --release -- --selftest       # DSP, chain, project, MIDI and clock smoke test
-cargo run --release -- --project examples/Demo.rproj
-cargo test                              # 72 unit tests
+cargo run --release -- --selftest       # engine, chain, project, MIDI and clock smoke test
+cargo run --release -- --project /path/to/project.rproj
+cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
 Environment variables:
 
 ```bash
-REPLICANT_DAW_NO_AUDIO=1        # force the silent fallback clock
-REPLICANT_DAW_SIZE=1200x760     # initial window size (clamped to the minimum)
-REPLICANT_DAW_ZOOM=125          # UI scale at startup (75..150)
-REPLICANT_DAW_PROJECT=x.rproj   # load a project at startup
-REPLICANT_DAW_PROJECTS=dir      # override the projects directory
-REPLICANT_DAW_PLUGIN_PATH=a:b   # extra plugin scan roots
-REPLICANT_DAW_OPEN_PLUGIN=/path/to/plugin.vst3   # QA: load into slot 1
-REPLICANT_DAW_SMOKE=docs/screenshot.png
-REPLICANT_DAW_SMOKE_SECS=4      # auto-play, wait, screenshot, exit
-REPLICANT_DAW_SMOKE_WINDOWS=rack,midi,synth      # open utility windows
-REPLICANT_DAW_SMOKE_SAVE=/tmp/demo.rproj         # save a project before exiting
+REPLICANT_DAW_NO_AUDIO=1          # force the silent fallback clock
+REPLICANT_DAW_SIZE=1660x1000      # initial window size
+REPLICANT_DAW_ZOOM=125            # UI scale at startup (75..200)
+REPLICANT_DAW_PROJECT=x.rproj     # load a project at startup
+REPLICANT_DAW_PROJECTS=dir        # override the projects directory
+REPLICANT_DAW_PLUGIN_PATH=a:b     # extra plugin scan roots
+REPLICANT_DAW_OPEN_PLUGIN=/path/to/plugin.vst3
 WGPU_BACKEND=gl|vulkan|metal|dx12
 ```
 
@@ -416,219 +121,76 @@ Default project directory:
 - macOS: `~/Library/Application Support/ReplicantDaw/projects`
 - Windows: `%APPDATA%\ReplicantDaw\projects`
 
+## Arrangement workflow
+
+1. Open the instrument browser from `SELECT VST3 / CLAP` and load an instrument
+   into a track. Without one, MIDI clips are silent.
+2. Drop an audio file onto a lane, or drag a sample from the session matrix.
+   The clip lands on the nearest beat; the ghost block shows where it will go.
+3. Drag the arrangement block onto any session cell to move it back. Dragging
+   a session cell onto a lane moves it out of the matrix so it cannot sound
+   twice.
+4. Double-click an arrangement clip to open the audio editor. Right-click for
+   `OPEN AUDIO EDITOR` or `REMOVE FROM ARRANGEMENT`.
+5. Press Space to play. Arrangement clips play at their absolute timeline
+   position; the 16-bar loop wraps.
+
 ## Controls
 
 - **Space** — play / stop. **Esc** — stop and rewind.
 - **Ctrl+S** — save. **Ctrl+O** — project window. **Ctrl+P** — plugin browser.
-- **Ctrl + / Ctrl − / Ctrl 0** — zoom in / out / reset. The `ZOOM` menu offers
-  75%, 90%, 100%, 110%, 125% and 150%.
-- **Play / Stop / REC** — transport and MIDI recording on the selected track.
+- **Ctrl + / Ctrl − / Ctrl 0** — zoom in / out / reset.
 - **BPM** — click to type, drag vertically, or use `-` / `+`.
-- **MIDI row** — click a track's clip to mute/unmute it; empty slots prompt to
-  arm REC. The row also shows a live loop position.
-- **Clip slot** — click to launch, click again (or right-click) to stop. The
-  triangle at the left of a row launches the whole scene.
-- **Track header** — selects the track (also the MIDI input/record target and
-  the track edited by the synth module).
-- **Fader** — drag vertically, double-click for 0 dB.
-- **Pan knob** — drag vertically, double-click to centre.
+- **Clip slot** — click to launch, click again to stop; right-click for the
+  clip menu.
+- **Sample cell** — drag to the arrangement; double-click to edit the clip.
+- **Arrangement lane** — drop audio files or dragged clips; double-click empty
+  space to edit the track's clip.
+- **Fader / pan** — drag vertically, double-click to reset.
 - **M / S** — mute and solo.
-- **SYNTH module** — click its track strip to cycle tracks; drag its seven
-  knobs. `SYNTH` in the menu opens the larger editor with RESET.
 - **Effect module** — drag knobs; `b` bypasses, `X` closes, `‹ ›` reorders.
-  `+ ADD FX` opens the module menu (and `RESET CHAIN`).
-- **Rack** — load, bypass or remove plugins; up to 16 parameters per slot.
-- **MIDI** — connect an input, play the on-screen keyboard, arm REC, clear a
-  clip, toggle MIDI to plugins.
+- **Rack** — load, bypass, edit or remove the plugin in each track.
 
-## Architecture
+## Plugin support
 
-```
-┌────────────────────────── UI thread (eframe / egui / wgpu) ─────────────────────────┐
-│ menu+zoom · transport · clip matrix+MIDI row · mixer · lanes · FFT · chain · windows  │
-│    │ Command              ▲ Telemetry / scope / record events                        │
-└────┼──────────────────────┼─────────────────────────────────────────────────────────┘
-     │ rtrb                 │ rtrb
-┌────▼──────────────────────┴─────────────────────────────────────────────────────────┐
-│ Audio thread: cpal callback (or paced silent clock)                                  │
-│ sequencer → FM voices (per-track params) → track mix → modular FX chain → master      │
-│      │ dry blocks                                                ▲ processed blocks  │
-└──────┼───────────────────────────────────────────────────────────┼───────────────────┘
-       │ rtrb                                                      │ rtrb
-┌──────▼───────────────────────────────────────────────────────────┴───────────────────┐
-│ Plugin worker thread: CLAP + VST3 instances, params, state                           │
-└──────────────────────────────────────────────────────────────────────────────────────┘
+- **CLAP** — scan, load, stereo audio, note/parameter events, state, native
+  editor.
+- **VST3** — scan, load, audio, MIDI, parameters, state, latency, editor.
+- **VST2** — discovered and listed only; the Steinberg SDK is not vendored.
+- **Audio Unit** — not implemented.
 
-MIDI hardware ──midir──▶ bridge ring ──UI pump──▶ MIDI ring ──▶ engine (voices + record)
-```
+Each track has one insert slot. Instruments generate the track's audio; effect
+plugins process the track bus. Plugins run on a dedicated worker thread and
+exchange 512-frame stereo blocks through lock-free rings.
 
-- `src/audio/engine.rs` renders audio. It never allocates, locks or calls into
-  third-party code; the plugin chain only moves blocks between rings.
-- `src/audio/effects.rs` implements the chain modules with fixed state and
-  smoothed parameters.
-- `src/plugins/worker.rs` owns all plugin handles. It is created inside its own
-  thread because plugin instances are not `Send`.
-- `src/studio.rs` owns MIDI, plugins, zoom and projects on the UI side.
-- `src/project.rs` is the serialized session model.
-
-## DSP details
-
-- Two-operator phase-modulation voice: `sin(phase + index * env * sin(mod_phase))`,
-  with per-track ratio, index and ADSR edited live from the UI.
-- The sequencer derives the current 16th note from a sample-accurate transport
-  position, so tempo changes and loops stay tight.
-- Each track runs its instrument slot (internal FM synth or plugin) and then
-  sums into the master bus. Chain order is user-defined; master gain, soft
-  clip, DC blocker and output guard always come last.
-- Effect parameters are clamped to their module ranges and smoothed to avoid
-  zipper noise. Delay runs a 1.05 s stereo line.
-- `src/dsp/spectrum.rs` uses `rustfft` with a 1024-point Hann window and
-  log-spaced display bins from 30 Hz to 16 kHz.
+Details, scan paths and known limits: [docs/PLUGINS.md](docs/PLUGINS.md).
 
 ## Project format
 
-`.rproj` is versioned JSON (format 6):
+`.rproj` is versioned JSON. Format v9 stores tempo, mix, track names, session
+MIDI clips, session samples, arrangement audio clips, effect chain, master gain
+and plugin state. Older formats load with migrations; a track whose instrument
+id is `synth` loads as an empty slot because the built-in synth was removed.
+Unknown fields are ignored and newer format versions are rejected with a clear
+error.
 
-```json
-{
-  "format_version": 6,
-  "app_version": "1.2.0",
-  "name": "Neon Demo",
-  "bpm": 142.0,
-  "effects": [
-    { "kind": "DRIVE",  "params": [0.22, 1.0, 1.0], "bypass": false },
-    { "kind": "FILTER", "params": [6200.0, 0.24, 1.0], "bypass": false },
-    { "kind": "DELAY",  "params": [0.28, 0.32, 0.18], "bypass": false }
-  ],
-  "master_gain": 0.9,
-  "tracks": [
-    { "name": "MY LEAD", "gain_db": -7.0, "pan": -0.12,
-      "mute": false, "solo": false, "scene": 1,
-      "clip_gain_db": 0.0, "fade_in": 0.0, "fade_out": 0.0,
-      "instrument": "synth",
-      "synth": { "ratio": 1.0, "index": 2.4, "attack": 0.004,
-                 "decay": 0.18, "sustain": 0.25, "release": 0.25,
-                 "level": 0.9 },
-      "clips": [
-        { "scene": 1, "enabled": true,
-          "loop_start": 0, "loop_end": 256,
-          "notes": [ { "note": 60, "velocity": 100,
-                       "start_step": 0, "length_steps": 2 } ] }
-      ] }
-  ],
-  "plugins": [
-    { "slot": 0, "name": "Dexed", "format": "CLAP",
-      "path": "/usr/lib/clap/Dexed.clap",
-      "bypass": false, "state": "<base64>" }
-  ]
-}
-```
+## Limits
 
-`tracks[].clips` holds one entry per non-empty session slot, so each of the
-8 × 8 slots is independent. `plugins[].slot` is the track index and
-`instrument` records the sound source (`empty`, `synth` or `plugin`). Unknown
-fields are ignored (forward compatible), while a newer `format_version` is
-rejected with a clear error. Loading a v4 file maps its `instrument_plugin`
-flag onto `instrument`; a v3 file moves its single `notes` clip into the slot
-named by `scene`; v1 files translate their `fx` block into chain modules.
-
-## Verification
-
-Verified on Linux (Arch, kernel 7.2) with a real AMD/Radeon desktop, a
-Keystation 49 MK3 MIDI keyboard, and third-party plugins already installed:
-
-```
-$ cargo test
-test result: ok. 92 passed; 0 failed
-
-$ cargo clippy --all-targets -- -D warnings
-Finished
-
-$ ./target/release/replicant-daw --selftest
-- rendered 8.0 s of audio in 0.106 s (75.7x realtime)
-- lock-free path: telemetry playing=true peaks=0.442 | scope frames=32768
-- chain: 4 default modules -> 4 after remove/add; synth index 3.2
-- project: 2 module(s), 1 note(s), synth index 4.25
-- midi recording: 1 note(s), 2 UI event(s)
-- midi inputs available: 5
-- midi input opened: Midi Through:Midi Through Port-0 14:0
-- silent clock: peak 0.577, playing=true
-SELFTEST OK
-
-$ ./target/release/replicant-daw --audio-check
-AUDIO OK: Alsa | Default Audio Device | 48000 Hz | ... telemetry frames | stopped (silent)
-```
-
-Additional manual checks:
-
-- **VST3**: `OB-Xd 3.vst3` loads on the worker thread, exposes its parameters,
-  reports latency and produces audio from MIDI; closing the slot no longer
-  crashes thanks to the parked-instance workaround.
-- **CLAP**: `Dexed.clap` loads into a track's instrument slot, exposes 128
-  parameters, takes over the track's sound source and is playable from the
-  sequencer and the piano roll. The full-screen editor and parameter filter
-  were captured from the running binary.
-- **Independent slots**: an injected double-click on the session cell for
-  track 1 / slot 3 opened `PIANO ROLL // TRACK 01 // SLOT 03`, a note added
-  there left slot 2's 16-note clip untouched, and the matrix only kept the
-  slot-2 clip. Also covered by engine and UI-state tests.
-- **Projects**: saved a session with chain, synth parameters, per-slot clips,
-  track names and the instrument choice, then loaded it in a fresh process;
-  `examples/Demo.rproj` is the same file in format v4.
-- **UI zoom**: captured at 125% (`docs/synth.png`), with the logical layout
-  preserved and the synth editor open.
-- **Screenshots**: `docs/screenshot.png`, `docs/synth.png`, `docs/plugins.png`,
-  `docs/piano-roll.png` and `docs/plugin-editor.png` are captured from the real
-  binary under Xvfb.
-
-The CI matrix runs tests and the self-test on Ubuntu, macOS and Windows. The
-release workflows cross-build both macOS architectures and publish packages for
-Linux, macOS and Windows on every tag (`.github/workflows/release-*.yml`).
-
-## Architecture & roadmap
-
-- Plugin hosting is in-process: a crashing plugin takes the app down, and the
-  plugin worker adds one block of latency. An out-of-process sandbox is the
-  natural next step.
-- The VST3 workaround parks closed instances instead of destroying them, so
-  their memory is held until exit.
-- Native plugin windows are experimental. CLAP editors are embedded on
-  Linux/X11; Windows and macOS fall back with a clear message.
-- Rendering of plugin windows could not be verified headlessly (Xvfb has no
-  compositor), only that they are created, sized, mapped and closed cleanly.
-- VST2 and Audio Unit hosting are not implemented (see the matrix above).
-- The modular effects are still a master chain; per-track inserts host one
-  plugin each. There is no arbitrary per-track effect chain yet.
-- One MIDI clip per session slot and one instrument plugin per track. There is
-  no arrangement clip model (the arrangement mirrors the launched slot) and no
-  MIDI export, automation lanes or undo. Recording replaces the target clip.
-- Instrument-slot choice and effect-plugin inserts share the same slot: an
-  instrument plugin replaces the FM synth, an effect plugin is an insert.
-- One 16-bar loop.
+- One MIDI clip per session slot and one external instrument per track.
+- Arrangement clips are audio; there is no MIDI arrangement clip model yet.
+- One 16-bar loop; no automation lanes, undo or audio export.
+- Plugin hosting is in-process: a crashing plugin can take the app down.
+- Native plugin windows are tested on Linux/X11; other platforms fall back to
+  the parameter editor.
 - Windows and macOS are covered by CI builds but were not manually auditioned
-  for this release; Linux/ALSA, MIDI input, CLAP and VST3 were verified on
-  hardware.
-
-## Support
-
-Replicant DAW is free and open source. If it earns a place in your setup and
-you feel like saying thanks, you can buy me a coffee — completely optional.
-
-<p align="center">
-  <a href="https://paypal.me/DanimanX?locale.x=en_US&amp;country.x=CL">
-    <img src="https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&amp;logoColor=white&amp;style=for-the-badge" alt="Donate with PayPal">
-  </a>
-</p>
-
-<p align="center">
-  <sub><a href="https://paypal.me/DanimanX?locale.x=en_US&amp;country.x=CL">paypal.me/DanimanX</a></sub>
-</p>
-
----
+  for this release.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
-The embedded fonts are licensed under the SIL Open Font License; the license
-texts are in [`assets/licenses/`](assets/licenses).
+The embedded fonts are licensed under the SIL Open Font License; license texts
+are in [`assets/licenses/`](assets/licenses).
+
+If this project earns a place in your setup, you can buy me a coffee:
+[paypal.me/DanimanX](https://paypal.me/DanimanX?locale.x=en_US&country.x=CL).

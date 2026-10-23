@@ -108,6 +108,12 @@ impl ReplicantApp {
         if let Ok(sample) = std::env::var("REPLICANT_DAW_SAMPLE") {
             studio.open_sample_editor_path(std::path::Path::new(&sample));
         }
+        if std::env::var_os("REPLICANT_DAW_DEMO_ARRANGEMENT").is_some() {
+            studio.seed_arrangement_demo(&mut state, &mut audio);
+        }
+        if std::env::var_os("REPLICANT_DAW_DEMO_SESSION").is_some() {
+            studio.seed_session_demo(&mut state, &mut audio);
+        }
         if let Ok(windows) = std::env::var("REPLICANT_DAW_SMOKE_WINDOWS") {
             for window in windows.split(',') {
                 match window.trim() {
@@ -116,7 +122,6 @@ impl ReplicantApp {
                     "project" => studio.project_open = true,
                     "browser" => studio.browser_open = true,
                     "instrument" => studio.open_instrument_browser(state.selected_track),
-                    "synth" => studio.synth_open = true,
                     "add" => state.add_effect_open = true,
                     "piano" => {
                         studio.piano_roll_open = true;
@@ -373,7 +378,13 @@ impl ReplicantApp {
             &mut self.studio,
             &mut self.audio,
         );
-        ui::lanes::draw_lanes(ui, tracks_rect, &mut self.state, &mut self.studio);
+        ui::lanes::draw_lanes(
+            ui,
+            tracks_rect,
+            &mut self.state,
+            &mut self.studio,
+            &mut self.audio,
+        );
         ui::lanes::draw_fft(ui, fft_rect, &mut self.state);
         ui::devices::draw(
             ui,

@@ -86,6 +86,78 @@ impl SampleClip {
             .map(|extension| extension.to_string_lossy().to_ascii_uppercase())
             .unwrap_or_else(|| "AUDIO".to_string())
     }
+
+    /// Build a short synthetic clip for headless demos and screenshots.
+    ///
+    /// The source frames travel with the rendered buffer, so the audio editor
+    /// can reopen the clip exactly like a decoded file.
+    pub fn from_tone(name: &str, hz: f32, seconds: f32, sample_rate: u32) -> Arc<Self> {
+        let sample_rate = sample_rate.max(8_000);
+        let frames = ((seconds.max(0.05) * sample_rate as f32).round() as usize).max(1);
+        let mut source = Vec::with_capacity(frames * 2);
+        let mut peaks = Vec::with_capacity(256);
+        let bucket = (frames / 256).max(1);
+        let mut bucket_peak = 0.0_f32;
+        for index in 0..frames {
+            let t = index as f32 / sample_rate as f32;
+            let envelope = (-t * 1.4).exp();
+            let lfo = 1.0 + 0.18 * (std::f32::consts::TAU * 2.0 * t).sin();
+            let value = (std::f32::consts::TAU * hz * t).sin() * 0.32 * envelope * lfo;
+            source.push(value);
+            source.push(value);
+            bucket_peak = bucket_peak.max(value.abs());
+            if (index + 1) % bucket == 0 {
+                peaks.push(bucket_peak);
+                bucket_peak = 0.0;
+            }
+        }
+        if peaks.is_empty() {
+            peaks.push(bucket_peak);
+        }
+        let buffer = Arc::new(SampleBuffer {
+            frames: source.clone(),
+            sample_rate,
+        });
+        Arc::new(Self {
+            path: PathBuf::from(format!("{name}.wav")),
+            name: name.to_string(),
+            source: Arc::new(source),
+            source_rate: sample_rate,
+            source_frames: frames,
+            edits: SampleEdits::default(),
+            buffer,
+            peaks,
+        })
+    }
+}
+
+/// Payload carried while an audio clip is dragged between views.
+///
+/// The same type is used by the sample editor, the session matrix and the
+/// arrangement, so a drop target can distinguish a fresh render from a clip
+/// that already lives somewhere (and move it instead of copying blindly).
+#[derive(Clone, Debug)]
+pub enum ClipDrag {
+    /// A render from the sample editor that is not assigned to a slot yet.
+    Editor { clip: Arc<SampleClip> },
+    /// A sample in a session matrix cell.
+    Session {
+        track: usize,
+        scene: usize,
+        clip: Arc<SampleClip>,
+    },
+    /// A clip on the arrangement timeline.
+    Arrangement { id: u64, clip: Arc<SampleClip> },
+}
+
+impl ClipDrag {
+    pub fn clip(&self) -> &Arc<SampleClip> {
+        match self {
+            Self::Editor { clip } | Self::Session { clip, .. } | Self::Arrangement { clip, .. } => {
+                clip
+            }
+        }
+    }
 }
 
 /// A sample assigned to one session slot, plus its slot-level settings.

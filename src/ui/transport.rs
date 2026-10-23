@@ -470,9 +470,9 @@ pub fn draw(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRunti
         Pos2::new(status_left + 12.0, rect.top() + 10.0),
         Align2::LEFT_TOP,
         if online {
-            "NEURAL LINK · STABLE"
+            "ENGINE LINK · STABLE"
         } else {
-            "NEURAL LINK · SILENT FALLBACK"
+            "ENGINE LINK · SILENT FALLBACK"
         },
         theme::mono(8.5),
         link_color,
@@ -511,13 +511,18 @@ pub fn draw(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRunti
         true,
     );
 
-    // Voice activity strip near the right edge.
+    // Track activity strip near the right edge.
     let strip = Rect::from_min_max(
         Pos2::new(rect.right() - 8.0, rect.top() + 12.0),
         Pos2::new(rect.right() - 5.0, rect.bottom() - 12.0),
     );
     painter.rect_filled(strip, CornerRadius::same(1), theme::BG_DEEP);
-    let lit = (state.voices as f32 / crate::audio::MAX_VOICES as f32).clamp(0.0, 1.0);
+    let lit = state
+        .peaks
+        .iter()
+        .copied()
+        .fold(0.0_f32, f32::max)
+        .clamp(0.0, 1.0);
     painter.rect_filled(
         Rect::from_min_max(
             Pos2::new(strip.left(), strip.bottom() - strip.height() * lit),

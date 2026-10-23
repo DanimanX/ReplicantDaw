@@ -3,6 +3,7 @@
 //! Normal launch opens the egui/wgpu interface. `--selftest` runs an offline
 //! DSP smoke test and `--devices` lists available output devices.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use replicant_daw::app::ReplicantApp;
@@ -109,7 +110,34 @@ fn selftest() -> Result<(), String> {
     println!("Replicant DAW {} · engine self-test", APP_VERSION);
     println!("- sample rate: 48000 Hz, stereo f32, 16-bar loop");
 
-    let mut engine = Engine::offline(48_000.0);
+    // A session sample drives the offline render now that the built-in synth
+    // is gone; this exercises the same sample path the UI uses.
+    let (mut sample_tx, sample_rx) = rtrb::RingBuffer::new(4);
+    let mut engine = Engine::new_with_io(
+        48_000.0,
+        audio::EngineIo {
+            samples: Some(sample_rx),
+            ..audio::EngineIo::default()
+        },
+    );
+    let tone_frames = 48_000 * 2;
+    let mut tone = Vec::with_capacity(tone_frames * 2);
+    for index in 0..tone_frames {
+        let value = (std::f32::consts::TAU * 440.0 * index as f32 / 48_000.0).sin() * 0.30;
+        tone.push(value);
+        tone.push(value);
+    }
+    sample_tx
+        .push(audio::SampleUpload {
+            track: 0,
+            scene: 0,
+            sample: Some(Arc::new(audio::SampleBuffer {
+                frames: tone,
+                sample_rate: 48_000,
+            })),
+        })
+        .map_err(|error| error.to_string())?;
+    engine.apply(Command::LaunchClip { track: 0, scene: 0 });
     engine.apply(Command::Play);
 
     let frames = 48_000 * 8;
@@ -140,7 +168,7 @@ fn selftest() -> Result<(), String> {
         8.0 / elapsed
     );
     println!(
-        "- peak {peak:.3} | rms {rms:.4} | voices {}",
+        "- peak {peak:.3} | rms {rms:.4} | active voices {}",
         engine.active_voices()
     );
     println!(
@@ -178,13 +206,6 @@ fn selftest() -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
     command_tx
-        .push(Command::SetSynthParam {
-            track: 0,
-            param: audio::SynthParam::FilterCutoff(0),
-            value: 2_500.0,
-        })
-        .map_err(|e| e.to_string())?;
-    command_tx
         .push(Command::SetTrackGain {
             track: 2,
             gain: 0.5,
@@ -204,7 +225,7 @@ fn selftest() -> Result<(), String> {
         return Err("rtrb telemetry/scope path did not deliver data".into());
     }
 
-    // Modular chain and editable synth through the command path.
+    // Modular chain through the command path.
     let mut chain = Engine::offline(48_000.0);
     chain.apply(Command::Play);
     let default_effects = chain.effect_count();
@@ -217,21 +238,13 @@ fn selftest() -> Result<(), String> {
         knob: 0,
         value: 0.7,
     });
-    chain.apply(Command::SetSynthParam {
-        track: 0,
-        param: audio::SynthParam::FilterCutoff(0),
-        value: 3_200.0,
-    });
     let mut chain_buffer = vec![0.0_f32; block * 2];
     for _ in 0..(9_600 / block) {
         chain.process(&mut chain_buffer);
     }
     println!(
-        "- chain: {default_effects} default modules -> {} after remove/add; cutoff {:.0} Hz",
-        chain.effect_count(),
-        chain
-            .synth_params(0)
-            .get(audio::SynthParam::FilterCutoff(0))
+        "- chain: {default_effects} default modules -> {} after remove/add",
+        chain.effect_count()
     );
     if chain.effect_count() != default_effects {
         return Err("effect chain bookkeeping is inconsistent".into());
@@ -246,7 +259,6 @@ fn selftest() -> Result<(), String> {
     ui_state.add_effect(audio::EffectKind::Delay);
     ui_state.add_effect(audio::EffectKind::Filter);
     ui_state.master_gain = 0.66;
-    ui_state.synth[0].set(audio::SynthParam::FilterCutoff(0), 4_250.0);
     ui_state.set_recorded(
         0,
         2,
@@ -268,26 +280,18 @@ fn selftest() -> Result<(), String> {
         && reloaded.tracks[0].name == "Selftest Lead"
         && reloaded.tracks[0].clips.len() == 1
         && reloaded.tracks[0].clips[0].scene == 2
-        && !reloaded.tracks[0].clips[0].enabled
-        && reloaded.tracks[0].synth.as_ref().is_some_and(|synth| {
-            (synth.to_patch().get(audio::SynthParam::FilterCutoff(0)) - 4_250.0).abs() < 1e-3
-        });
+        && !reloaded.tracks[0].clips[0].enabled;
     println!(
-        "- project: {} module(s), {} note(s), cutoff {:.0} Hz",
+        "- project: {} module(s), {} note(s)",
         reloaded.effects.len(),
         reloaded.tracks[0]
             .clips
             .iter()
             .map(|clip| clip.notes.len())
-            .sum::<usize>(),
-        reloaded.tracks[0]
-            .synth
-            .as_ref()
-            .map(|synth| synth.to_patch().get(audio::SynthParam::FilterCutoff(0)))
-            .unwrap_or(f32::NAN)
+            .sum::<usize>()
     );
     if !ok {
-        return Err("project round trip lost chain, synth or MIDI state".into());
+        return Err("project round trip lost chain or MIDI state".into());
     }
 
     // MIDI recording through the real lock-free path.

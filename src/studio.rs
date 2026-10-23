@@ -18,7 +18,9 @@ use crate::plugins::{
     PluginSlotInfo, MAX_PLUGIN_SLOTS,
 };
 use crate::project::{Project, ProjectPlugin};
-use crate::samples::{list_directory, DecodedSample, SampleClip, SampleEntry, SampleSlot};
+use crate::samples::{
+    list_directory, ClipDrag, DecodedSample, SampleClip, SampleEntry, SampleSlot,
+};
 use crate::state::UiState;
 
 pub const MAX_STATUS_CHARS: usize = 160;
@@ -67,8 +69,6 @@ pub struct Studio {
     pub slot_pending: [bool; MAX_PLUGIN_SLOTS],
     /// Routing last handed to the engine: `(active, is_instrument)`.
     pub plugin_sent: [(bool, bool); MAX_PLUGIN_SLOTS],
-    /// Source to fall back to when a plugin load never lands.
-    source_before_load: [Option<crate::state::InstrumentSource>; MAX_PLUGIN_SLOTS],
     pub selected_slot: usize,
 
     pub scan_results: Vec<PluginDescriptor>,
@@ -82,7 +82,6 @@ pub struct Studio {
     pub rack_open: bool,
     pub midi_open: bool,
     pub project_open: bool,
-    pub synth_open: bool,
     pub zoom: f32,
 
     /// Piano-roll editor. `piano_roll_scene` is informational: clips are
@@ -148,7 +147,6 @@ impl Studio {
             slots: std::array::from_fn(|_| None),
             slot_pending: [false; MAX_PLUGIN_SLOTS],
             plugin_sent: [(false, false); MAX_PLUGIN_SLOTS],
-            source_before_load: [None; MAX_PLUGIN_SLOTS],
             selected_slot: 0,
             scan_results: Vec::new(),
             scan_running: false,
@@ -160,7 +158,6 @@ impl Studio {
             rack_open: false,
             midi_open: false,
             project_open: false,
-            synth_open: false,
             zoom: 1.0,
             piano_roll_open: false,
             piano_roll_track: 0,
@@ -324,6 +321,154 @@ impl Studio {
             scene + 1,
             duration
         ));
+    }
+
+    /// Populate session audio slots for documentation screenshots.
+    pub fn seed_session_demo(&mut self, state: &mut UiState, audio: &mut AudioRuntime) {
+        let rate = audio.sample_rate;
+        self.assign_sample(
+            state,
+            audio,
+            1,
+            1,
+            SampleClip::from_tone("SAMPLE BED", 220.0, 2.4, rate),
+        );
+        self.assign_sample(
+            state,
+            audio,
+            3,
+            2,
+            SampleClip::from_tone("PERC LOOP", 660.0, 0.8, rate),
+        );
+        state.selected_track = 1;
+    }
+
+    /// Populate a few arrangement clips for documentation screenshots.
+    pub fn seed_arrangement_demo(&mut self, state: &mut UiState, audio: &mut AudioRuntime) {
+        let rate = audio.sample_rate;
+        for (track, name, hz, seconds, start) in [
+            (0usize, "NEON LOOP", 110.0_f32, 2.2_f32, 0u16),
+            (2, "VOID PULSE", 220.0, 1.6, 32),
+            (4, "BASS STEM", 55.0, 3.0, 64),
+            (6, "GLASS ARP", 440.0, 1.2, 16),
+        ] {
+            let clip = SampleClip::from_tone(name, hz, seconds, rate);
+            state.add_arrangement_clip(track, start, clip, true, -2.0);
+        }
+        self.sync_arrangement(state, audio);
+    }
+
+    /// Mirror the UI's arrangement clips into the audio engine.
+    pub fn sync_arrangement(&self, state: &UiState, audio: &mut AudioRuntime) {
+        let clips = state
+            .arrangement
+            .iter()
+            .map(|clip| crate::audio::ArrangementClip {
+                track: clip.track as u8,
+                start_step: clip.start_step,
+                length_steps: clip.length_steps,
+                sample: Arc::clone(&clip.clip.buffer),
+                loop_enabled: clip.loop_enabled,
+                gain: db_to_gain(clip.gain_db),
+            })
+            .collect();
+        let _ = audio.command_tx.push(Command::SetArrangement { clips });
+    }
+
+    /// Decode an audio file and place it on an arrangement lane.
+    pub fn import_arrangement_file(
+        &mut self,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+        path: &std::path::Path,
+        track: usize,
+        start_step: u16,
+    ) {
+        match DecodedSample::load(path) {
+            Ok(mut sample) => {
+                let clip = sample.to_clip(audio.sample_rate);
+                let name = clip.name.clone();
+                let length = clip.duration_secs();
+                state.add_arrangement_clip(track, start_step, clip, true, 0.0);
+                self.sync_arrangement(state, audio);
+                self.notify(format!(
+                    "{} → arrangement · track {:02} · {:.2} s",
+                    name,
+                    track + 1,
+                    length
+                ));
+            }
+            Err(error) => self.log_error(error),
+        }
+    }
+
+    /// Handle a clip dropped on an arrangement lane.
+    pub fn drop_clip_on_arrangement(
+        &mut self,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+        drag: ClipDrag,
+        track: usize,
+        start_step: u16,
+    ) {
+        match drag {
+            ClipDrag::Editor { clip } => {
+                state.add_arrangement_clip(track, start_step, clip, true, 0.0);
+            }
+            ClipDrag::Session {
+                track: source_track,
+                scene,
+                clip,
+            } => {
+                // Moving a clip to the arrangement takes it out of the matrix,
+                // so the same sample cannot sound from both views.
+                let (loop_enabled, gain_db) = state
+                    .sample_slot(source_track, scene)
+                    .map(|slot| (slot.loop_enabled, slot.gain_db))
+                    .unwrap_or((true, 0.0));
+                self.clear_sample(state, audio, source_track, scene);
+                if state.launched[source_track] == Some(scene as u8) {
+                    state.launched[source_track] = None;
+                    let _ = audio.command_tx.push(Command::StopClip {
+                        track: source_track as u8,
+                    });
+                }
+                state.add_arrangement_clip(track, start_step, clip, loop_enabled, gain_db);
+            }
+            ClipDrag::Arrangement { id, .. } => {
+                state.move_arrangement_clip(id, track, start_step);
+            }
+        }
+        self.sync_arrangement(state, audio);
+    }
+
+    /// Move an arrangement clip into a session cell.
+    pub fn move_arrangement_to_session(
+        &mut self,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+        id: u64,
+        track: usize,
+        scene: usize,
+    ) {
+        let Some(clip) = state.remove_arrangement_clip(id) else {
+            return;
+        };
+        self.sync_arrangement(state, audio);
+        self.assign_sample(state, audio, track, scene, clip.clip);
+    }
+
+    /// Delete one arrangement clip.
+    pub fn remove_arrangement_clip(
+        &mut self,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+        id: u64,
+    ) {
+        if state.remove_arrangement_clip(id).is_some() {
+            self.sync_arrangement(state, audio);
+            self.notify("Arrangement clip removed");
+        }
     }
 
     /// Remove a sample from a clip slot and stop that slot's playback.
@@ -521,26 +666,6 @@ impl Studio {
         }
     }
 
-    /// Choose the internal synth as the instrument source for `track`.
-    ///
-    /// The slot holds one instrument, so picking the synth unloads whatever
-    /// plugin occupied it. Without this the plugin would keep sounding (or keep
-    /// processing the bus) under a synth the user believes is alone.
-    pub fn select_synth(&mut self, state: &mut UiState, track: usize, audio: &mut AudioRuntime) {
-        if track >= TRACK_COUNT {
-            return;
-        }
-        if self.slots[track].is_some() || self.slot_pending[track] {
-            self.unload_plugin(track, audio);
-        }
-        self.slots[track] = None;
-        self.slot_pending[track] = false;
-        state.instrument[track] = crate::state::InstrumentSource::Synth;
-        // `sync_instrument_sources` sends the commands; mirroring the flags
-        // here would silently skip them.
-        self.plugin_sent[track] = (false, false);
-    }
-
     pub fn start_scan(&mut self) {
         if self.scan_running {
             return;
@@ -572,10 +697,7 @@ impl Studio {
         self.slot_pending[slot] = true;
         self.selected_slot = slot;
         // Loading into the instrument slot makes the plugin this track's sound
-        // source at once, so the internal synth stops before the instance is
-        // ready and the panel already shows what is coming.
-        self.source_before_load[slot] = Some(state.instrument[slot])
-            .filter(|source| *source != crate::state::InstrumentSource::Plugin);
+        // source at once, so the panel already shows what is coming.
         state.instrument[slot] = crate::state::InstrumentSource::Plugin;
         self.plugins.send(PluginCommand::Load {
             slot: slot as u8,
@@ -604,7 +726,6 @@ impl Studio {
         self.slots[slot] = None;
         self.slot_pending[slot] = false;
         // Nothing to fall back to: the slot really is empty now.
-        self.source_before_load[slot] = None;
         self.plugin_sent[slot] = (false, false);
     }
 
@@ -779,8 +900,10 @@ impl Studio {
             gain: project.master_gain,
         });
 
-        // Drop samples from the previous project before loading this one.
+        // Drop samples and arrangement clips from the previous project.
         state.clear_samples();
+        state.clear_arrangement();
+        self.sync_arrangement(state, audio);
         for track in 0..TRACK_COUNT {
             for scene in 0..crate::audio::SCENE_COUNT {
                 let _ = audio.sample_tx.push(crate::audio::SampleUpload {
@@ -907,18 +1030,32 @@ impl Studio {
                 }
             }
 
-            let patch = track
-                .synth
-                .as_ref()
-                .map(|synth| synth.to_patch())
-                .unwrap_or_else(|| crate::audio::SynthXt::from_track(index));
-            state.synth[index] = patch;
-            for param in crate::audio::SynthParam::all() {
-                let _ = audio.command_tx.push(Command::SetSynthParam {
-                    track: index as u8,
-                    param,
-                    value: patch.get(param),
-                });
+            // Restore arrangement audio after the session slots, so a clip
+            // that was saved on the timeline keeps its own sample data.
+            for entry in &track.arrangement {
+                match DecodedSample::load(&entry.path) {
+                    Ok(mut sample) => {
+                        sample.edits = entry.edits();
+                        let clip = sample.to_clip(audio.sample_rate);
+                        let length = if entry.length_steps == 0 {
+                            state.steps_for_duration(clip.duration_secs(), entry.start_step)
+                        } else {
+                            entry.length_steps
+                        };
+                        state.add_arrangement_clip_with_length(
+                            index,
+                            entry.start_step,
+                            length,
+                            clip,
+                            entry.loop_enabled,
+                            entry.slot_gain_db,
+                        );
+                    }
+                    Err(error) => self.log_error(format!(
+                        "Could not restore arrangement clip '{}': {error}",
+                        entry.path.display()
+                    )),
+                }
             }
 
             state.instrument[index] = crate::state::InstrumentSource::from_id(&track.instrument);
@@ -965,6 +1102,8 @@ impl Studio {
                 });
             }
         }
+
+        self.sync_arrangement(state, audio);
 
         self.project_name = project.name;
         self.project_path = Some(path.to_path_buf());
@@ -1027,14 +1166,11 @@ impl Studio {
         self.selected_slot = track.min(TRACK_COUNT - 1);
     }
 
-    /// Keep each track's internal synth mute in line with its instrument slot.
-    ///
     /// Keep each track's instrument source and engine routing in agreement.
     ///
-    /// A track has exactly one sound source. The plugin insert is routed when
-    /// it is the selected source, or when it is an effect (it then processes
-    /// the bus the internal synth feeds). An instrument insert and the internal
-    /// synth are never both audible: the engine enforces the same rule.
+    /// A track has one external instrument slot. A loaded generator owns the
+    /// track; a loaded effect is a track insert. There is no built-in synth to
+    /// fall back to, so an empty slot is silent until a plugin is loaded.
     ///
     /// Runs every frame, so a plugin loaded on a track that is not currently
     /// selected still takes over that track's sound source.
@@ -1046,32 +1182,15 @@ impl Studio {
             let is_instrument = slot.is_some_and(|slot| slot.is_instrument);
 
             // The slot decides the source: a generator owns the track, an
-            // effect is a track insert the synth plays through. Correcting the
-            // state here keeps every UI path honest, even one that forgot.
+            // effect is a track insert. Correcting the state here keeps every
+            // UI path honest, even one that forgot.
             state.instrument[track] =
                 source_for_slot(state.instrument[track], loaded, is_instrument);
 
             // A load that never produced a slot (bad path, unsupported format)
             // must not leave the track pointing at a plugin that is not there.
-            if !loaded
-                && !self.slot_pending[track]
-                && state.instrument[track] == InstrumentSource::Plugin
-            {
-                state.instrument[track] = self.source_before_load[track]
-                    .take()
-                    .unwrap_or(InstrumentSource::Empty);
-            }
-            if loaded {
-                self.source_before_load[track] = None;
-            }
-
-            let want_synth = state.instrument[track] == InstrumentSource::Synth;
-            if state.synth_sent[track] != want_synth {
-                state.synth_sent[track] = want_synth;
-                let _ = audio.command_tx.push(Command::SetTrackSynth {
-                    track: track as u8,
-                    enabled: want_synth,
-                });
+            if !loaded && !self.slot_pending[track] {
+                state.instrument[track] = InstrumentSource::Empty;
             }
 
             let want = plugin_routing(state.instrument[track], loaded, is_instrument);
@@ -1112,33 +1231,25 @@ impl PluginDescriptor {
 
 /// What the instrument source must be, given what the slot holds.
 ///
-/// A loaded generator always owns the track; a loaded effect is only an
-/// insert, so the internal synth stays the source; an empty slot keeps
-/// whatever the user chose.
+/// A loaded generator owns the track. A loaded effect is only an insert, and
+/// an empty slot has no source at all: this build has no built-in synth.
 pub fn source_for_slot(
-    current: crate::state::InstrumentSource,
+    _current: crate::state::InstrumentSource,
     loaded: bool,
     instrument: bool,
 ) -> crate::state::InstrumentSource {
     use crate::state::InstrumentSource;
-    match (loaded, instrument) {
-        (false, _) => current,
-        (true, true) => InstrumentSource::Plugin,
-        (true, false) => {
-            if current == InstrumentSource::Plugin {
-                InstrumentSource::Synth
-            } else {
-                current
-            }
-        }
+    if loaded && instrument {
+        InstrumentSource::Plugin
+    } else {
+        InstrumentSource::Empty
     }
 }
 
 /// Routing the engine should hold for a track's plugin insert.
 ///
-/// Returns `(active, instrument)`. An effect insert always processes the bus
-/// the internal synth feeds; an instrument insert is routed only while it is
-/// the track's selected source, so the two can never sound together.
+/// Returns `(active, instrument)`. An effect insert always processes the track
+/// bus; an instrument insert is routed only while it is the track's source.
 pub fn plugin_routing(
     source: crate::state::InstrumentSource,
     loaded: bool,
@@ -1154,8 +1265,7 @@ pub fn source_after_unload(
 ) -> crate::state::InstrumentSource {
     use crate::state::InstrumentSource;
     match current {
-        InstrumentSource::Plugin => InstrumentSource::Empty,
-        other => other,
+        InstrumentSource::Plugin | InstrumentSource::Empty => InstrumentSource::Empty,
     }
 }
 
@@ -1218,6 +1328,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_clip_moves_between_the_session_and_the_arrangement() {
+        let midi = MidiRuntime::new();
+        let (plugins, _plugin_in, _plugin_out) = PluginRuntime::start(48_000.0);
+        let mut studio = Studio::new(midi, plugins);
+        let mut audio = AudioRuntime::start_silent(Some("test".into()));
+        let mut state = UiState::new();
+
+        let clip = SampleClip::from_tone("MOVE ME", 220.0, 0.5, 48_000);
+        studio.assign_sample(&mut state, &mut audio, 1, 1, clip);
+        let clip = state.sample_clip(1, 1).cloned().expect("session sample");
+
+        studio.drop_clip_on_arrangement(
+            &mut state,
+            &mut audio,
+            ClipDrag::Session {
+                track: 1,
+                scene: 1,
+                clip,
+            },
+            3,
+            32,
+        );
+        assert!(
+            state.sample_clip(1, 1).is_none(),
+            "the session copy must be gone after moving to the timeline"
+        );
+        let placed = state
+            .arrangement
+            .iter()
+            .find(|entry| entry.track == 3)
+            .cloned()
+            .expect("arrangement clip");
+        assert_eq!(placed.start_step, 32);
+
+        studio.move_arrangement_to_session(&mut state, &mut audio, placed.id, 2, 4);
+        assert!(state.arrangement.is_empty());
+        assert!(
+            state.sample_clip(2, 4).is_some(),
+            "the clip must land in the session cell"
+        );
+    }
+
+    #[test]
     fn clip_conversion_preserves_notes() {
         let notes = vec![
             RecordedNote {
@@ -1242,10 +1395,6 @@ mod tests {
     fn instrument_slot_decides_the_sound_source() {
         use crate::state::InstrumentSource;
 
-        assert!(InstrumentSource::Synth.synth_audible());
-        assert!(!InstrumentSource::Empty.synth_audible());
-        assert!(!InstrumentSource::Plugin.synth_audible());
-
         // A new track starts empty: the chain shows ADD PLUGIN / INSTRUMENT.
         assert_eq!(InstrumentSource::default(), InstrumentSource::Empty);
 
@@ -1255,8 +1404,8 @@ mod tests {
             InstrumentSource::Empty
         );
         assert_eq!(
-            source_after_unload(InstrumentSource::Synth),
-            InstrumentSource::Synth
+            source_after_unload(InstrumentSource::Empty),
+            InstrumentSource::Empty
         );
     }
 
@@ -1264,40 +1413,23 @@ mod tests {
     fn the_slot_contents_decide_the_source() {
         use crate::state::InstrumentSource;
 
-        // An empty slot keeps the user's choice.
-        assert_eq!(
-            source_for_slot(InstrumentSource::Synth, false, false),
-            InstrumentSource::Synth
-        );
+        // Only a loaded generator owns the track. There is no built-in synth
+        // to fall back to when the slot is empty or holds an effect.
         assert_eq!(
             source_for_slot(InstrumentSource::Empty, false, false),
             InstrumentSource::Empty
-        );
-
-        // A loaded generator always owns the track. This is what stops the
-        // synth from sounding under a plugin that was mislabelled or set by a
-        // stale UI path.
-        assert_eq!(
-            source_for_slot(InstrumentSource::Synth, true, true),
-            InstrumentSource::Plugin
         );
         assert_eq!(
             source_for_slot(InstrumentSource::Empty, true, true),
             InstrumentSource::Plugin
         );
-
-        // A loaded effect is a track insert: the synth stays the source.
         assert_eq!(
             source_for_slot(InstrumentSource::Plugin, true, false),
-            InstrumentSource::Synth
-        );
-        assert_eq!(
-            source_for_slot(InstrumentSource::Empty, true, false),
             InstrumentSource::Empty
         );
         assert_eq!(
-            source_for_slot(InstrumentSource::Synth, true, false),
-            InstrumentSource::Synth
+            source_for_slot(InstrumentSource::Plugin, false, true),
+            InstrumentSource::Empty
         );
     }
 
@@ -1321,18 +1453,13 @@ mod tests {
             (true, true)
         );
         assert_eq!(
-            plugin_routing(InstrumentSource::Synth, true, true),
-            (false, false),
-            "an instrument plugin must not be routed under the internal synth"
-        );
-        assert_eq!(
             plugin_routing(InstrumentSource::Empty, true, true),
             (false, false)
         );
 
-        // An effect insert keeps processing the track bus either way.
+        // An effect insert processes the track bus.
         assert_eq!(
-            plugin_routing(InstrumentSource::Synth, true, false),
+            plugin_routing(InstrumentSource::Empty, true, false),
             (true, false)
         );
         assert_eq!(

@@ -17,47 +17,21 @@
 //!   audible, because that was the only source back then.
 //! - v7: audio samples assigned to session slots, with their edit settings.
 //!   v6 files load with no samples.
-//! - v8: the FM voice is replaced by the NEURAL GEN XT hybrid synth. The
-//!   patch is stored as (parameter id, value) pairs, so unknown parameters in
-//!   newer files are ignored instead of breaking the load. Older files load
-//!   with the default patch for each track.
+//! - v8: the built-in hybrid synth patch, stored as parameter pairs.
+//! - v9: the built-in synth is gone. Tracks host external CLAP/VST3 plugins
+//!   only; an old `synth` instrument id loads as an empty slot, while its
+//!   stored patch is ignored. Arrangement audio clips are part of the format.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::audio::messages::{EffectKind, RecordedNote, TRACK_COUNT};
-use crate::audio::{SynthXt, TRACKS};
+use crate::audio::TRACKS;
 use crate::samples::SampleEdits;
 
 pub const PROJECT_EXTENSION: &str = "rproj";
-pub const PROJECT_FORMAT_VERSION: u32 = 8;
-
-/// A NEURAL GEN XT patch: parameter id/value pairs so the format survives
-/// new parameters without a migration.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct ProjectSynthXt {
-    #[serde(default)]
-    pub params: Vec<(String, f32)>,
-}
-
-impl ProjectSynthXt {
-    pub fn from_patch(patch: &SynthXt) -> Self {
-        Self {
-            params: patch.to_saved(),
-        }
-    }
-
-    pub fn to_patch(&self) -> SynthXt {
-        let mut patch = SynthXt::default();
-        patch.apply_saved(&self.params);
-        patch
-    }
-
-    pub fn default_for_track(index: usize) -> Self {
-        Self::from_patch(&SynthXt::from_track(index))
-    }
-}
+pub const PROJECT_FORMAT_VERSION: u32 = 9;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectEffect {
@@ -141,6 +115,49 @@ impl ProjectSample {
     }
 }
 
+/// One audio clip placed on the arrangement timeline.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectArrangementClip {
+    /// Timeline position in 16th notes.
+    pub start_step: u16,
+    #[serde(default)]
+    pub length_steps: u16,
+    pub path: PathBuf,
+    #[serde(default)]
+    pub gain_db: f32,
+    #[serde(default)]
+    pub trim_start: f32,
+    #[serde(default)]
+    pub trim_end: f32,
+    #[serde(default)]
+    pub fade_in: f32,
+    #[serde(default)]
+    pub fade_out: f32,
+    #[serde(default)]
+    pub reverse: bool,
+    #[serde(default)]
+    pub normalize: bool,
+    #[serde(default = "default_true")]
+    pub loop_enabled: bool,
+    /// Per-clip trim in dB.
+    #[serde(default)]
+    pub slot_gain_db: f32,
+}
+
+impl ProjectArrangementClip {
+    pub fn edits(&self) -> SampleEdits {
+        SampleEdits {
+            trim_start: self.trim_start,
+            trim_end: self.trim_end,
+            gain_db: self.gain_db,
+            fade_in: self.fade_in,
+            fade_out: self.fade_out,
+            reverse: self.reverse,
+            normalize: self.normalize,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectTrack {
     pub name: String,
@@ -159,6 +176,9 @@ pub struct ProjectTrack {
     /// Audio samples assigned to slots.
     #[serde(default)]
     pub samples: Vec<ProjectSample>,
+    /// Audio clips placed on the arrangement timeline.
+    #[serde(default)]
+    pub arrangement: Vec<ProjectArrangementClip>,
     /// Legacy (v3) single clip. Migrated into `clips` on load.
     #[serde(default)]
     pub notes: Vec<RecordedNote>,
@@ -172,9 +192,8 @@ pub struct ProjectTrack {
     pub fade_in: f32,
     #[serde(default)]
     pub fade_out: f32,
-    #[serde(default)]
-    pub synth: Option<ProjectSynthXt>,
-    /// Instrument slot source: `empty`, `synth` or `plugin`.
+    /// Instrument slot source: `empty` or `plugin`. Legacy `synth` files load
+    /// with an empty slot.
     #[serde(default)]
     pub instrument: String,
     /// Legacy (v4) instrument choice. Migrated into `instrument` on load.
@@ -267,13 +286,13 @@ impl Default for Project {
                 scene: Some(crate::audio::DEFAULT_SCENES[index] as u8),
                 clips: Vec::new(),
                 samples: Vec::new(),
+                arrangement: Vec::new(),
                 notes: Vec::new(),
                 clip_enabled: true,
                 clip_gain_db: 0.0,
                 fade_in: 0.0,
                 fade_out: 0.0,
-                synth: Some(ProjectSynthXt::default_for_track(index)),
-                instrument: "synth".to_string(),
+                instrument: "empty".to_string(),
                 instrument_plugin: None,
             })
             .collect();
@@ -378,19 +397,18 @@ impl Project {
             for track in project.tracks.iter_mut() {
                 track.instrument = match track.instrument_plugin {
                     Some(true) => "plugin".to_string(),
-                    Some(false) | None => "synth".to_string(),
+                    Some(false) | None => "empty".to_string(),
                 };
                 track.instrument_plugin = None;
             }
         }
 
-        // A track without an instrument id predates the slot (the bundled demo
-        // still is one): back then the internal synth was always audible, so
-        // that is what those files must keep doing. An explicit `empty` stays
-        // empty.
+        // A track without an instrument id predates the slot. The internal
+        // synth it may have used no longer exists, so those tracks load empty
+        // and wait for an external plugin.
         for track in project.tracks.iter_mut() {
             if track.instrument.trim().is_empty() {
-                track.instrument = "synth".to_string();
+                track.instrument = "empty".to_string();
             }
         }
 
@@ -399,11 +417,6 @@ impl Project {
             if let Some(legacy) = project.legacy_fx.take() {
                 project.effects = legacy_chain(&legacy);
                 project.master_gain = if legacy.gain > 0.0 { legacy.gain } else { 0.90 };
-            }
-            for (index, track) in project.tracks.iter_mut().enumerate() {
-                if track.synth.is_none() {
-                    track.synth = Some(ProjectSynthXt::default_for_track(index));
-                }
             }
         }
 
@@ -485,12 +498,30 @@ impl Project {
                         })
                     })
                     .collect(),
+                arrangement: state
+                    .arrangement
+                    .iter()
+                    .filter(|clip| clip.track == index)
+                    .map(|clip| ProjectArrangementClip {
+                        start_step: clip.start_step,
+                        length_steps: clip.length_steps,
+                        path: clip.clip.path.clone(),
+                        gain_db: clip.clip.edits.gain_db,
+                        trim_start: clip.clip.edits.trim_start,
+                        trim_end: clip.clip.edits.trim_end,
+                        fade_in: clip.clip.edits.fade_in,
+                        fade_out: clip.clip.edits.fade_out,
+                        reverse: clip.clip.edits.reverse,
+                        normalize: clip.clip.edits.normalize,
+                        loop_enabled: clip.loop_enabled,
+                        slot_gain_db: clip.gain_db,
+                    })
+                    .collect(),
                 notes: Vec::new(),
                 clip_enabled: true,
                 clip_gain_db: state.clip_gain_db[index],
                 fade_in: state.clip_fade_in[index],
                 fade_out: state.clip_fade_out[index],
-                synth: Some(ProjectSynthXt::from_patch(&state.synth_params(index))),
                 instrument: state.instrument[index].id().to_string(),
                 instrument_plugin: None,
             })
@@ -554,7 +585,6 @@ fn legacy_chain(fx: &ProjectFx) -> Vec<ProjectEffect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::SynthParam;
 
     #[test]
     fn default_project_has_all_tracks_and_a_chain() {
@@ -563,7 +593,6 @@ mod tests {
         assert_eq!(project.format_version, PROJECT_FORMAT_VERSION);
         assert!(project.tracks.iter().all(|track| track.scene.is_some()));
         assert_eq!(project.effects.len(), 4);
-        assert!(project.tracks.iter().all(|track| track.synth.is_some()));
         assert!(project.tracks.iter().all(|track| track.clip_gain_db == 0.0));
         assert!(project.tracks.iter().all(|track| track.fade_in == 0.0));
     }
@@ -606,10 +635,20 @@ mod tests {
             loop_enabled: false,
             slot_gain_db: -1.5,
         });
-        let mut patch = SynthXt::default();
-        patch.set(SynthParam::FilterCutoff(0), 2_500.0);
-        patch.set(SynthParam::OscUnison(0), 4.0);
-        project.tracks[1].synth = Some(ProjectSynthXt::from_patch(&patch));
+        project.tracks[1].arrangement.push(ProjectArrangementClip {
+            start_step: 48,
+            length_steps: 24,
+            path: PathBuf::from("/samples/loop.wav"),
+            gain_db: -1.0,
+            trim_start: 0.0,
+            trim_end: 0.0,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            reverse: false,
+            normalize: false,
+            loop_enabled: true,
+            slot_gain_db: -2.0,
+        });
         project.effects.push(ProjectEffect::new(EffectKind::Delay));
         project.master_gain = 0.75;
         project.plugins.push(ProjectPlugin {
@@ -649,12 +688,17 @@ mod tests {
         assert!(loaded.tracks[1].samples[0].normalize);
         assert!(!loaded.tracks[1].samples[0].loop_enabled);
         assert!((loaded.tracks[1].samples[0].slot_gain_db + 1.5).abs() < 1e-6);
+        assert_eq!(loaded.tracks[1].arrangement.len(), 1);
+        assert_eq!(loaded.tracks[1].arrangement[0].start_step, 48);
+        assert_eq!(loaded.tracks[1].arrangement[0].length_steps, 24);
+        assert_eq!(
+            loaded.tracks[1].arrangement[0].path,
+            PathBuf::from("/samples/loop.wav")
+        );
+        assert!((loaded.tracks[1].arrangement[0].slot_gain_db + 2.0).abs() < 1e-6);
         assert_eq!(loaded.effects.len(), 5);
         assert_eq!(loaded.effects[4].kind, "DELAY");
         assert!((loaded.master_gain - 0.75).abs() < 1e-6);
-        let synth = loaded.tracks[1].synth.as_ref().unwrap().to_patch();
-        assert!((synth.get(SynthParam::FilterCutoff(0)) - 2_500.0).abs() < 1e-3);
-        assert!((synth.get(SynthParam::OscUnison(0)) - 4.0).abs() < 1e-6);
         assert_eq!(loaded.plugins[0].format, "CLAP");
     }
 
@@ -698,10 +742,11 @@ mod tests {
         }"#;
         let project = Project::from_json(json).expect("parse v4 project");
         assert_eq!(project.format_version, PROJECT_FORMAT_VERSION);
-        assert_eq!(project.tracks[0].instrument, "synth");
+        assert_eq!(project.tracks[0].instrument, "empty");
         assert_eq!(project.tracks[1].instrument, "plugin");
-        // A v4 file without the flag played the internal synth.
-        assert_eq!(project.tracks[2].instrument, "synth");
+        // A v4 file without the flag pointed at the internal synth, which this
+        // build no longer has.
+        assert_eq!(project.tracks[2].instrument, "empty");
         assert!(project
             .tracks
             .iter()
@@ -756,27 +801,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v1_tracks_get_their_original_synth_defaults() {
-        let json = r#"{
-            "format_version": 1,
-            "name": "Old",
-            "bpm": 120.0,
-            "tracks": [
-                { "name": "SYNAPSE 01", "gain_db": -7.0, "pan": 0.0 },
-                { "name": "NEURAL BASS", "gain_db": -5.0, "pan": 0.0 }
-            ]
-        }"#;
-        let project = Project::from_json(json).expect("parse v1 project");
-        // v8 replaced the FM voice: old files get the XT default patch.
-        let first = project.tracks[0].synth.as_ref().unwrap().to_patch();
-        let expected = SynthXt::from_track(0);
-        assert_eq!(first, expected);
-    }
-
-    #[test]
-    fn a_track_without_an_instrument_id_keeps_its_synth() {
-        // The bundled demo is a v6 file with no `instrument` key: the synth was
-        // the only source back then, so it must stay audible.
+    fn a_legacy_synth_track_loads_empty() {
+        // The bundled demo is a v6 file with no `instrument` key. The internal
+        // synth it used is gone, so it must load as an empty plugin slot.
         let json = r#"{
             "format_version": 6,
             "app_version": "1.2.0",
@@ -793,8 +820,7 @@ mod tests {
             ]
         }"#;
         let project = Project::from_json(json).expect("parse");
-        assert_eq!(project.tracks[0].instrument, "synth");
-        // An explicit choice is respected.
+        assert_eq!(project.tracks[0].instrument, "empty");
         assert_eq!(project.tracks[1].instrument, "empty");
     }
 

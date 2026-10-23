@@ -2,8 +2,9 @@
 
 use egui::{Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Sense, Shape, Stroke, Ui, Vec2};
 
-use crate::audio::{TRACKS, TRACK_COUNT};
+use crate::audio::{AudioRuntime, LOOP_STEPS, TRACKS, TRACK_COUNT};
 use crate::dsp::spectrum::{BINS, HISTORY};
+use crate::samples::ClipDrag;
 use crate::state::UiState;
 use crate::studio::Studio;
 use crate::theme;
@@ -11,11 +12,17 @@ use crate::ui::widgets::{mini_roll, MiniRollView};
 
 pub const TIMELINE_BARS: usize = 16;
 
-pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Studio) {
+pub fn draw_lanes(
+    ui: &mut Ui,
+    rect: Rect,
+    state: &mut UiState,
+    studio: &mut Studio,
+    audio: &mut AudioRuntime,
+) {
     let content = theme::paint_panel(
         ui.painter(),
         rect,
-        "ARRANGEMENT // NEURAL TRACKS",
+        "ARRANGEMENT // TRACKS",
         "TIMELINE · 16 BARS",
         theme::CYAN,
     );
@@ -105,6 +112,18 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
             ui.scope_id().with(("arr_lane", track)),
             Sense::click(),
         );
+
+        // Dropping places the clip on a beat boundary under the pointer.
+        let pointer = lane_hit
+            .hover_pos()
+            .or_else(|| ui.ctx().pointer_interact_pos());
+        let drop_step = pointer
+            .map(|pos| {
+                let raw = ((pos.x - lane.left()) / lane.width().max(1.0)).clamp(0.0, 1.0)
+                    * LOOP_STEPS as f32;
+                ((raw / 4.0).round() * 4.0).clamp(0.0, (LOOP_STEPS - 1) as f32) as u16
+            })
+            .unwrap_or(0);
 
         if state.selected_track == track {
             ui.painter()
@@ -368,6 +387,161 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
             );
         }
 
+        // Arrangement audio clips, placed at their timeline position.
+        let arrangement: Vec<_> = state
+            .arrangement
+            .iter()
+            .filter(|clip| clip.track == track)
+            .cloned()
+            .collect();
+        let mut remove_arrangement = None;
+        let mut edit_arrangement = None;
+        for clip in &arrangement {
+            let steps_total = LOOP_STEPS as f32;
+            let x0 = lane.left() + clip.start_step as f32 / steps_total * lane.width();
+            let x1 = lane.left()
+                + (clip.start_step + clip.length_steps).min(LOOP_STEPS as u16) as f32 / steps_total
+                    * lane.width();
+            let block = Rect::from_min_max(
+                Pos2::new(x0 + 1.0, lane.top() + 1.5),
+                Pos2::new(x1.max(x0 + 12.0) - 1.0, lane.bottom() - 1.5),
+            );
+            let block_hit = ui.interact(
+                block,
+                ui.scope_id().with(("arr_clip", clip.id)),
+                Sense::click_and_drag(),
+            );
+            if block_hit.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+            }
+            block_hit.dnd_set_drag_payload(ClipDrag::Arrangement {
+                id: clip.id,
+                clip: std::sync::Arc::clone(&clip.clip),
+            });
+
+            let muted = state.mute[track] || (state.any_solo() && !state.solo[track]);
+            let fill = if muted {
+                theme::accent_alpha(theme::BORDER, 40)
+            } else {
+                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 24)
+            };
+            ui.painter().rect_filled(block, CornerRadius::same(2), fill);
+            ui.painter().rect_stroke(
+                block,
+                CornerRadius::same(2),
+                Stroke::new(
+                    if block_hit.hovered() { 1.6 } else { 1.0 },
+                    if muted {
+                        theme::BORDER
+                    } else {
+                        theme::accent_alpha(accent, 180)
+                    },
+                ),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().rect_filled(
+                Rect::from_min_size(block.min, Vec2::new(2.0, block.height())),
+                CornerRadius::same(1),
+                if muted { theme::BORDER } else { accent },
+            );
+
+            let header = Rect::from_min_max(
+                Pos2::new(block.left() + 5.0, block.top() + 1.0),
+                Pos2::new(block.right() - 4.0, block.top() + 11.0),
+            );
+            let label = format!("AUDIO · {}", clip.clip.name);
+            let label_painter = ui.painter().with_clip_rect(header);
+            let label_font =
+                theme::fitted_font(&label_painter, &label, theme::display(6.0), header.width());
+            label_painter.text(
+                Pos2::new(header.left(), header.center().y),
+                Align2::LEFT_CENTER,
+                &label,
+                label_font,
+                if muted {
+                    theme::TEXT_DIM
+                } else {
+                    theme::accent_alpha(accent, 230)
+                },
+            );
+
+            let wave = Rect::from_min_max(
+                Pos2::new(block.left() + 4.0, block.top() + 11.0),
+                Pos2::new(block.right() - 4.0, block.bottom() - 2.0),
+            );
+            if wave.width() > 4.0 && wave.height() > 3.0 {
+                draw_peaks(
+                    ui.painter(),
+                    wave,
+                    &clip.clip.peaks,
+                    if muted {
+                        theme::BORDER
+                    } else {
+                        theme::accent_alpha(accent, 170)
+                    },
+                );
+            }
+
+            if block_hit.double_clicked() {
+                edit_arrangement = Some(clip.clip.clone());
+            }
+            block_hit.context_menu(|ui| {
+                if ui.button("OPEN AUDIO EDITOR").clicked() {
+                    edit_arrangement = Some(clip.clip.clone());
+                    ui.close();
+                }
+                if ui.button("REMOVE FROM ARRANGEMENT").clicked() {
+                    remove_arrangement = Some(clip.id);
+                    ui.close();
+                }
+            });
+            block_hit
+                .on_hover_text("Arrangement audio · drag to a session cell · double-click to edit");
+        }
+        if let Some(clip) = edit_arrangement {
+            studio.open_sample_editor_clip(&clip);
+        }
+        if let Some(id) = remove_arrangement {
+            studio.remove_arrangement_clip(state, audio, id);
+        }
+
+        // Ghost of the clip being dragged, and the highlight for OS file drops.
+        let drag_payload = lane_hit.dnd_hover_payload::<ClipDrag>();
+        let files_hovered = ui.ctx().input(|input| !input.raw.hovered_files.is_empty());
+        if drag_payload.is_some() || (files_hovered && lane_hit.contains_pointer()) {
+            let length = drag_payload
+                .as_ref()
+                .map(|drag| state.steps_for_duration(drag.clip().duration_secs(), drop_step))
+                .unwrap_or(16);
+            let x0 = lane.left() + drop_step as f32 / LOOP_STEPS as f32 * lane.width();
+            let x1 = lane.left()
+                + (drop_step.saturating_add(length)).min(LOOP_STEPS as u16) as f32
+                    / LOOP_STEPS as f32
+                    * lane.width();
+            let ghost = Rect::from_min_max(
+                Pos2::new(x0 + 1.0, lane.top() + 2.0),
+                Pos2::new(x1.max(x0 + 18.0) - 1.0, lane.bottom() - 2.0),
+            );
+            ui.painter().rect_filled(
+                ghost,
+                CornerRadius::same(2),
+                theme::accent_alpha(theme::MAGENTA, 20),
+            );
+            ui.painter().rect_stroke(
+                ghost,
+                CornerRadius::same(2),
+                Stroke::new(1.2, theme::accent_alpha(theme::MAGENTA, 180)),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter().text(
+                ghost.center(),
+                Align2::CENTER_CENTER,
+                "DROP AUDIO",
+                theme::mono(6.5),
+                theme::MAGENTA,
+            );
+        }
+
         // Audio clip blocks, one per four bars (generative slots only).
         let block_bars = 4usize;
         let blocks = if launched.is_some() && notes.is_empty() && sample.is_none() {
@@ -467,11 +641,34 @@ pub fn draw_lanes(ui: &mut Ui, rect: Rect, state: &mut UiState, studio: &mut Stu
             }
         }
         if lane_hit.hovered() {
-            lane_hit.on_hover_text(format!(
-                "{} · double-click to edit the {} clip",
+            lane_hit.clone().on_hover_text(format!(
+                "{} · drop audio here · double-click to edit the {} clip",
                 state.track_label(track),
                 if notes.is_empty() { "audio" } else { "MIDI" }
             ));
+        }
+
+        // A clip dragged from the session matrix (or another lane) lands here.
+        if let Some(payload) = lane_hit.dnd_release_payload::<ClipDrag>() {
+            studio.drop_clip_on_arrangement(state, audio, (*payload).clone(), track, drop_step);
+        }
+
+        // Audio files dropped from the desktop become arrangement clips.
+        let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        if !dropped.is_empty() && lane_hit.contains_pointer() {
+            ui.ctx().input_mut(|input| input.raw.dropped_files.clear());
+            for (index, path) in dropped.iter().enumerate() {
+                let start =
+                    (drop_step as u32 + index as u32 * 16).min((LOOP_STEPS - 1) as u32) as u16;
+                studio.import_arrangement_file(state, audio, path, track, start);
+            }
         }
     }
 

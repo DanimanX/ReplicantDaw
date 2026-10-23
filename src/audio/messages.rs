@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
 pub use super::synth_xt::SynthParam;
 
 pub const TRACK_COUNT: usize = 8;
@@ -49,6 +50,21 @@ pub struct SampleUpload {
     pub track: u8,
     pub scene: u8,
     pub sample: Option<Arc<SampleBuffer>>,
+}
+
+/// An audio clip placed on the arrangement timeline.
+///
+/// The buffer is uploaded once and shared with the engine through an `Arc`,
+/// so moving the clip around the UI never copies the sample.
+#[derive(Clone, Debug)]
+pub struct ArrangementClip {
+    pub track: u8,
+    /// Timeline position in 16th notes, from the start of the 16-bar loop.
+    pub start_step: u16,
+    pub length_steps: u16,
+    pub sample: Arc<SampleBuffer>,
+    pub loop_enabled: bool,
+    pub gain: f32,
 }
 
 /// A note captured by MIDI recording or loaded from a project.
@@ -158,7 +174,7 @@ impl EffectKind {
         match self {
             Self::Drive => "SYNAPSE DRIVE",
             Self::Filter => "QUANTUM RESONATOR",
-            Self::Tone => "NEURAL GEN XT",
+            Self::Tone => "TONE SHAPER",
             Self::Width => "MIRROR WIDTH",
             Self::Delay => "ECHO MEMORY",
         }
@@ -335,7 +351,7 @@ pub const MAX_EFFECTS: usize = 6;
 /// allocation-free on the audio thread. The queue is sized for UI events, not
 /// for audio-rate traffic.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Command {
     Play,
     Stop,
@@ -364,7 +380,8 @@ pub enum Command {
     StopClip {
         track: u8,
     },
-    /// Change one editable parameter of a track's synth.
+    /// Change one editable parameter of a track's synth (test-only legacy path).
+    #[cfg(test)]
     SetSynthParam {
         track: u8,
         param: SynthParam,
@@ -458,11 +475,15 @@ pub enum Command {
         active: bool,
         instrument: bool,
     },
-    /// Mute or unmute the internal synth of a track. Used when an
-    /// instrument plugin replaces it in the track's instrument slot.
+    /// Mute or unmute the internal synth of a track (test-only legacy path).
+    #[cfg(test)]
     SetTrackSynth {
         track: u8,
         enabled: bool,
+    },
+    /// Replace the arrangement audio clip list.
+    SetArrangement {
+        clips: Vec<ArrangementClip>,
     },
     /// Audio-clip envelope applied to a track before the master bus.
     /// Fades are normalized to the 16-bar loop (0.0 = off, 1.0 = whole loop).

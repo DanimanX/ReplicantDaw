@@ -69,10 +69,6 @@ pub fn draw_menu_bar(ui: &mut Ui, rect: Rect, studio: &mut Studio, state: &mut U
     if button(&mut child, "MIDI", studio.midi_open) {
         studio.midi_open = !studio.midi_open;
     }
-    if button(&mut child, "SYNTH", studio.synth_open) {
-        studio.synth_open = !studio.synth_open;
-    }
-
     let donate = Button::new(
         RichText::new("DONATE")
             .font(theme::display(8.5))
@@ -223,7 +219,6 @@ pub fn draw_windows(
     draw_audio_editor(ctx, studio, state, audio);
     crate::ui::samples::draw_editor(ctx, studio, audio);
     crate::ui::sample_clip::draw(ctx, studio, state, audio);
-    crate::ui::synth_xt::draw(ctx, studio, state, audio);
     crate::ui::piano_roll::draw(ctx, studio, state, audio);
 }
 
@@ -546,7 +541,7 @@ fn draw_browser(
     ctx: &egui::Context,
     studio: &mut Studio,
     state: &mut UiState,
-    audio: &mut AudioRuntime,
+    _audio: &mut AudioRuntime,
 ) {
     let mut open = studio.browser_open;
     // Selecting something must close the picker; `open` is captured before the
@@ -606,33 +601,6 @@ fn draw_browser(
             ui.add_space(4.0);
 
             let filter = studio.browser_filter.to_lowercase();
-            let mut choose_synth = false;
-            if studio.instrument_browser {
-                // The internal engine is always available, above the plugins.
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("INT ")
-                            .font(theme::mono(8.0))
-                            .color(theme::GREEN),
-                    );
-                    ui.label(
-                        RichText::new("NEURAL GEN XT · internal hybrid synth")
-                            .font(theme::display(8.5))
-                            .color(theme::TEXT),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(Button::new(
-                                RichText::new("USE").font(theme::display(8.0)),
-                            ))
-                            .clicked()
-                        {
-                            choose_synth = true;
-                        }
-                    });
-                });
-                ui.separator();
-            }
             ScrollArea::vertical()
                 .id_salt("plugin_browser_list")
                 .max_height(300.0)
@@ -720,15 +688,6 @@ fn draw_browser(
                 .font(theme::mono(7.0))
                 .color(theme::TEXT_FAINT),
             );
-            if choose_synth {
-                let track = studio.browser_target;
-                studio.select_synth(state, track, audio);
-                close = true;
-                studio.notify(format!(
-                    "Track {:02} now plays the internal synth",
-                    track + 1
-                ));
-            }
         });
     if close {
         open = false;

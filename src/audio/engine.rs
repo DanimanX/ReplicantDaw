@@ -10,17 +10,21 @@ use super::effects::EffectSlot;
 use std::sync::Arc;
 
 use super::messages::{
-    db_to_gain, Command, EffectKind, RecordEvent, RecordedClip, RecordedNote, SampleBuffer,
-    SampleUpload, Telemetry, LOOP_STEPS, MAX_EFFECTS, PREVIEW_TRACK, SCENE_COUNT, STEPS_PER_BAR,
-    TRACK_COUNT,
+    db_to_gain, ArrangementClip, Command, EffectKind, RecordEvent, RecordedClip, RecordedNote,
+    SampleBuffer, SampleUpload, Telemetry, LOOP_STEPS, MAX_EFFECTS, PREVIEW_TRACK, SCENE_COUNT,
+    STEPS_PER_BAR, TRACK_COUNT,
 };
 use super::midi::MidiMessage;
+#[cfg(test)]
 use super::synth_xt::{SynthXt, Voice};
-use super::tracks::{note_at, TrackSpec, TRACKS};
+#[cfg(test)]
+use super::tracks::TrackSpec;
+use super::tracks::{note_at, TRACKS};
 use crate::dsp::{soft_clip, DcBlocker, Smoothed};
 use crate::plugins::{PluginBlock, PLUGIN_BLOCK_FRAMES};
 
 pub const MAX_VOICES: usize = 32;
+pub const MAX_ARRANGEMENT_CLIPS: usize = 64;
 pub const LOOP_BARS: u64 = 16;
 pub const DEFAULT_BPM: f32 = 142.0;
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -108,8 +112,11 @@ pub struct Engine {
     position: u64,
     last_step: u64,
     tracks: [TrackState; TRACK_COUNT],
+    #[cfg(test)]
     synth: [SynthXt; TRACK_COUNT],
+    #[cfg(test)]
     voices: [Voice; MAX_VOICES],
+    #[cfg(test)]
     voice_age: u64,
     effects: [EffectSlot; MAX_EFFECTS],
     effect_count: u8,
@@ -150,7 +157,8 @@ pub struct Engine {
     /// Whether the insert on that track generates its own audio (instrument)
     /// or just processes the bus the internal synth feeds (effect).
     track_plugin_instrument: [bool; TRACK_COUNT],
-    /// Internal synth audible per track. An instrument plugin replaces it.
+    /// Internal synth audible per track (test-only legacy path).
+    #[cfg(test)]
     synth_enabled: [bool; TRACK_COUNT],
     /// Note-offs scheduled for plugins at a given loop step.
     plugin_offs: [(u8, u8, u16); 128],
@@ -159,6 +167,9 @@ pub struct Engine {
     sample_rx: Option<Consumer<SampleUpload>>,
     /// One audio sample per (track, scene) clip.
     clip_samples: Box<[Option<Arc<SampleBuffer>>]>,
+    /// Audio clips placed on the arrangement timeline.
+    arrangement: [Option<ArrangementClip>; MAX_ARRANGEMENT_CLIPS],
+    arrangement_len: usize,
     /// Repeat each slot's sample to fill its clip loop.
     sample_loop: [[bool; SCENE_COUNT]; TRACK_COUNT],
     /// Linear trim per slot, precomputed from the dB command.
@@ -207,8 +218,11 @@ impl Engine {
             position: 0,
             last_step: u64::MAX,
             tracks: std::array::from_fn(|i| TrackState::new(i, sample_rate)),
+            #[cfg(test)]
             synth: std::array::from_fn(SynthXt::from_track),
+            #[cfg(test)]
             voices: [Voice::default(); MAX_VOICES],
+            #[cfg(test)]
             voice_age: 0,
             effects: std::array::from_fn(|_| EffectSlot::new(sample_rate)),
             effect_count: 0,
@@ -241,12 +255,15 @@ impl Engine {
             plugin_latency: 0,
             track_plugin: [false; TRACK_COUNT],
             track_plugin_instrument: [false; TRACK_COUNT],
+            #[cfg(test)]
             synth_enabled: [true; TRACK_COUNT],
             plugin_offs: [(0, 0, 0); 128],
             plugin_off_count: 0,
             last_midi_note: 60,
             sample_rx: io.samples,
             clip_samples: empty_sample_grid(),
+            arrangement: std::array::from_fn(|_| None),
+            arrangement_len: 0,
             sample_loop: [[true; SCENE_COUNT]; TRACK_COUNT],
             sample_gain: [[1.0; SCENE_COUNT]; TRACK_COUNT],
             preview: None,
@@ -300,7 +317,8 @@ impl Engine {
             .unwrap_or(0.0)
     }
 
-    /// Editable synth parameters for a track.
+    /// Editable synth parameters for a track (test-only legacy path).
+    #[cfg(test)]
     pub fn synth_params(&self, track: usize) -> SynthXt {
         self.synth[track.min(TRACK_COUNT - 1)]
     }
@@ -336,7 +354,14 @@ impl Engine {
     }
 
     pub fn active_voices(&self) -> u8 {
-        self.voices.iter().filter(|v| v.is_active()).count() as u8
+        #[cfg(test)]
+        {
+            self.voices.iter().filter(|v| v.is_active()).count() as u8
+        }
+        #[cfg(not(test))]
+        {
+            0
+        }
     }
 
     /// Render interleaved stereo audio. The slice length must be even.
@@ -357,6 +382,7 @@ impl Engine {
             && self.track_plugin.iter().any(|active| *active);
         let mut block_peaks = [0.0_f32; TRACK_COUNT];
         let mut block_master = [0.0_f32; 2];
+        #[cfg(test)]
         // Patches are copyable and small; taking one snapshot per block keeps
         // the per-sample loop free of borrow juggling and cache misses.
         let patches = self.synth;
@@ -369,7 +395,8 @@ impl Engine {
             let mut track_l = [0.0_f32; TRACK_COUNT];
             let mut track_r = [0.0_f32; TRACK_COUNT];
 
-            // Render voices into their track buses.
+            // Render voices into their track buses (test-only legacy path).
+            #[cfg(test)]
             for voice in &mut self.voices {
                 if !voice.is_active() {
                     continue;
@@ -415,6 +442,16 @@ impl Engine {
                     track_l[index] += sample.frames[position * 2] * gain;
                     track_r[index] += sample.frames[position * 2 + 1] * gain;
                     self.tracks[index].sample_pos = position + 1;
+                }
+
+                // Arrangement clips play at their absolute timeline position,
+                // independent of which session slot a track has launched.
+                let step_frames = self.samples_per_step();
+                let step_pos = self.position as f64 / step_frames;
+                for index in 0..TRACK_COUNT {
+                    let (left, right) = self.arrangement_sample(index, step_pos, step_frames);
+                    track_l[index] += left;
+                    track_r[index] += right;
                 }
             }
 
@@ -709,6 +746,7 @@ impl Engine {
                     self.tracks[track].clip_step = self.clip_loop[track][scene].0;
                     self.tracks[track].sample_pos = 0;
                 }
+                #[cfg(test)]
                 for voice in &mut self.voices {
                     voice.release();
                 }
@@ -765,6 +803,7 @@ impl Engine {
             Command::StopClip { track } => {
                 if let Some(t) = self.tracks.get_mut(track as usize) {
                     t.active = false;
+                    #[cfg(test)]
                     for voice in &mut self.voices {
                         if voice.is_active() && voice.track == track {
                             voice.release();
@@ -881,6 +920,7 @@ impl Engine {
                 }
                 // One instrument per track: an active instrument insert owns
                 // the sound source, so the internal synth steps aside.
+                #[cfg(test)]
                 if active && instrument {
                     self.synth_enabled[track] = false;
                     self.stop_synth_voices(track);
@@ -892,6 +932,7 @@ impl Engine {
                         .push_event(track as u8, 0, [0xB0, 123, 0], 3);
                 }
             }
+            #[cfg(test)]
             Command::SetTrackSynth { track, enabled } => {
                 let track = (track as usize).min(TRACK_COUNT - 1);
                 if let Some(flag) = self.synth_enabled.get_mut(track) {
@@ -913,6 +954,17 @@ impl Engine {
                     }
                 }
             }
+            Command::SetArrangement { clips } => {
+                let count = clips.len().min(MAX_ARRANGEMENT_CLIPS);
+                let mut incoming = clips.into_iter();
+                for slot in self.arrangement.iter_mut().take(count) {
+                    *slot = incoming.next();
+                }
+                for slot in self.arrangement.iter_mut().skip(count) {
+                    *slot = None;
+                }
+                self.arrangement_len = count;
+            }
             Command::SetTrackClip {
                 track,
                 gain,
@@ -931,6 +983,7 @@ impl Engine {
                     }
                 }
             }
+            #[cfg(test)]
             Command::SetSynthParam {
                 track,
                 param,
@@ -1001,6 +1054,41 @@ impl Engine {
         }
     }
 
+    /// Audio from arrangement clips whose timeline range contains `step_pos`.
+    #[inline]
+    fn arrangement_sample(&self, track: usize, step_pos: f64, step_frames: f64) -> (f32, f32) {
+        let mut left = 0.0_f32;
+        let mut right = 0.0_f32;
+        for clip in self.arrangement[..self.arrangement_len].iter().flatten() {
+            if clip.track as usize != track {
+                continue;
+            }
+            let start = clip.start_step as f64;
+            let end = start + clip.length_steps.max(1) as f64;
+            if step_pos < start || step_pos >= end {
+                continue;
+            }
+            let frames = clip.sample.frame_count();
+            if frames == 0 {
+                continue;
+            }
+            let offset = ((step_pos - start) * step_frames).round().max(0.0) as usize;
+            let position = if offset >= frames {
+                if clip.loop_enabled {
+                    offset % frames
+                } else {
+                    continue;
+                }
+            } else {
+                offset
+            };
+            let gain = clip.gain.clamp(0.0, 2.0);
+            left += clip.sample.frames[position * 2] * gain;
+            right += clip.sample.frames[position * 2 + 1] * gain;
+        }
+        (left, right)
+    }
+
     #[inline]
     fn samples_per_beat(&self) -> f64 {
         self.sample_rate as f64 * 60.0 / self.bpm as f64
@@ -1056,6 +1144,7 @@ impl Engine {
         self.release_plugin_notes(loop_step);
 
         for (track, spec) in TRACKS.iter().enumerate() {
+            let _ = spec;
             if !self.tracks[track].active {
                 continue;
             }
@@ -1078,8 +1167,12 @@ impl Engine {
                         let gate = (step_samples * note.length_steps.max(1) as f64)
                             .round()
                             .max(1.0) as u32;
-                        let velocity = (note.velocity as f32 / 127.0).clamp(0.05, 1.0);
-                        self.trigger_note(track, note.note, velocity, gate, spec);
+                        #[cfg(test)]
+                        {
+                            let velocity = (note.velocity as f32 / 127.0).clamp(0.05, 1.0);
+                            self.trigger_note(track, note.note, velocity, gate, spec);
+                        }
+                        let _ = gate;
                         self.forward_note_on(track, note.note, note.velocity);
                         // When the note ends, expressed on the global step grid.
                         let delta = (note.end_step().saturating_sub(phase)) % region;
@@ -1111,10 +1204,13 @@ impl Engine {
             let Some(note) = note_at(track, scene, step_in_bar) else {
                 continue;
             };
-            let gate = (step_samples * spec.gate as f64).round().max(1.0) as u32;
-            let velocity = if step_in_bar % 4 == 0 { 1.0 } else { 0.82 };
-            let velocity_byte = (velocity * 100.0) as u8;
-            self.trigger_note(track, note, velocity, gate, spec);
+            #[cfg(test)]
+            {
+                let gate = (step_samples * spec.gate as f64).round().max(1.0) as u32;
+                let velocity = if step_in_bar % 4 == 0 { 1.0 } else { 0.82 };
+                self.trigger_note(track, note, velocity, gate, spec);
+            }
+            let velocity_byte = if step_in_bar % 4 == 0 { 100 } else { 82 };
             self.forward_note_on(track, note, velocity_byte);
             self.schedule_plugin_off(track, note, loop_step + 1);
         }
@@ -1202,9 +1298,15 @@ impl Engine {
                 }
                 let track = self.record_track as usize;
                 let spec = &TRACKS[track.min(TRACK_COUNT - 1)];
-                let velocity_norm = (velocity as f32 / 127.0).clamp(0.05, 1.0);
-                // Live notes stay open until the matching note-off.
-                self.trigger_note(track, note, velocity_norm, u32::MAX / 4, spec);
+                #[cfg(test)]
+                {
+                    let _ = spec;
+                    let velocity_norm = (velocity as f32 / 127.0).clamp(0.05, 1.0);
+                    // Live notes stay open until the matching note-off.
+                    self.trigger_note(track, note, velocity_norm, u32::MAX / 4, spec);
+                }
+                let _ = track;
+                let _ = spec;
                 self.forward_midi([0x90, note, velocity], 3);
             }
             MidiMessage::NoteOff { note, channel: _ } => {
@@ -1213,6 +1315,7 @@ impl Engine {
                         self.finalize_pending_note(self.loop_step);
                     }
                 }
+                #[cfg(test)]
                 for voice in &mut self.voices {
                     if voice.is_active() && voice.track == self.record_track && voice.note() == note
                     {
@@ -1319,6 +1422,7 @@ impl Engine {
     ///
     /// Called when the track's sound source changes, so the internal synth
     /// cannot keep ringing under a newly selected instrument plugin.
+    #[cfg(test)]
     fn stop_synth_voices(&mut self, track: usize) {
         for voice in &mut self.voices {
             if voice.is_active() && voice.track as usize == track {
@@ -1337,6 +1441,7 @@ impl Engine {
         }
     }
 
+    #[cfg(test)]
     fn trigger_note(
         &mut self,
         track: usize,
@@ -1422,7 +1527,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::messages::{SynthParam, SCENE_COUNT};
+    use crate::audio::messages::{ArrangementClip, SynthParam, SCENE_COUNT};
     use rtrb::RingBuffer;
 
     fn render(engine: &mut Engine, frames: usize) -> Vec<f32> {
@@ -1518,6 +1623,63 @@ mod tests {
             .fold(0.0_f32, |max, sample| max.max(sample.abs()));
         assert!(peak > 0.05, "sample produced no audio: {peak}");
         assert!(engine.tracks[0].sample_pos > 0);
+    }
+
+    #[test]
+    fn arrangement_clip_plays_at_its_timeline_position() {
+        let (mut sample_tx, sample_rx) = RingBuffer::new(4);
+        let mut engine = Engine::new_with_io(
+            48_000.0,
+            EngineIo {
+                samples: Some(sample_rx),
+                ..EngineIo::default()
+            },
+        );
+        // Silence the test-only synth path and the generative patterns.
+        for track in 0..TRACK_COUNT {
+            engine.apply(Command::SetTrackSynth {
+                track: track as u8,
+                enabled: false,
+            });
+        }
+        engine.apply(Command::SetBpm(120.0));
+        engine.apply(Command::Play);
+
+        let frames = 48_000usize;
+        let mut data = Vec::with_capacity(frames * 2);
+        for index in 0..frames {
+            let value = (std::f32::consts::TAU * 330.0 * index as f32 / 48_000.0).sin() * 0.5;
+            data.push(value);
+            data.push(value);
+        }
+        // At 120 BPM a 16th note is 0.125 s: step 16 is second 2.
+        engine.apply(Command::SetArrangement {
+            clips: vec![ArrangementClip {
+                track: 0,
+                start_step: 16,
+                length_steps: 16,
+                sample: Arc::new(SampleBuffer {
+                    frames: data,
+                    sample_rate: 48_000,
+                }),
+                loop_enabled: true,
+                gain: 1.0,
+            }],
+        });
+        let _ = &mut sample_tx;
+
+        let before = render(&mut engine, 72_000);
+        assert!(peak(&before) < 1e-4, "arrangement clip started early");
+
+        let during = render(&mut engine, 48_000);
+        assert!(peak(&during) > 0.05, "arrangement clip did not sound");
+
+        let _ = render(&mut engine, 96_000);
+        let after = render(&mut engine, 24_000);
+        assert!(
+            peak(&after) < 1e-4,
+            "arrangement clip kept sounding after its end"
+        );
     }
 
     #[test]

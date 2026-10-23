@@ -57,10 +57,10 @@ REPLICANT_DAW_PLUGIN_PATH="/data/plugins/clap:/data/plugins/vst3" cargo run --re
 
 1. Plugins are scanned automatically at startup; **RESCAN** in the picker
    refreshes the list.
-2. A new track starts empty. Click `SELECT SYNTH OR VST/CLAP` in the device
-   chain to open the instrument browser: the internal synth is listed first,
-   followed by every CLAP/VST3 plugin installed on the system. Picking one
-   assigns it to the track.
+2. A new track starts empty. Click `SELECT VST3 / CLAP` in the device chain
+   to open the instrument browser, which lists every CLAP/VST3 plugin installed
+   on the system. Picking one assigns it to the track; this build has no
+   built-in synth.
 3. **RACK** lists all eight track inserts. Each row has **EDIT**, **LOAD**,
    **BYPASS** and **X** (unload), reports its latency, and exposes its
    parameters as knobs.
@@ -110,17 +110,13 @@ Known limits:
 
 Instrument vs effect:
 
-The device chain has no source switch: the slot holds one instrument and the
-panel shows what that is. There is no way to select the synth while a plugin
-still occupies the slot, which is what used to let both sound at once.
+The track has one external plugin slot. There is no built-in synth and no
+source switch, so a track cannot play two generators at once.
 
-- A loaded **instrument** owns the track. The internal synth is muted, its
-  sounding voices are faded out over 12 ms, and the panel shows the plugin's
-  parameters. Unload it with `X` to free the slot.
-- A loaded **effect** is a track insert: the synth stays the source and the
-  plugin processes its bus. The module header reads `NAME · FX INSERT`.
-- Choosing the internal synth from the browser unloads whatever plugin occupied
-  the slot, so the two can never share a track.
+- A loaded **instrument** owns the track and the panel shows its parameters.
+  Unload it with `X` to free the slot.
+- A loaded **effect** is a track insert. The module header reads
+  `NAME · FX INSERT`.
 - Classification uses the CLAP feature tags (`instrument`, `synthesizer`,
   `sampler` vs `audio-effect`) and the VST3 bus layout plus category, so a
   sampler that also exposes an audio input is not mistaken for an effect.
@@ -130,8 +126,8 @@ Routing rules:
 - Each plugin processes only its track's stereo bus, before the master effect
   chain.
 - **Effects** replace the track signal (100% wet insert).
-- **Instruments** replace the track's sound source: the engine mutes the synth
-  and fades its voices out, so a track never plays two generators at once.
+- **Instruments** are the track's only generator, so loading another plugin
+  into the same slot replaces the previous instance.
 - **MIDI → PLUGINS** in the MIDI window forwards live notes, CC and pitch bend
   to the insert on the selected input track. It is on by default.
 - The sequencer and the piano roll also send note on/off to the instrument

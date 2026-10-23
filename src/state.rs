@@ -9,13 +9,28 @@ use rtrb::Consumer;
 
 use crate::audio::messages::RecordedNote;
 use crate::audio::{
-    gain_to_db, EffectKind, RecordEvent, SynthXt, Telemetry, DEFAULT_BPM, SCENE_COUNT, TRACKS,
-    TRACK_COUNT,
+    gain_to_db, EffectKind, RecordEvent, Telemetry, DEFAULT_BPM, SCENE_COUNT, TRACKS, TRACK_COUNT,
 };
 use crate::dsp::spectrum::SpectrumAnalyzer;
-use crate::samples::SampleSlot;
+use crate::samples::{SampleClip, SampleSlot};
 
 pub const MAX_SCOPE: usize = 4096;
+
+/// An audio clip placed on the arrangement timeline.
+///
+/// The clip owns its rendered sample, so it is independent of the session
+/// matrix: moving it between views does not leave a second copy sounding.
+#[derive(Clone, Debug)]
+pub struct ArrangementClip {
+    pub id: u64,
+    pub track: usize,
+    /// Timeline position in 16th notes, from the start of the 16-bar loop.
+    pub start_step: u16,
+    pub length_steps: u16,
+    pub clip: Arc<SampleClip>,
+    pub loop_enabled: bool,
+    pub gain_db: f32,
+}
 
 /// Sound source of a track's single instrument slot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -23,8 +38,6 @@ pub enum InstrumentSource {
     /// Nothing loaded yet; the device chain offers `ADD PLUGIN / INSTRUMENT`.
     #[default]
     Empty,
-    /// The internal hybrid synth (`NEURAL GEN XT`).
-    Synth,
     /// The CLAP/VST3 plugin hosted in the slot.
     Plugin,
 }
@@ -33,7 +46,6 @@ impl InstrumentSource {
     pub fn label(self) -> &'static str {
         match self {
             Self::Empty => "EMPTY",
-            Self::Synth => "FM",
             Self::Plugin => "PLUGIN",
         }
     }
@@ -41,22 +53,18 @@ impl InstrumentSource {
     pub fn id(self) -> &'static str {
         match self {
             Self::Empty => "empty",
-            Self::Synth => "synth",
             Self::Plugin => "plugin",
         }
     }
 
     pub fn from_id(id: &str) -> Self {
         match id.to_ascii_lowercase().as_str() {
-            "synth" | "fm" => Self::Synth,
+            // Projects from releases with the internal synth load with an
+            // empty slot, so they cannot resurrect a source this build lacks.
+            "synth" | "fm" => Self::Empty,
             "plugin" | "vst3" | "clap" => Self::Plugin,
             _ => Self::Empty,
         }
-    }
-
-    /// Does the internal synth sound on this track?
-    pub fn synth_audible(self) -> bool {
-        self == Self::Synth
     }
 }
 
@@ -114,12 +122,9 @@ pub struct UiState {
     pub clip_gain_db: [f32; TRACK_COUNT],
     pub clip_fade_in: [f32; TRACK_COUNT],
     pub clip_fade_out: [f32; TRACK_COUNT],
-    pub synth: [SynthXt; TRACK_COUNT],
-    /// What makes this track sound: nothing, the internal synth, or the
-    /// hosted plugin. New tracks start empty, as the device chain shows.
+    /// What makes this track sound: nothing or the hosted plugin. New tracks
+    /// start empty, as the device chain shows.
     pub instrument: [InstrumentSource; TRACK_COUNT],
-    /// Last synth-mute value pushed to the engine, to avoid resending it.
-    pub synth_sent: [bool; TRACK_COUNT],
     /// Per-slot clip playback enable, indexed by (track, scene).
     pub recorded_active: [[bool; SCENE_COUNT]; TRACK_COUNT],
     /// Floating "add effect" menu state.
@@ -137,6 +142,9 @@ pub struct UiState {
     pub clip_loop: [[(u16, u16); SCENE_COUNT]; TRACK_COUNT],
     /// Audio sample assigned to each session slot, if any.
     pub sample_slots: [[Option<Arc<SampleSlot>>; SCENE_COUNT]; TRACK_COUNT],
+    /// Audio clips placed on the arrangement timeline.
+    pub arrangement: Vec<ArrangementClip>,
+    arrangement_serial: u64,
     pub recording: bool,
     pub record_track: u8,
     pub input_track: u8,
@@ -176,11 +184,7 @@ impl UiState {
             clip_gain_db: [0.0; TRACK_COUNT],
             clip_fade_in: [0.0; TRACK_COUNT],
             clip_fade_out: [0.0; TRACK_COUNT],
-            synth: std::array::from_fn(SynthXt::from_track),
             instrument: [InstrumentSource::Empty; TRACK_COUNT],
-            // The engine starts with every synth enabled, so the empty default
-            // must be pushed once; start "sent" as the opposite value.
-            synth_sent: [true; TRACK_COUNT],
             recorded_active: [[true; SCENE_COUNT]; TRACK_COUNT],
             add_effect_open: false,
             add_menu_pos: egui::Pos2::new(200.0, 200.0),
@@ -193,6 +197,8 @@ impl UiState {
             recorded: std::array::from_fn(|_| std::array::from_fn(|_| Vec::new())),
             clip_loop: [[(0, crate::audio::LOOP_STEPS as u16); SCENE_COUNT]; TRACK_COUNT],
             sample_slots: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            arrangement: Vec::new(),
+            arrangement_serial: 1,
             recording: false,
             record_track: 0,
             input_track: 0,
@@ -329,6 +335,80 @@ impl UiState {
         {
             *slot = sample;
         }
+    }
+
+    /// Number of 16th-note steps a sample spans at the current tempo.
+    pub fn steps_for_duration(&self, seconds: f32, start_step: u16) -> u16 {
+        let seconds_per_step = 60.0 / self.bpm.max(1.0) / 4.0;
+        let steps = (seconds / seconds_per_step).round().max(1.0) as u32;
+        let remaining = crate::audio::LOOP_STEPS as u32
+            - start_step.min(crate::audio::LOOP_STEPS as u16 - 1) as u32;
+        steps.min(remaining).max(1) as u16
+    }
+
+    /// Place an audio clip on the arrangement, sized to the sample's duration.
+    pub fn add_arrangement_clip(
+        &mut self,
+        track: usize,
+        start_step: u16,
+        clip: Arc<SampleClip>,
+        loop_enabled: bool,
+        gain_db: f32,
+    ) -> u64 {
+        let start_step = start_step.min(crate::audio::LOOP_STEPS as u16 - 1);
+        let length_steps = self.steps_for_duration(clip.duration_secs(), start_step);
+        self.add_arrangement_clip_with_length(
+            track,
+            start_step,
+            length_steps,
+            clip,
+            loop_enabled,
+            gain_db,
+        )
+    }
+
+    /// Place an audio clip with an explicit length (used by project restore).
+    pub fn add_arrangement_clip_with_length(
+        &mut self,
+        track: usize,
+        start_step: u16,
+        length_steps: u16,
+        clip: Arc<SampleClip>,
+        loop_enabled: bool,
+        gain_db: f32,
+    ) -> u64 {
+        let id = self.arrangement_serial;
+        self.arrangement_serial = self.arrangement_serial.wrapping_add(1).max(1);
+        self.arrangement.push(ArrangementClip {
+            id,
+            track: track.min(TRACK_COUNT - 1),
+            start_step: start_step.min(crate::audio::LOOP_STEPS as u16 - 1),
+            length_steps: length_steps.max(1),
+            clip,
+            loop_enabled,
+            gain_db,
+        });
+        id
+    }
+
+    pub fn arrangement_clip(&self, id: u64) -> Option<&ArrangementClip> {
+        self.arrangement.iter().find(|clip| clip.id == id)
+    }
+
+    pub fn remove_arrangement_clip(&mut self, id: u64) -> Option<ArrangementClip> {
+        let index = self.arrangement.iter().position(|clip| clip.id == id)?;
+        Some(self.arrangement.remove(index))
+    }
+
+    pub fn move_arrangement_clip(&mut self, id: u64, track: usize, start_step: u16) {
+        if let Some(clip) = self.arrangement.iter_mut().find(|clip| clip.id == id) {
+            clip.track = track.min(TRACK_COUNT - 1);
+            clip.start_step = start_step.min(crate::audio::LOOP_STEPS as u16 - 1);
+        }
+    }
+
+    pub fn clear_arrangement(&mut self) {
+        self.arrangement.clear();
     }
 
     /// Toggle whether the slot repeats its sample inside the clip loop.
@@ -483,11 +563,6 @@ impl UiState {
                 target.velocity = velocity.clamp(1, 127);
             }
         }
-    }
-
-    /// Synth parameters for the selected track.
-    pub fn synth_params(&self, track: usize) -> SynthXt {
-        self.synth[track.min(TRACK_COUNT - 1)]
     }
 
     /// Append an effect to the mirrored chain, bounded by the engine limit.
@@ -670,6 +745,37 @@ mod tests {
     }
 
     #[test]
+    fn arrangement_clips_can_be_placed_moved_and_removed() {
+        let mut state = UiState::new();
+        let clip = std::sync::Arc::new(crate::samples::SampleClip {
+            path: std::path::PathBuf::from("/tmp/loop.wav"),
+            name: "loop".to_string(),
+            source: std::sync::Arc::new(vec![0.0; 4]),
+            source_rate: 48_000,
+            source_frames: 2,
+            edits: crate::samples::SampleEdits::default(),
+            buffer: std::sync::Arc::new(crate::audio::SampleBuffer {
+                frames: vec![0.0; 4],
+                sample_rate: 48_000,
+            }),
+            peaks: vec![0.5],
+        });
+        let id = state.add_arrangement_clip(2, 32, clip, true, -3.0);
+        assert!(state.arrangement_clip(id).is_some());
+        assert_eq!(state.steps_for_duration(1.0, 0), 9);
+
+        state.move_arrangement_clip(id, 4, 64);
+        let moved = state.arrangement_clip(id).expect("clip");
+        assert_eq!(moved.track, 4);
+        assert_eq!(moved.start_step, 64);
+
+        assert!(state.remove_arrangement_clip(id).is_some());
+        assert!(state.arrangement_clip(id).is_none());
+        state.clear_arrangement();
+        assert!(state.arrangement.is_empty());
+    }
+
+    #[test]
     fn effect_chain_helpers_mirror_the_engine() {
         let mut state = UiState::new();
         assert_eq!(state.effects.len(), 4);
@@ -691,28 +797,6 @@ mod tests {
         state.reset_chain();
         assert_eq!(state.effects.len(), 4);
         assert!((state.master_gain - 0.90).abs() < 1e-6);
-    }
-
-    #[test]
-    fn synth_params_are_editable_per_track() {
-        let mut state = UiState::new();
-        state.synth[3].set(crate::audio::SynthParam::FilterCutoff(0), 6_000.0);
-        assert!(
-            (state
-                .synth_params(3)
-                .get(crate::audio::SynthParam::FilterCutoff(0))
-                - 6_000.0)
-                .abs()
-                < 1e-6
-        );
-        assert!(
-            (state
-                .synth_params(2)
-                .get(crate::audio::SynthParam::FilterCutoff(0))
-                - 6_000.0)
-                .abs()
-                > 1e-3
-        );
     }
 
     #[test]

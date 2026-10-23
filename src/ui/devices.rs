@@ -1,15 +1,12 @@
 //! Bottom device chain: instrument slot, modular effects and the master bus.
 //!
-//! The first module is the track's instrument slot. It holds the internal
-//! `NEURAL GEN XT` synth and the CLAP/VST3 instrument insert, and lets you
-//! choose which one sounds. Modules are painted left to right in signal order;
-//! every effect can be bypassed, reordered, closed and re-added from `+ FX`.
+//! The first module is the track's external instrument slot (CLAP/VST3).
+//! Modules are painted left to right in signal order; every effect can be
+//! bypassed, reordered, closed and re-added from `+ FX`.
 
 use egui::{Align2, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 
-use crate::audio::{
-    gain_to_db, AudioRuntime, Command, EffectKind, EffectKnob, SynthParam, MAX_VOICES,
-};
+use crate::audio::{gain_to_db, AudioRuntime, Command, EffectKind, EffectKnob};
 use crate::state::{UiEffect, UiState};
 use crate::studio::Studio;
 use crate::theme;
@@ -63,14 +60,13 @@ pub fn draw(
     let mut x = content.left();
     let mut clicked: Option<ModuleAction> = None;
     let mut param_change: Option<(usize, usize, f32)> = None;
-    let mut synth_change: Option<(usize, SynthParam, f32)> = None;
 
-    // ---- Instrument slot (internal synth + plugin insert) ----------------
+    // ---- Instrument slot (external plugin insert) -----------------------
     let instrument_rect = Rect::from_min_size(
         Pos2::new(x, content.top()),
         Vec2::new(unit * instrument_weight, content.height()),
     );
-    draw_instrument(ui, instrument_rect, studio, state, audio, &mut synth_change);
+    draw_instrument(ui, instrument_rect, studio, state, audio);
     x += instrument_rect.width() + GAP;
 
     // ---- Effect modules -------------------------------------------------
@@ -114,14 +110,6 @@ pub fn draw(
         let _ = audio.command_tx.push(Command::SetEffectParam {
             index: index as u8,
             knob: knob_index as u8,
-            value,
-        });
-    }
-    if let Some((track, param, value)) = synth_change {
-        state.synth[track].set(param, value);
-        let _ = audio.command_tx.push(Command::SetSynthParam {
-            track: track as u8,
-            param,
             value,
         });
     }
@@ -277,17 +265,13 @@ fn norm_to_value(norm: f32, min: f32, max: f32, log: bool) -> f32 {
     }
 }
 
-/// The track's instrument slot.
-///
-/// Mutually exclusive instrument generator: either the internal `SURGE WT SYNTH`
-/// or the loaded `VST3 / CLAP` plugin. Exactly one is active and sounds per track.
+/// The track's instrument slot: one external CLAP/VST3 plugin.
 fn draw_instrument(
     ui: &mut Ui,
     rect: Rect,
     studio: &mut Studio,
     state: &mut UiState,
     audio: &mut AudioRuntime,
-    change: &mut Option<(usize, SynthParam, f32)>,
 ) {
     use crate::state::InstrumentSource;
 
@@ -296,24 +280,18 @@ fn draw_instrument(
     let info = studio.slots[track].clone();
     let pending = studio.slot_pending[track];
     let mut source = state.instrument[track];
-    // A plugin can only be the source when one is actually loaded. While a
-    // load is in flight the slot stays selected so the panel shows progress
-    // instead of falling back to the synth that is no longer routed.
+    // A plugin can only be the source when one is actually loaded.
     if source == InstrumentSource::Plugin && info.is_none() && !pending {
         source = InstrumentSource::Empty;
         state.instrument[track] = source;
     }
 
-    // The slot holds one of three things, and the panel shows exactly that.
-    // There is no separate "source" switch: it would let the synth and a
-    // loaded plugin claim the same track.
-    let title = match (&info, pending, source) {
-        (Some(info), _, _) if info.is_instrument => info.name.clone(),
-        // An effect plugin is a track insert; the synth is still the source.
-        (Some(info), _, _) => format!("{} · FX INSERT", info.name),
-        (None, true, _) => "LOADING PLUGIN…".into(),
-        (None, false, InstrumentSource::Synth) => "SURGE WT SYNTH".into(),
-        (None, false, _) => "INSTRUMENT // EMPTY".into(),
+    // The slot holds a plugin or nothing.
+    let title = match (&info, pending) {
+        (Some(info), _) if info.is_instrument => info.name.clone(),
+        (Some(info), _) => format!("{} · FX INSERT", info.name),
+        (None, true) => "LOADING PLUGIN…".into(),
+        (None, false) => "INSTRUMENT // EMPTY".into(),
     };
 
     // GUI + E + b + X sit in the header when a plugin is loaded.
@@ -328,7 +306,7 @@ fn draw_instrument(
     );
 
     // ---- Empty slot: the call to action --------------------------------
-    if info.is_none() && !pending && source != InstrumentSource::Synth {
+    if info.is_none() && !pending {
         let hit = ui.interact(
             inner,
             ui.scope_id().with(("instrument_add", track)),
@@ -368,7 +346,7 @@ fn draw_instrument(
             theme::display(26.0),
             if hovered { Color32::WHITE } else { accent },
         );
-        let cta = "SELECT SYNTH OR VST/CLAP";
+        let cta = "SELECT VST3 / CLAP";
         let cta_painter = ui
             .painter()
             .with_clip_rect(inner.shrink2(Vec2::new(4.0, 0.0)));
@@ -396,9 +374,7 @@ fn draw_instrument(
             studio.open_instrument_browser(track);
         }
         if hovered {
-            hit.on_hover_text(
-                "Pick a CLAP/VST3 plugin installed on this system, or the internal Surge WT synth",
-            );
+            hit.on_hover_text("Pick a CLAP/VST3 plugin installed on this system");
         }
         return;
     }
@@ -495,23 +471,10 @@ fn draw_instrument(
                 }
             }
         }
-    } else if !pending && source == InstrumentSource::Synth {
-        let edit = Rect::from_min_size(Pos2::new(right - 34.0, y), Vec2::new(34.0, button));
-        if icon_button(ui, edit, "EDIT", accent) {
-            studio.synth_open = true;
-        }
     }
 
     let content_top = inner.top() + row_h + 4.0;
-    let synth_mode = info.is_none() && !pending && source == InstrumentSource::Synth;
-    // The synth panel keeps one line at the bottom for its engine badge.
-    let content = Rect::from_min_max(
-        Pos2::new(inner.left(), content_top),
-        Pos2::new(
-            inner.right(),
-            inner.bottom() - if synth_mode { 14.0 } else { 0.0 },
-        ),
-    );
+    let content = Rect::from_min_max(Pos2::new(inner.left(), content_top), inner.max);
 
     // ---- A loaded plugin owns the panel ---------------------------------
     if let Some(info) = &info {
@@ -527,92 +490,6 @@ fn draw_instrument(
             theme::mono(9.0),
             theme::TEXT_DIM,
         );
-        return;
-    }
-
-    // ---- If Synth is selected, render Surge WT Synth Controls ONLY ------
-    let params = state.synth[track];
-    let compact = [
-        SynthParam::OscMorph(0),
-        SynthParam::FilterCutoff(0),
-        SynthParam::FilterResonance(0),
-        SynthParam::OscLevel(1),
-        SynthParam::OscDetune(0),
-        SynthParam::EnvRelease(0),
-    ];
-    let columns = ((content.width() / 62.0).floor() as usize).clamp(2, 3);
-    let rows = compact.len().div_ceil(columns);
-    let cell_w = content.width() / columns as f32;
-    let cell_h = (content.height() / rows as f32).max(32.0);
-
-    for (index, param) in compact.iter().enumerate() {
-        let row = index / columns;
-        let column = index % columns;
-        let cell = Rect::from_min_size(
-            Pos2::new(
-                content.left() + column as f32 * cell_w,
-                content.top() + row as f32 * cell_h,
-            ),
-            Vec2::new(cell_w, cell_h),
-        );
-        let (min, max) = param.range();
-        let log = param.logarithmic();
-        let mut norm = value_to_norm(params.get(*param), min, max, log);
-        let changed = knob(
-            ui,
-            cell,
-            ui.scope_id().with(("synth_knob", track, index)),
-            &mut norm,
-            0.0..=1.0,
-            value_to_norm(param.default_value(), min, max, log),
-            &param.label(),
-            &param.format(params.get(*param)),
-            accent,
-        );
-        if changed {
-            let value = norm_to_value(norm, min, max, log);
-            *change = Some((track, *param, value));
-        }
-    }
-
-    // Badge that names the internal Surge WT engine and opens the full editor.
-    let badge = Rect::from_min_size(
-        Pos2::new(inner.left(), content.bottom() + 1.0),
-        Vec2::new(content.width(), 13.0),
-    );
-    let badge_hit = ui.interact(
-        badge,
-        ui.scope_id().with(("synth_editor_open", track)),
-        Sense::click(),
-    );
-    ui.painter().text(
-        Pos2::new(badge.left() + 2.0, badge.center().y),
-        Align2::LEFT_CENTER,
-        "SURGE WT SYNTH · 1:1 WAVETABLE ENGINE",
-        theme::mono(8.0),
-        theme::TEXT_DIM,
-    );
-    ui.painter().text(
-        Pos2::new(badge.right() - 2.0, badge.center().y),
-        Align2::RIGHT_CENTER,
-        if badge_hit.hovered() {
-            "OPEN FULL EDITOR >"
-        } else {
-            "EDITOR >"
-        },
-        theme::mono(8.0),
-        if badge_hit.hovered() {
-            accent
-        } else {
-            theme::TEXT_FAINT
-        },
-    );
-    if badge_hit.clicked() {
-        studio.synth_open = true;
-    }
-    if badge_hit.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        badge_hit.on_hover_text("Open the Surge WT Synth full editor");
     }
 }
 
@@ -1079,7 +956,7 @@ fn draw_master(ui: &mut Ui, rect: Rect, state: &mut UiState, audio: &mut AudioRu
     ui.painter().text(
         Pos2::new(inner.right(), inner.top() + 11.0),
         Align2::RIGHT_TOP,
-        format!("{} voices", MAX_VOICES.min(state.voices as usize)),
+        "EXTERNAL INSTR",
         theme::mono(5.8),
         theme::TEXT_FAINT,
     );

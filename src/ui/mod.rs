@@ -7,6 +7,5 @@ pub mod sample_clip;
 pub mod samples;
 pub mod session;
 pub mod studio_windows;
-pub mod synth_xt;
 pub mod transport;
 pub mod widgets;

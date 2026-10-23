@@ -292,7 +292,13 @@ impl Worker {
                 if index >= MAX_PLUGIN_SLOTS {
                     return;
                 }
-                self.slots[index] = None;
+                // Replacing a slot must go through the same safe teardown as
+                // an explicit unload. Dropping a live instance here left CLAP
+                // processors and VST3 components running (and vendors' VST3
+                // destructors are known to crash).
+                if let Some(previous) = self.slots[index].take() {
+                    self.retire(previous);
+                }
                 let loaded = match descriptor.format {
                     PluginFormat::Clap => ClapInstance::load(
                         &descriptor.path,
@@ -327,18 +333,8 @@ impl Worker {
             }
             PluginCommand::Unload { slot } => {
                 if let Some(entry) = self.slots.get_mut(slot as usize) {
-                    if let Some(mut removed) = entry.take() {
-                        match &mut removed.instance {
-                            Instance::Clap(plugin) => plugin.shutdown(),
-                            Instance::Vst3(_) => {}
-                        }
-                        if removed.instance.is_vst3() {
-                            if let Instance::Vst3(plugin) = &mut removed.instance {
-                                plugin.stop();
-                            }
-                            self.retired.push(removed.instance);
-                        }
-                        // CLAP instances drop normally.
+                    if let Some(removed) = entry.take() {
+                        self.retire(removed);
                     }
                 }
                 self.emit_slots();
@@ -441,6 +437,22 @@ impl Worker {
                 Instance::Clap(plugin) => plugin.service_gui(),
                 Instance::Vst3(plugin) => plugin.service_gui(),
             }
+        }
+    }
+
+    /// Stop an instance before dropping it. VST3 components are parked
+    /// because their teardown can crash asynchronously; CLAP processors are
+    /// shut down before the library handle drops.
+    fn retire(&mut self, mut removed: Slot) {
+        match &mut removed.instance {
+            Instance::Clap(plugin) => plugin.shutdown(),
+            Instance::Vst3(_) => {}
+        }
+        if removed.instance.is_vst3() {
+            if let Instance::Vst3(plugin) = &mut removed.instance {
+                plugin.stop();
+            }
+            self.retired.push(removed.instance);
         }
     }
 

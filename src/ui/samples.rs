@@ -420,7 +420,7 @@ pub fn draw_editor(ctx: &egui::Context, studio: &mut Studio, audio: &mut AudioRu
                         let clip = editor.to_clip(audio.sample_rate);
                         ui.dnd_drag_source(
                             egui::Id::unique("sample_editor_drag"),
-                            clip,
+                            crate::samples::ClipDrag::Editor { clip },
                             |ui| {
                                 ui.add(
                                     egui::Button::new(

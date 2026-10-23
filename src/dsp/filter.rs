@@ -1,4 +1,4 @@
-//! Filters used by the Quantum Resonator and Neural Gen devices.
+//! Filters used by the Quantum Resonator effect and the offline synth tests.
 
 use std::f32::consts::PI;
 

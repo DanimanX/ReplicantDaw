@@ -99,7 +99,7 @@ impl ReplicantApp {
                 path: std::path::PathBuf::from(path),
                 format,
             };
-            studio.load_plugin(0, &descriptor, &mut audio);
+            studio.load_plugin(0, &descriptor, &mut state);
         } else if let Ok(slot) = std::env::var("REPLICANT_DAW_OPEN_SLOT") {
             if let Ok(index) = slot.parse::<usize>() {
                 studio.selected_slot = index.min(crate::plugins::MAX_PLUGIN_SLOTS - 1);

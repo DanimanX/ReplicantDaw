@@ -22,6 +22,9 @@ pub struct Vst3Instance {
     vendor: String,
     version: String,
     category: String,
+    /// Whether the class advertises an audio input bus. An instrument has
+    /// none, which is a far more reliable signal than the category string.
+    has_audio_input: bool,
     params: Vec<ParamInfo>,
 }
 
@@ -36,6 +39,15 @@ impl Vst3Instance {
         let plugin = Arc::new(Mutex::new(plugin));
 
         let info = lock(&plugin).info().clone();
+        let has_audio_input = lock(&plugin)
+            .audio_bus_layout()
+            .map(|layout| {
+                layout
+                    .inputs
+                    .iter()
+                    .any(|bus| bus.active && bus.channel_count > 0)
+            })
+            .unwrap_or(true);
         let buffers = AudioBuffers::new(2, 2, PLUGIN_BLOCK_FRAMES, sample_rate as f64);
         let mut instance = Self {
             plugin,
@@ -46,6 +58,7 @@ impl Vst3Instance {
             vendor: info.vendor,
             version: info.version,
             category: info.category,
+            has_audio_input,
             params: Vec::new(),
         };
 
@@ -111,8 +124,13 @@ impl Vst3Instance {
     }
 
     pub fn is_instrument(&self) -> bool {
-        self.category.to_lowercase().contains("instrument")
-            || self.category.to_lowercase().contains("synth")
+        // A generator exposes no audio input; some builds report an empty or
+        // unrelated category, so trust the bus layout first.
+        if !self.has_audio_input {
+            return true;
+        }
+        let category = self.category.to_lowercase();
+        category.contains("instrument") || category.contains("synth")
     }
 
     /// Re-read every parameter from the plugin.

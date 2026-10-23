@@ -1753,6 +1753,14 @@ impl Env {
         }
     }
 
+    /// Release with a fixed, short time constant, ignoring the patch setting.
+    fn fast_release(&mut self, sample_rate: f32) {
+        if self.stage != Stage::Off {
+            self.release_coef = envelope_coeff(0.0001, 0.012, sample_rate);
+            self.stage = Stage::Release;
+        }
+    }
+
     #[inline]
     fn tick(&mut self) -> f32 {
         match self.stage {
@@ -2019,6 +2027,18 @@ impl Voice {
         for env in &mut self.env {
             env.release();
         }
+    }
+
+    /// Fade the voice out over a few milliseconds and free it.
+    ///
+    /// Used when the track's sound source changes (the internal synth steps
+    /// aside for an instrument plugin). A short release keeps the switch
+    /// inaudible instead of cutting the waveform into a click.
+    pub fn stop(&mut self, sample_rate: f32) {
+        for env in &mut self.env {
+            env.fast_release(sample_rate);
+        }
+        self.gate_left = 0;
     }
 
     #[inline]

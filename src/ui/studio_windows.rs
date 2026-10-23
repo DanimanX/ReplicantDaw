@@ -215,7 +215,7 @@ pub fn draw_windows(
     audio: &mut AudioRuntime,
 ) {
     draw_rack(ctx, studio, state, audio);
-    draw_browser(ctx, studio, state, audio);
+    draw_browser(ctx, studio, state);
     draw_plugin_editor(ctx, studio, state, audio);
     draw_rename(ctx, studio, state);
     draw_midi(ctx, studio, state, audio);
@@ -542,12 +542,7 @@ fn draw_rack(
     studio.rack_open = open;
 }
 
-fn draw_browser(
-    ctx: &egui::Context,
-    studio: &mut Studio,
-    state: &mut UiState,
-    audio: &mut AudioRuntime,
-) {
+fn draw_browser(ctx: &egui::Context, studio: &mut Studio, state: &mut UiState) {
     let mut open = studio.browser_open;
     // Selecting something must close the picker; `open` is captured before the
     // click is handled, so a flag is needed to carry the decision to the end.
@@ -708,7 +703,7 @@ fn draw_browser(
                     }
                     if let Some(descriptor) = to_load {
                         let slot = studio.browser_target;
-                        studio.load_plugin(slot, &descriptor, audio);
+                        studio.load_plugin(slot, &descriptor, state);
                         close = true;
                     }
                 });

@@ -5,7 +5,7 @@ driven by `cpal`, a neon session interface built with `eframe`/`egui` on `wgpu`,
 lock-free `rtrb` queues between the threads, MIDI recording, project files, a
 modular effect chain and in-process CLAP/VST3 plugin hosting.
 
-**Version 1.3.2** · MIT, Linux, macOS and Windows.
+**Version 1.3.3** · MIT, Linux, macOS and Windows.
 
 ![Replicant DAW session view](docs/screenshot.png)
 
@@ -26,6 +26,24 @@ modular effect chain and in-process CLAP/VST3 plugin hosting.
 ![Plugin editor at full screen](docs/plugin-editor.png)
 
 ![A CLAP instrument's own window, hosted natively](docs/plugin-gui.png)
+
+## What's new in 1.3.3
+
+- **One instrument per track, enforced in the engine.** Selecting the Surge WT
+  synth and then loading a VST used to leave both sounding: the insert was
+  activated on load while the internal synth was still audible, and the synth
+  only stopped *triggering* notes rather than releasing the ones already
+  ringing. The engine now owns the rule — an active instrument insert silences
+  the synth and fades its voices out over 12 ms, and choosing the synth drops
+  the instrument insert. Effect inserts still process the track bus, so
+  `synth → effect` racks keep working.
+- **The device panel follows the instrument that is actually loaded.** Loading a
+  plugin into the instrument slot switches the panel immediately (with a
+  `LOADING PLUGIN…` state while the instance starts) instead of leaving the
+  Surge editor on screen with a silent, unrouted plugin behind it.
+- **VST3 instruments are classified by their bus layout**, not only by the
+  category string, so generators that report an empty or unusual category are no
+  longer mistaken for effects.
 
 ## What's new in 1.3.2
 

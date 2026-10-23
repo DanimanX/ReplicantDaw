@@ -65,9 +65,10 @@ pub struct Studio {
     pub plugins: PluginRuntime,
     pub slots: [Option<PluginSlotInfo>; MAX_PLUGIN_SLOTS],
     pub slot_pending: [bool; MAX_PLUGIN_SLOTS],
-    /// Slots that had a plugin on the previous frame, used to notice loads.
-    slot_loaded: [bool; MAX_PLUGIN_SLOTS],
-    pub plugin_sent: [bool; MAX_PLUGIN_SLOTS],
+    /// Routing last handed to the engine: `(active, is_instrument)`.
+    pub plugin_sent: [(bool, bool); MAX_PLUGIN_SLOTS],
+    /// Source to fall back to when a plugin load never lands.
+    source_before_load: [Option<crate::state::InstrumentSource>; MAX_PLUGIN_SLOTS],
     pub selected_slot: usize,
 
     pub scan_results: Vec<PluginDescriptor>,
@@ -146,8 +147,8 @@ impl Studio {
             plugins,
             slots: std::array::from_fn(|_| None),
             slot_pending: [false; MAX_PLUGIN_SLOTS],
-            slot_loaded: [false; MAX_PLUGIN_SLOTS],
-            plugin_sent: [false; MAX_PLUGIN_SLOTS],
+            plugin_sent: [(false, false); MAX_PLUGIN_SLOTS],
+            source_before_load: [None; MAX_PLUGIN_SLOTS],
             selected_slot: 0,
             scan_results: Vec::new(),
             scan_running: false,
@@ -531,12 +532,7 @@ impl Studio {
         self.notify("Scanning plugin directories…");
     }
 
-    pub fn load_plugin(
-        &mut self,
-        slot: usize,
-        descriptor: &PluginDescriptor,
-        audio: &mut AudioRuntime,
-    ) {
+    pub fn load_plugin(&mut self, slot: usize, descriptor: &PluginDescriptor, state: &mut UiState) {
         if slot >= MAX_PLUGIN_SLOTS {
             return;
         }
@@ -549,14 +545,16 @@ impl Studio {
         }
         self.slot_pending[slot] = true;
         self.selected_slot = slot;
+        // Loading into the instrument slot makes the plugin this track's sound
+        // source at once, so the internal synth stops before the instance is
+        // ready and the panel already shows what is coming.
+        self.source_before_load[slot] = Some(state.instrument[slot])
+            .filter(|source| *source != crate::state::InstrumentSource::Plugin);
+        state.instrument[slot] = crate::state::InstrumentSource::Plugin;
         self.plugins.send(PluginCommand::Load {
             slot: slot as u8,
             descriptor: descriptor.clone(),
             state: None,
-        });
-        let _ = audio.command_tx.push(Command::SetTrackPlugin {
-            track: slot as u8,
-            active: true,
         });
         self.notify(format!(
             "Loading {} ({}) on track {:02}",
@@ -575,9 +573,13 @@ impl Studio {
         let _ = audio.command_tx.push(Command::SetTrackPlugin {
             track: slot as u8,
             active: false,
+            instrument: false,
         });
         self.slots[slot] = None;
         self.slot_pending[slot] = false;
+        // Nothing to fall back to: the slot really is empty now.
+        self.source_before_load[slot] = None;
+        self.plugin_sent[slot] = (false, false);
     }
 
     /// Remember the DAW's native window so plugin editors float above it.
@@ -927,10 +929,9 @@ impl Studio {
                 descriptor,
                 state: state_bytes,
             });
-            let _ = audio.command_tx.push(Command::SetTrackPlugin {
-                track: plugin.slot,
-                active: true,
-            });
+            // Restoring the instance does not imply routing it: the project's
+            // saved instrument source decides. `sync_instrument_sources`
+            // routes the insert once the worker reports the loaded slot.
             if plugin.bypass {
                 self.plugins.send(PluginCommand::Bypass {
                     slot: plugin.slot,
@@ -1002,21 +1003,37 @@ impl Studio {
 
     /// Keep each track's internal synth mute in line with its instrument slot.
     ///
+    /// Keep each track's instrument source and engine routing in agreement.
+    ///
+    /// A track has exactly one sound source. The plugin insert is routed when
+    /// it is the selected source, or when it is an effect (it then processes
+    /// the bus the internal synth feeds). An instrument insert and the internal
+    /// synth are never both audible: the engine enforces the same rule.
+    ///
     /// Runs every frame, so a plugin loaded on a track that is not currently
     /// selected still takes over that track's sound source.
     pub fn sync_instrument_sources(&mut self, state: &mut UiState, audio: &mut AudioRuntime) {
+        use crate::state::InstrumentSource;
         for track in 0..TRACK_COUNT {
-            // A newly loaded instrument plugin takes over an empty slot.
-            let loaded = self.slots[track].is_some();
-            if loaded && !self.slot_loaded[track] {
-                let is_instrument = self.slots[track]
-                    .as_ref()
-                    .is_some_and(|slot| slot.is_instrument);
-                state.instrument[track] = source_after_load(state.instrument[track], is_instrument);
-            }
-            self.slot_loaded[track] = loaded;
+            let slot = self.slots[track].as_ref();
+            let loaded = slot.is_some();
+            let is_instrument = slot.is_some_and(|slot| slot.is_instrument);
 
-            let want_synth = state.instrument[track] == crate::state::InstrumentSource::Synth;
+            // A load that never produced a slot (bad path, unsupported format)
+            // must not leave the track pointing at a plugin that is not there.
+            if !loaded
+                && !self.slot_pending[track]
+                && state.instrument[track] == InstrumentSource::Plugin
+            {
+                state.instrument[track] = self.source_before_load[track]
+                    .take()
+                    .unwrap_or(InstrumentSource::Empty);
+            }
+            if loaded {
+                self.source_before_load[track] = None;
+            }
+
+            let want_synth = state.instrument[track] == InstrumentSource::Synth;
             if state.synth_sent[track] != want_synth {
                 state.synth_sent[track] = want_synth;
                 let _ = audio.command_tx.push(Command::SetTrackSynth {
@@ -1025,13 +1042,13 @@ impl Studio {
                 });
             }
 
-            let want_plugin = state.instrument[track] == crate::state::InstrumentSource::Plugin
-                && self.slots[track].is_some();
-            if self.plugin_sent[track] != want_plugin {
-                self.plugin_sent[track] = want_plugin;
+            let want = plugin_routing(state.instrument[track], loaded, is_instrument);
+            if self.plugin_sent[track] != want {
+                self.plugin_sent[track] = want;
                 let _ = audio.command_tx.push(Command::SetTrackPlugin {
                     track: track as u8,
-                    active: want_plugin,
+                    active: want.0,
+                    instrument: want.1,
                 });
             }
         }
@@ -1061,22 +1078,18 @@ impl PluginDescriptor {
     }
 }
 
-/// Deciding the instrument source when a plugin is loaded or unloaded.
+/// Routing the engine should hold for a track's plugin insert.
 ///
-/// Loading a plugin only takes over an *empty* or already-plugin slot when the
-/// plugin is an instrument; an effect plugin leaves the current source alone.
-pub fn source_after_load(
-    current: crate::state::InstrumentSource,
-    plugin_is_instrument: bool,
-) -> crate::state::InstrumentSource {
-    use crate::state::InstrumentSource;
-    if plugin_is_instrument {
-        InstrumentSource::Plugin
-    } else if current == InstrumentSource::Plugin {
-        InstrumentSource::Empty
-    } else {
-        current
-    }
+/// Returns `(active, instrument)`. An effect insert always processes the bus
+/// the internal synth feeds; an instrument insert is routed only while it is
+/// the track's selected source, so the two can never sound together.
+pub fn plugin_routing(
+    source: crate::state::InstrumentSource,
+    loaded: bool,
+    instrument: bool,
+) -> (bool, bool) {
+    let active = loaded && (!instrument || source == crate::state::InstrumentSource::Plugin);
+    (active, active && instrument)
 }
 
 /// Deciding the instrument source when a plugin is unloaded.
@@ -1180,21 +1193,6 @@ mod tests {
         // A new track starts empty: the chain shows ADD PLUGIN / INSTRUMENT.
         assert_eq!(InstrumentSource::default(), InstrumentSource::Empty);
 
-        // Instrument plugins take over an empty or plugin slot.
-        assert_eq!(
-            source_after_load(InstrumentSource::Empty, true),
-            InstrumentSource::Plugin
-        );
-        // Effect plugins leave an empty slot empty.
-        assert_eq!(
-            source_after_load(InstrumentSource::Empty, false),
-            InstrumentSource::Empty
-        );
-        // An explicit FM choice survives an effect plugin.
-        assert_eq!(
-            source_after_load(InstrumentSource::Synth, false),
-            InstrumentSource::Synth
-        );
         // Unloading a plugin empties the slot.
         assert_eq!(
             source_after_unload(InstrumentSource::Plugin),
@@ -1203,6 +1201,46 @@ mod tests {
         assert_eq!(
             source_after_unload(InstrumentSource::Synth),
             InstrumentSource::Synth
+        );
+    }
+
+    #[test]
+    fn an_instrument_insert_is_routed_only_as_the_selected_source() {
+        use crate::state::InstrumentSource;
+
+        // Nothing loaded: nothing to route.
+        assert_eq!(
+            plugin_routing(InstrumentSource::Empty, false, false),
+            (false, false)
+        );
+        assert_eq!(
+            plugin_routing(InstrumentSource::Plugin, false, true),
+            (false, false)
+        );
+
+        // An instrument insert sounds only while it is the track's source.
+        assert_eq!(
+            plugin_routing(InstrumentSource::Plugin, true, true),
+            (true, true)
+        );
+        assert_eq!(
+            plugin_routing(InstrumentSource::Synth, true, true),
+            (false, false),
+            "an instrument plugin must not be routed under the internal synth"
+        );
+        assert_eq!(
+            plugin_routing(InstrumentSource::Empty, true, true),
+            (false, false)
+        );
+
+        // An effect insert keeps processing the track bus either way.
+        assert_eq!(
+            plugin_routing(InstrumentSource::Synth, true, false),
+            (true, false)
+        );
+        assert_eq!(
+            plugin_routing(InstrumentSource::Plugin, true, false),
+            (true, false)
         );
     }
 

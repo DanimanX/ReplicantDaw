@@ -288,8 +288,10 @@ fn draw_instrument(
     let info = studio.slots[track].clone();
     let pending = studio.slot_pending[track];
     let mut source = state.instrument[track];
-    // A plugin can only be the source when one is actually loaded.
-    if source == InstrumentSource::Plugin && info.is_none() {
+    // A plugin can only be the source when one is actually loaded. While a
+    // load is in flight the slot stays selected so the panel shows progress
+    // instead of falling back to the synth that is no longer routed.
+    if source == InstrumentSource::Plugin && info.is_none() && !pending {
         source = InstrumentSource::Empty;
         state.instrument[track] = source;
     }
@@ -300,7 +302,7 @@ fn draw_instrument(
             if let Some(info) = &info {
                 &info.name
             } else {
-                "INSTRUMENT // PLUGIN"
+                "INSTRUMENT // LOADING PLUGIN…"
             }
         }
         InstrumentSource::Empty => "INSTRUMENT // EMPTY (AUDIO ONLY)",
@@ -534,8 +536,17 @@ fn draw_instrument(
     if source == InstrumentSource::Plugin {
         if let Some(info) = &info {
             draw_plugin_parameters(ui, content, studio, track, info, accent);
-            return;
+        } else {
+            // The instance is still loading on the plugin worker thread.
+            ui.painter().text(
+                content.center(),
+                Align2::CENTER_CENTER,
+                "LOADING PLUGIN…",
+                theme::mono(9.0),
+                theme::TEXT_DIM,
+            );
         }
+        return;
     }
 
     // ---- If Synth is selected, render Surge WT Synth Controls ONLY ------
@@ -622,8 +633,6 @@ fn draw_instrument(
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         badge_hit.on_hover_text("Open the Surge WT Synth full editor");
     }
-
-    let _ = pending;
 }
 
 /// Small selectable chip used by the instrument source row.

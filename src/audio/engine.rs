@@ -147,6 +147,9 @@ pub struct Engine {
     plugin_midi: bool,
     plugin_latency: u16,
     track_plugin: [bool; TRACK_COUNT],
+    /// Whether the insert on that track generates its own audio (instrument)
+    /// or just processes the bus the internal synth feeds (effect).
+    track_plugin_instrument: [bool; TRACK_COUNT],
     /// Internal synth audible per track. An instrument plugin replaces it.
     synth_enabled: [bool; TRACK_COUNT],
     /// Note-offs scheduled for plugins at a given loop step.
@@ -237,6 +240,7 @@ impl Engine {
             plugin_midi: true,
             plugin_latency: 0,
             track_plugin: [false; TRACK_COUNT],
+            track_plugin_instrument: [false; TRACK_COUNT],
             synth_enabled: [true; TRACK_COUNT],
             plugin_offs: [(0, 0, 0); 128],
             plugin_off_count: 0,
@@ -850,9 +854,15 @@ impl Engine {
             Command::SetInputTrack { track } => {
                 self.record_track = (track as usize).min(TRACK_COUNT - 1) as u8;
             }
-            Command::SetTrackPlugin { track, active } => {
-                if let Some(flag) = self.track_plugin.get_mut(track as usize) {
+            Command::SetTrackPlugin {
+                track,
+                active,
+                instrument,
+            } => {
+                let track = (track as usize).min(TRACK_COUNT - 1);
+                if let Some(flag) = self.track_plugin.get_mut(track) {
                     *flag = active;
+                    self.track_plugin_instrument[track] = instrument;
                     if !self.track_plugin.iter().any(|enabled| *enabled) {
                         // Leaving the plugin path: drop the one-block delay.
                         self.plugin_pending.frames = 0;
@@ -869,10 +879,38 @@ impl Engine {
                         self.plugin_ready_pos = 0;
                     }
                 }
+                // One instrument per track: an active instrument insert owns
+                // the sound source, so the internal synth steps aside.
+                if active && instrument {
+                    self.synth_enabled[track] = false;
+                    self.stop_synth_voices(track);
+                }
+                // Dropping the insert must not leave notes held inside the
+                // instance: they would resume the moment it is routed again.
+                if !active && self.plugin_midi && self.track_plugin.iter().any(|enabled| *enabled) {
+                    self.plugin_pending
+                        .push_event(track as u8, 0, [0xB0, 123, 0], 3);
+                }
             }
             Command::SetTrackSynth { track, enabled } => {
-                if let Some(flag) = self.synth_enabled.get_mut(track as usize) {
+                let track = (track as usize).min(TRACK_COUNT - 1);
+                if let Some(flag) = self.synth_enabled.get_mut(track) {
                     *flag = enabled;
+                }
+                if !enabled {
+                    // Muting the source must also stop what is already ringing.
+                    self.stop_synth_voices(track);
+                } else if self.track_plugin[track] && self.track_plugin_instrument[track] {
+                    // Choosing the synth drops an instrument insert. An effect
+                    // insert keeps processing the bus the synth feeds.
+                    self.track_plugin[track] = false;
+                    if !self.track_plugin.iter().any(|enabled| *enabled) {
+                        self.plugin_pending.frames = 0;
+                        self.plugin_pending.clear_events();
+                        self.plugin_ready_len = 0;
+                        self.plugin_ready_pos = 0;
+                        self.plugin_latency = 0;
+                    }
                 }
             }
             Command::SetTrackClip {
@@ -1087,6 +1125,11 @@ impl Engine {
         if self.plugin_input.is_none() || !self.plugin_midi {
             return;
         }
+        // A track whose insert is not routed must not collect notes: they
+        // would otherwise fire the moment the insert is routed again.
+        if !self.track_plugin.get(track).copied().unwrap_or(false) {
+            return;
+        }
         let offset = self.plugin_pending.frames.saturating_sub(1);
         self.plugin_pending.push_event(
             track as u8,
@@ -1099,6 +1142,9 @@ impl Engine {
     /// Queue a note-off for the plugin at `end_step` of the 16-bar loop.
     fn schedule_plugin_off(&mut self, track: usize, note: u8, end_step: u16) {
         if self.plugin_input.is_none() || !self.plugin_midi || self.plugin_off_count >= 128 {
+            return;
+        }
+        if !self.track_plugin.get(track).copied().unwrap_or(false) {
             return;
         }
         let end_step = end_step % LOOP_STEPS as u16;
@@ -1267,6 +1313,28 @@ impl Engine {
 
     pub fn is_recording(&self) -> bool {
         self.recording
+    }
+
+    /// Fade out every sounding voice of `track` and free their slots.
+    ///
+    /// Called when the track's sound source changes, so the internal synth
+    /// cannot keep ringing under a newly selected instrument plugin.
+    fn stop_synth_voices(&mut self, track: usize) {
+        for voice in &mut self.voices {
+            if voice.is_active() && voice.track as usize == track {
+                voice.stop(self.sample_rate);
+            }
+        }
+        // Notes scheduled from before the switch would re-open silent voices.
+        let mut index = 0;
+        while index < self.plugin_off_count {
+            if self.plugin_offs[index].0 as usize == track {
+                self.plugin_off_count -= 1;
+                self.plugin_offs[index] = self.plugin_offs[self.plugin_off_count];
+            } else {
+                index += 1;
+            }
+        }
     }
 
     fn trigger_note(
@@ -1654,6 +1722,100 @@ mod tests {
         assert!(out.iter().all(|s| s.is_finite()));
     }
 
+    /// Solo track 0 so a source switch is measured on its own bus.
+    fn solo_track_zero(engine: &mut Engine) {
+        for track in 1..TRACK_COUNT {
+            engine.apply(Command::SetTrackMute {
+                track: track as u8,
+                mute: true,
+            });
+        }
+    }
+
+    /// Voices the internal synth still has sounding on one track.
+    fn voices_on(engine: &Engine, track: u8) -> usize {
+        engine
+            .voices
+            .iter()
+            .filter(|voice| voice.is_active() && voice.track == track)
+            .count()
+    }
+
+    fn peak(samples: &[f32]) -> f32 {
+        samples.iter().fold(0.0_f32, |max, s| max.max(s.abs()))
+    }
+
+    #[test]
+    fn an_instrument_insert_replaces_the_internal_synth() {
+        let mut engine = Engine::offline(48_000.0);
+        solo_track_zero(&mut engine);
+        engine.apply(Command::Play);
+        let before = render(&mut engine, 24_000);
+        assert!(peak(&before) > 0.01, "the synth should be sounding");
+        assert!(voices_on(&engine, 0) > 0);
+
+        engine.apply(Command::SetTrackPlugin {
+            track: 0,
+            active: true,
+            instrument: true,
+        });
+        // The fade-out is 12 ms; give it room, then the track must be silent.
+        let _ = render(&mut engine, 4_800);
+        assert_eq!(
+            voices_on(&engine, 0),
+            0,
+            "the synth kept voices alive under an instrument plugin"
+        );
+        let after = render(&mut engine, 24_000);
+        assert!(
+            peak(&after) < 1.0e-6,
+            "the internal synth is still audible under the plugin (peak {})",
+            peak(&after)
+        );
+    }
+
+    #[test]
+    fn an_effect_insert_keeps_the_internal_synth_audible() {
+        let mut engine = Engine::offline(48_000.0);
+        solo_track_zero(&mut engine);
+        engine.apply(Command::Play);
+        engine.apply(Command::SetTrackPlugin {
+            track: 0,
+            active: true,
+            instrument: false,
+        });
+        let out = render(&mut engine, 24_000);
+        assert!(
+            peak(&out) > 0.01,
+            "an effect insert must still receive the synth bus"
+        );
+        assert!(voices_on(&engine, 0) > 0);
+    }
+
+    #[test]
+    fn choosing_the_synth_drops_the_instrument_insert() {
+        let mut engine = Engine::offline(48_000.0);
+        solo_track_zero(&mut engine);
+        engine.apply(Command::Play);
+        engine.apply(Command::SetTrackPlugin {
+            track: 0,
+            active: true,
+            instrument: true,
+        });
+        let silent = render(&mut engine, 24_000);
+        assert!(peak(&silent) < 1.0e-6, "the plugin path should be silent");
+
+        engine.apply(Command::SetTrackSynth {
+            track: 0,
+            enabled: true,
+        });
+        let out = render(&mut engine, 24_000);
+        assert!(
+            peak(&out) > 0.01,
+            "selecting the synth must bring it back and drop the insert"
+        );
+    }
+
     #[test]
     fn mute_silences_a_track_and_master_limits() {
         let mut engine = Engine::offline(48_000.0);
@@ -1798,6 +1960,8 @@ mod tests {
         engine.apply(Command::SetTrackPlugin {
             track: 0,
             active: true,
+            // An effect insert: it processes the bus the synth feeds.
+            instrument: false,
         });
 
         let frames = PLUGIN_BLOCK_FRAMES;
@@ -2189,10 +2353,7 @@ mod tests {
         engine.apply(Command::SetTrackPlugin {
             track: 0,
             active: true,
-        });
-        engine.apply(Command::SetTrackSynth {
-            track: 0,
-            enabled: false,
+            instrument: true,
         });
         engine.apply(Command::Play);
 

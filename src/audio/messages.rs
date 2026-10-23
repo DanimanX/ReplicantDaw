@@ -448,9 +448,15 @@ pub enum Command {
         track: u8,
     },
     /// Enable or disable the CLAP/VST3 insert hosted on a track.
+    ///
+    /// `instrument` tells the engine whether the insert *is* the track's sound
+    /// source (it generates audio) or merely processes the bus the internal
+    /// synth feeds. An active instrument insert silences the synth, so a track
+    /// never plays two instruments at once.
     SetTrackPlugin {
         track: u8,
         active: bool,
+        instrument: bool,
     },
     /// Mute or unmute the internal synth of a track. Used when an
     /// instrument plugin replaces it in the track's instrument slot.

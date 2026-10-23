@@ -65,19 +65,19 @@ static WAVETABLE_BANK: std::sync::OnceLock<[[[f32; WT_SIZE]; WT_FRAMES]; WAVETAB
 
 fn init_wavetable_bank() -> [[[f32; WT_SIZE]; WT_FRAMES]; WAVETABLE_COUNT] {
     let mut bank = [[[0.0_f32; WT_SIZE]; WT_FRAMES]; WAVETABLE_COUNT];
-    for table_idx in 0..WAVETABLE_COUNT {
-        for frame_idx in 0..WT_FRAMES {
+    for (table_idx, table) in bank.iter_mut().enumerate() {
+        for (frame_idx, frame) in table.iter_mut().enumerate() {
             let mut max_abs = 0.0_f32;
-            for sample_idx in 0..WT_SIZE {
+            for (sample_idx, sample) in frame.iter_mut().enumerate() {
                 let t = sample_idx as f32 / WT_SIZE as f32;
                 let val = generate_raw_wt_sample(table_idx, frame_idx, t);
-                bank[table_idx][frame_idx][sample_idx] = val;
+                *sample = val;
                 max_abs = max_abs.max(val.abs());
             }
             if max_abs > 1.0e-5 {
                 let norm = 0.98 / max_abs;
-                for sample_idx in 0..WT_SIZE {
-                    bank[table_idx][frame_idx][sample_idx] *= norm;
+                for sample in frame.iter_mut() {
+                    *sample *= norm;
                 }
             }
         }
@@ -174,7 +174,7 @@ fn generate_raw_wt_sample(table: usize, frame: usize, t: f32) -> f32 {
             1 => {
                 (TAU * t).sin()
                     + 0.55 * (1.414 * TAU * t).sin()
-                    + 0.4 * (3.141 * TAU * t).sin()
+                    + 0.4 * (PI * TAU * t).sin()
                     + 0.25 * (4.2 * TAU * t).sin()
             }
             2 => (TAU * t).sin() + 0.7 * (3.75 * TAU * t).sin() + 0.5 * (6.33 * TAU * t).sin(),
@@ -193,11 +193,7 @@ fn generate_raw_wt_sample(table: usize, frame: usize, t: f32) -> f32 {
             let mut s = 0.0;
             for k in 1..=max_harmonic {
                 let f = k as f32;
-                let amp = if frame == 4 {
-                    1.0 / f.sqrt()
-                } else {
-                    1.0 / f
-                };
+                let amp = if frame == 4 { 1.0 / f.sqrt() } else { 1.0 / f };
                 s += (f * TAU * t).sin() * amp;
             }
             s

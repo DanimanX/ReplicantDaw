@@ -306,13 +306,7 @@ fn draw_instrument(
         InstrumentSource::Empty => "INSTRUMENT // EMPTY (AUDIO ONLY)",
     };
 
-    let inner = module_shell(
-        ui,
-        rect,
-        title,
-        &format!("TRK {:02}", track + 1),
-        accent,
-    );
+    let inner = module_shell(ui, rect, title, &format!("TRK {:02}", track + 1), accent);
 
     // ---- Empty slot: the call to action --------------------------------
     if source == InstrumentSource::Empty && info.is_none() {

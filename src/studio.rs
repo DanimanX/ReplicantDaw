@@ -1025,7 +1025,8 @@ impl Studio {
                 });
             }
 
-            let want_plugin = state.instrument[track] == crate::state::InstrumentSource::Plugin && self.slots[track].is_some();
+            let want_plugin = state.instrument[track] == crate::state::InstrumentSource::Plugin
+                && self.slots[track].is_some();
             if self.plugin_sent[track] != want_plugin {
                 self.plugin_sent[track] = want_plugin;
                 let _ = audio.command_tx.push(Command::SetTrackPlugin {

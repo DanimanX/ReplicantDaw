@@ -419,7 +419,14 @@ pub fn draw_matrix(
                         edit_clip = true;
                         ui.close();
                     }
-                    if ui.button(if looping { "🔁 LOOP: ON" } else { "🔁 LOOP: OFF" }).clicked() {
+                    if ui
+                        .button(if looping {
+                            "🔁 LOOP: ON"
+                        } else {
+                            "🔁 LOOP: OFF"
+                        })
+                        .clicked()
+                    {
                         toggle_loop = true;
                         ui.close();
                     }

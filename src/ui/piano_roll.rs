@@ -126,8 +126,8 @@ fn draw_header(
         }
         let muted = !state.recorded_active[track][scene];
         let has_sample = state.sample_clip(track, scene).is_some();
-        if has_sample {
-            if ui
+        if has_sample
+            && ui
                 .add(
                     egui::Button::new(
                         egui::RichText::new("🌊 VIEW AUDIO CLIP").font(theme::display(9.0)),
@@ -137,9 +137,8 @@ fn draw_header(
                 )
                 .on_hover_text("Open the audio clip waveform and loop editor for this slot")
                 .clicked()
-            {
-                studio.open_sample_clip(track, scene);
-            }
+        {
+            studio.open_sample_clip(track, scene);
         }
         ui.label(
             egui::RichText::new(format!(

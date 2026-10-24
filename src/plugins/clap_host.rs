@@ -292,6 +292,29 @@ impl HostHandlers for ReplicantHost {
     }
 }
 
+/// Plain range of one CLAP parameter, kept so a normalized host value can be
+/// converted to the plain value the plugin expects in its event list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ParamRange {
+    id: u32,
+    min: f64,
+    max: f64,
+}
+
+impl ParamRange {
+    /// Map a normalized `0.0..=1.0` knob position onto the plugin's plain range.
+    fn plain(self, normalized: f32) -> f64 {
+        let norm = normalized.clamp(0.0, 1.0) as f64;
+        self.min + (self.max - self.min) * norm
+    }
+
+    /// Recover the knob position from a plain value read back from the plugin.
+    fn normalize(self, plain: f64) -> f32 {
+        let span = (self.max - self.min).abs().max(1e-9);
+        (((plain - self.min) / span).clamp(0.0, 1.0)) as f32
+    }
+}
+
 pub struct ClapInstance {
     // Declaration order matters: the processor must drop before the instance,
     // and the entry library must outlive both.
@@ -307,14 +330,23 @@ pub struct ClapInstance {
     vendor: String,
     version: String,
     params: Vec<ParamInfo>,
-    /// Parameter changes queued by the host, delivered as CLAP parameter
-    /// events at the start of the next block.
+    /// Plain `(min, max)` range for every parameter id.
+    ///
+    /// CLAP automation carries **plain** values (`clap_param_info.min_value ..
+    /// max_value`), while the rack works in normalized `0.0..=1.0`. Without the
+    /// range a host edit reaches the plugin as if `0.8` were 0.8 Hz (or 0.8
+    /// semitones), so plugins whose range is not `0..1` — every u-he
+    /// instrument, for one — moved by a rounding error instead of following the
+    /// knob.
+    param_ranges: Vec<ParamRange>,
+    /// Parameter changes queued by the host, in **plain** values, delivered as
+    /// CLAP parameter events at the start of the next block.
     ///
     /// CLAP has no host-side `set_value`: parameter automation is expressed as
     /// `ParamValueEvent`s on the processor's input event list. Updating only
     /// the mirrored `params` made the host knobs look alive while the plugin
     /// never heard them.
-    pending_params: Vec<(u32, f32)>,
+    pending_params: Vec<(u32, f64)>,
     /// Whether the plugin declares an audio input port (used for wiring).
     has_audio_input: bool,
     /// Whether the plugin is a generator rather than a track effect.
@@ -744,7 +776,7 @@ impl ClapInstance {
             }
         }
 
-        let params = Self::read_params(&mut instance);
+        let (params, param_ranges) = Self::read_param_table(&mut instance);
         let gui_supported = Self::probe_gui(&mut instance);
         let has_audio_input = instance
             .plugin_handle()
@@ -772,6 +804,7 @@ impl ClapInstance {
             vendor,
             version,
             params,
+            param_ranges,
             pending_params: Vec::new(),
             has_audio_input,
             is_instrument,
@@ -795,31 +828,38 @@ impl ClapInstance {
             .is_some()
     }
 
-    fn read_params(instance: &mut PluginInstance<ReplicantHost>) -> Vec<ParamInfo> {
+    fn read_param_table(
+        instance: &mut PluginInstance<ReplicantHost>,
+    ) -> (Vec<ParamInfo>, Vec<ParamRange>) {
         let handle = instance.plugin_handle();
         let Some(params) = handle.get_extension::<PluginParams>() else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         let count = params.count(&handle);
         let mut out = Vec::with_capacity(count.min(128) as usize);
+        let mut ranges = Vec::with_capacity(count.min(128) as usize);
         for index in 0..count.min(128) {
             let mut buffer = ParamInfoBuffer::new();
             let Some(info) = params.get_info(&handle, index, &mut buffer) else {
                 continue;
             };
+            let range = ParamRange {
+                id: info.id.get(),
+                min: info.min_value,
+                max: info.max_value,
+            };
             let value = params
                 .get_value(&handle, info.id)
                 .unwrap_or(info.default_value);
-            let span = (info.max_value - info.min_value).abs().max(1e-9);
-            let normalized = ((value - info.min_value) / span).clamp(0.0, 1.0);
             out.push(ParamInfo {
-                id: info.id.get(),
+                id: range.id,
                 name: String::from_utf8_lossy(info.name).to_string(),
-                value: normalized as f32,
+                value: range.normalize(value),
                 text: format!("{value:.2}"),
             });
+            ranges.push(range);
         }
-        out
+        (out, ranges)
     }
 
     fn activate(&mut self) -> Result<(), String> {
@@ -873,7 +913,9 @@ impl ClapInstance {
     /// The cached list is only a mirror: a plugin can change its own values from
     /// its editor, so the host refreshes before displaying or saving them.
     pub fn refresh_params(&mut self) {
-        self.params = Self::read_params(&mut self.instance);
+        let (params, ranges) = Self::read_param_table(&mut self.instance);
+        self.params = params;
+        self.param_ranges = ranges;
     }
 
     pub fn set_param(&mut self, id: u32, value: f32) {
@@ -882,6 +924,16 @@ impl ClapInstance {
             param.value = value;
             param.text = format!("{:.2}", param.value);
         }
+        // CLAP automation carries the parameter's plain value, not the knob
+        // position, so the normalized edit is converted through the range the
+        // plugin reported. A parameter whose range is not `0..1` otherwise
+        // moved by a rounding error instead of following the knob.
+        let plain = self
+            .param_ranges
+            .iter()
+            .find(|range| range.id == id)
+            .map(|range| range.plain(value))
+            .unwrap_or(value as f64);
         // Queue the change for the plugin itself. Repeated edits of the same
         // parameter collapse into the last value, so dragging a knob cannot
         // overflow the event list.
@@ -890,9 +942,9 @@ impl ClapInstance {
             .iter_mut()
             .find(|(pending, _)| *pending == id)
         {
-            entry.1 = value;
+            entry.1 = plain;
         } else {
-            self.pending_params.push((id, value));
+            self.pending_params.push((id, plain));
         }
     }
 
@@ -911,8 +963,7 @@ impl ClapInstance {
         } = self;
         for (id, value) in pending_params.drain(..).take(super::MAX_BLOCK_EVENTS / 2) {
             events.push(
-                &ParamValueEvent::new(0, ClapId::new(id), Pckn::match_all(), value as f64)
-                    .as_unknown(),
+                &ParamValueEvent::new(0, ClapId::new(id), Pckn::match_all(), value).as_unknown(),
             );
         }
     }
@@ -1431,6 +1482,43 @@ mod tests {
         main_thread.unregister_timer(id).expect("unregister");
         std::thread::sleep(std::time::Duration::from_millis(3));
         assert!(reactor.due_timers().is_empty());
+    }
+
+    #[test]
+    fn a_knob_position_maps_onto_the_plugins_plain_range() {
+        // CLAP automation carries the plain value, not the knob position: a
+        // 0..200 parameter must receive 100.0 at the middle of the travel.
+        let range = super::ParamRange {
+            id: 7,
+            min: 0.0,
+            max: 200.0,
+        };
+        assert_eq!(range.plain(0.0), 0.0);
+        assert_eq!(range.plain(0.5), 100.0);
+        assert_eq!(range.plain(1.0), 200.0);
+        // Out-of-range edits clamp instead of overshooting the plugin's range.
+        assert_eq!(range.plain(-1.0), 0.0);
+        assert_eq!(range.plain(2.0), 200.0);
+    }
+
+    #[test]
+    fn a_plain_value_maps_back_to_the_knob_position() {
+        let range = super::ParamRange {
+            id: 7,
+            min: -24.0,
+            max: 24.0,
+        };
+        assert!((range.normalize(-24.0)).abs() < 1e-6);
+        assert!((range.normalize(0.0) - 0.5).abs() < 1e-6);
+        assert!((range.normalize(24.0) - 1.0).abs() < 1e-6);
+        // A degenerate range must not divide by zero.
+        let fixed = super::ParamRange {
+            id: 8,
+            min: 3.0,
+            max: 3.0,
+        };
+        assert!(fixed.normalize(3.0).is_finite());
+        assert!((fixed.normalize(9.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]

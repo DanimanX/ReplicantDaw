@@ -7,7 +7,7 @@ clips, a modular master chain, MIDI recording and versioned `.rproj` projects.
 Built with `eframe`/`egui` on `wgpu`; audio is rendered by `cpal` through
 lock-free `rtrb` rings.
 
-**Version 1.5.0** · MIT · Linux, macOS and Windows.
+**Version 1.5.1** · MIT · Linux, macOS and Windows.
 
 ![Replicant DAW session and arrangement](docs/screenshot.png)
 
@@ -15,28 +15,24 @@ lock-free `rtrb` rings.
 > the status reads `SILENT FALLBACK`. A fresh session starts with an empty
 > instrument slot and the plugins already scanned.
 
-## What's new in 1.5.0
+## What's new in 1.5.1
 
-- **The session matrix and the arrangement are independent spaces.** The
-  timeline used to paint the launched session clip across its lane, as if both
-  views were one piano roll. It no longer does: the matrix owns its slots, the
-  arrangement owns its blocks, and a block only exists there once you put it
-  there.
-- **MIDI clips can live on the timeline.** Dragging a MIDI cell onto a lane
-  copies its notes into a timeline clip with its own loop region, and the block
-  draws those notes. Audio clips work the same way. Editing either side never
-  reaches the other, because a drag carries a snapshot of the material.
-- **Drag and drop is one gesture in both directions.** Press a clip to carry
-  it, release on a lane or a session cell. Within one view the clip moves;
-  across views it is copied. A plain click still launches or opens as before,
-  and a click on a timeline block never nudges it to another beat.
-- **Blocks move freely on the timeline.** The grab point stays under the
-  pointer instead of snapping the block's left edge to it, and a block can be
-  grabbed anywhere inside itself — a wide clip used to be impossible to drag.
-- **No double playback.** Where a timeline clip covers a track, the engine
-  mutes that track's session layer, so a copied clip cannot sound twice.
-- Verified with a real mouse under X11: a MIDI cell dragged to a lane, moved
-  again from the middle of its block, and clicked without moving.
+- **Host knobs now reach CLAP plugins that report a real parameter range.**
+  CLAP automation carries the parameter's *plain* value, not the knob
+  position. The rack sent the normalized `0.0..=1.0` position, so a plugin
+  whose cutoff runs `0..20000` read the top of the knob as 1 Hz and a
+  `-24..+24` semitone control as a rounding error. The knob moved, nothing
+  sounded, and — with the plugin's own window open — the 400 ms refresh
+  snapped it back. u-he instruments (Bazille, Diva, Hive, Zebra2, Repro) were
+  the visible case; every CLAP whose range is not `0..1` was affected.
+- **The conversion is measured, not guessed.** Each parameter's plain range is
+  read once with its info and used to translate both directions: knob position
+  to event value, and plugin value back to the knob.
+- Verified with a real mouse under X11 against u-he Bazille: a panel knob
+  dragged 57 % → 86 % keeps its value across the parameter refresh, and a
+  regression test asserts that a wide-range CLAP parameter follows the host.
+- Dexed (CLAP and VST3), Vital and JC303 keep behaving as before: their
+  ranges are `0..1`, where the two scales coincide.
 
 ## Screenshots
 

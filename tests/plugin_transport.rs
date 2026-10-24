@@ -303,3 +303,75 @@ fn a_stopped_transport_silences_the_hosted_plugin() {
         "the plugin keeps sounding after Stop (peak {stopped})"
     );
 }
+
+/// A CLAP parameter whose range is not `0..1` must still follow the host knob.
+///
+/// CLAP automation carries the **plain** value (`min_value .. max_value`), not
+/// the knob position. Sending the normalized value made every u-he instrument
+/// ignore the edit: the plugin read `0.8` as 0.8 Hz (or 0.8 semitones) and the
+/// knob looked like it did nothing. The 0..1 plugins that other tests use
+/// cannot catch that, so this one asks a wide-range plugin to move.
+#[test]
+fn a_host_knob_change_reaches_a_wide_range_clap_parameter() {
+    let _guard = PLUGIN_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(path) = find_plugin(&[
+        "/home/danimanx/.clap/u-he/Bazille.64.clap",
+        "/home/danimanx/.clap/u-he/Diva.64.clap",
+        "/home/danimanx/.clap/u-he/Hive.64.clap",
+        "/home/danimanx/.clap/u-he/Zebra2.64.clap",
+        "/home/danimanx/.clap/u-he/Repro-1.64.clap",
+        "/Library/Audio/Plug-Ins/CLAP/u-he/Diva.clap",
+    ]) else {
+        eprintln!("skipping: no wide-range CLAP instrument installed");
+        return;
+    };
+    let (mut runtime, input, output) = PluginRuntime::start(48_000.0);
+    let mut engine = Engine::new_with_io(
+        48_000.0,
+        EngineIo {
+            plugin_input: Some(input),
+            plugin_output: Some(output),
+            ..EngineIo::default()
+        },
+    );
+    let params = load(&mut runtime, &mut engine, path.clone(), PluginFormat::Clap);
+    let Some(first) = params.first().cloned() else {
+        eprintln!("skipping: the plugin exposes no parameters");
+        return;
+    };
+    engine.apply(Command::SetTrackPlugin {
+        track: 0,
+        active: true,
+        instrument: true,
+    });
+
+    let target = if first.value > 0.5 { 0.2 } else { 0.8 };
+    runtime.send(PluginCommand::SetParam {
+        slot: 0,
+        id: first.id,
+        value: target,
+    });
+    render(&mut engine, 48_000);
+
+    let after = refreshed_params(&mut runtime, &mut engine);
+    let value = after
+        .iter()
+        .find(|param| param.id == first.id)
+        .map(|param| param.value)
+        .unwrap_or(f32::NAN);
+    eprintln!(
+        "{} param {} ({}) {:.3} -> {:.3} (target {:.3})",
+        path.display(),
+        first.id,
+        first.name,
+        first.value,
+        value,
+        target
+    );
+    assert!(
+        (value - target).abs() < 0.05,
+        "the plugin ignored the host knob change: {value} vs {target}"
+    );
+}

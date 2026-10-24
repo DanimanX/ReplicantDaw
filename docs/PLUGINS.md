@@ -144,6 +144,13 @@ Routing rules:
 - **Host knobs are real automation.** A knob edit becomes a CLAP parameter
   event (or a VST3 `setParameter` call) applied by the plugin on the next
   block; the panel mirrors the plugin's value.
+  The rack works in normalized `0.0..=1.0`, while CLAP automation carries the
+  parameter's **plain** value (`param_info.min_value .. max_value`). Each
+  parameter's range is read with its info and the knob position is converted
+  through it, both ways: a `0..200` parameter receives `100.0` at the middle of
+  the travel and reports `0.5` back. Sending the normalized position instead
+  made every plugin whose range is not `0..1` (u-he instruments, for one)
+  ignore the edit — the knob moved and nothing sounded.
 - The sequencer and the piano roll also send note on/off to the instrument
   insert, so hosted instruments play session clips and recorded MIDI.
 

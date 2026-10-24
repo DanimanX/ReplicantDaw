@@ -752,10 +752,15 @@ impl Engine {
                 }
                 self.preview_playing = false;
                 self.preview_pos = 0;
-                // Release any notes still held by a hosted instrument.
-                for index in 0..self.plugin_off_count {
-                    let (bus, note, _) = self.plugin_offs[index];
-                    self.plugin_pending.push_event(bus, 0, [0x80, note, 0], 3);
+                // Silence hosted instruments. Releasing only the scheduled
+                // notes left anything played live — the on-screen keyboard or
+                // a MIDI controller — sustaining forever, which is the steady
+                // tone heard after pressing Stop. All Sound Off also covers
+                // notes whose note-off was lost while a clip was switched.
+                for track in 0..TRACK_COUNT {
+                    if self.track_plugin[track] {
+                        self.panic_plugin_track(track);
+                    }
                 }
                 self.plugin_off_count = 0;
             }
@@ -803,6 +808,16 @@ impl Engine {
             Command::StopClip { track } => {
                 if let Some(t) = self.tracks.get_mut(track as usize) {
                     t.active = false;
+                    if self
+                        .track_plugin
+                        .get(track as usize)
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        // A stopped clip must not leave its last note ringing
+                        // inside the hosted instrument.
+                        self.panic_plugin_track(track as usize);
+                    }
                     #[cfg(test)]
                     for voice in &mut self.voices {
                         if voice.is_active() && voice.track == track {
@@ -936,8 +951,7 @@ impl Engine {
                 // Losing the insert must not leave notes held inside the
                 // instance: they would resume the moment it is routed again.
                 if was_active && !active && self.plugin_midi {
-                    self.plugin_pending
-                        .push_event(track as u8, 0, [0xB0, 123, 0], 3);
+                    self.panic_plugin_track(track);
                 }
             }
             #[cfg(test)]
@@ -1222,6 +1236,20 @@ impl Engine {
             self.forward_note_on(track, note, velocity_byte);
             self.schedule_plugin_off(track, note, loop_step + 1);
         }
+    }
+
+    /// Ask the insert on `track` to drop everything it is playing.
+    ///
+    /// CC 123 releases held notes and CC 120 cuts their tails, so a plugin
+    /// that ignores one of them still stops. Both are fixed-size events, so
+    /// this cannot overflow the block's event list the way one note-off per
+    /// scheduled note could.
+    fn panic_plugin_track(&mut self, track: usize) {
+        let offset = self.plugin_pending.frames.saturating_sub(1);
+        self.plugin_pending
+            .push_event(track as u8, offset, [0xB0, 123, 0], 3);
+        self.plugin_pending
+            .push_event(track as u8, offset, [0xB0, 120, 0], 3);
     }
 
     /// Send a sequencer note to the track's plugin insert.
@@ -2506,6 +2534,85 @@ mod tests {
         let out = render(&mut restored, 24_000);
         let peak = out.iter().fold(0.0_f32, |m, s| m.max(s.abs()));
         assert!(peak > 0.01);
+    }
+
+    #[test]
+    fn stop_panics_every_routed_plugin() {
+        let (dry_tx, mut dry_rx) = RingBuffer::new(8);
+        let (mut wet_tx, wet_rx) = RingBuffer::new(8);
+        let mut engine = Engine::new_with_io(
+            48_000.0,
+            EngineIo {
+                plugin_input: Some(dry_tx),
+                plugin_output: Some(wet_rx),
+                ..EngineIo::default()
+            },
+        );
+        engine.apply(Command::SetTrackPlugin {
+            track: 2,
+            active: true,
+            instrument: true,
+        });
+        engine.apply(Command::Play);
+        render(&mut engine, PLUGIN_BLOCK_FRAMES * 2);
+        while dry_rx.pop().is_ok() {}
+
+        engine.apply(Command::Stop);
+        render(&mut engine, PLUGIN_BLOCK_FRAMES * 2);
+
+        let mut all_notes_off = false;
+        let mut all_sound_off = false;
+        while let Ok(block) = dry_rx.pop() {
+            for event in &block.events[..block.event_count as usize] {
+                if event.bus != 2 {
+                    continue;
+                }
+                if event.bytes[0] == 0xB0 && event.bytes[1] == 123 {
+                    all_notes_off = true;
+                }
+                if event.bytes[0] == 0xB0 && event.bytes[1] == 120 {
+                    all_sound_off = true;
+                }
+            }
+            let _ = wet_tx.push(block);
+        }
+        assert!(all_notes_off, "Stop did not send All Notes Off");
+        assert!(all_sound_off, "Stop did not send All Sound Off");
+    }
+
+    #[test]
+    fn stopping_a_clip_panics_its_plugin() {
+        let (dry_tx, mut dry_rx) = RingBuffer::new(8);
+        let (mut wet_tx, wet_rx) = RingBuffer::new(8);
+        let mut engine = Engine::new_with_io(
+            48_000.0,
+            EngineIo {
+                plugin_input: Some(dry_tx),
+                plugin_output: Some(wet_rx),
+                ..EngineIo::default()
+            },
+        );
+        engine.apply(Command::SetTrackPlugin {
+            track: 4,
+            active: true,
+            instrument: true,
+        });
+        engine.apply(Command::Play);
+        render(&mut engine, PLUGIN_BLOCK_FRAMES * 2);
+        while dry_rx.pop().is_ok() {}
+
+        engine.apply(Command::StopClip { track: 4 });
+        render(&mut engine, PLUGIN_BLOCK_FRAMES * 2);
+        let mut panicked = false;
+        while let Ok(block) = dry_rx.pop() {
+            for event in &block.events[..block.event_count as usize] {
+                if event.bus == 4 && event.bytes[0] == 0xB0 && event.bytes[1] == 120 {
+                    panicked = true;
+                }
+            }
+            let _ = wet_tx.push(block);
+        }
+        assert!(panicked, "stopping a clip did not silence its plugin");
     }
 
     #[test]

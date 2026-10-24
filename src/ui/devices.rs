@@ -1075,6 +1075,88 @@ mod panel_tests {
     use std::path::PathBuf;
 
     #[test]
+    fn dragging_a_panel_knob_sends_a_parameter_change() {
+        let (plugins, _input, _output) = PluginRuntime::start(48_000.0);
+        let mut studio = Studio::new(MidiRuntime::new(), plugins);
+        let mut state = UiState::new();
+        let mut audio = AudioRuntime::start_silent(Some("test".into()));
+        let params = vec![crate::plugins::ParamInfo {
+            id: 7,
+            name: "Cutoff".into(),
+            value: 0.5,
+            text: "50%".into(),
+        }];
+        studio.slots[0] = Some(PluginSlotInfo {
+            slot: 0,
+            name: "KNOBBY".into(),
+            vendor: "TEST".into(),
+            version: "1".into(),
+            format: PluginFormat::Clap,
+            path: PathBuf::from("/tmp/Knobby.clap"),
+            bypass: false,
+            params,
+            latency: 0,
+            is_instrument: true,
+            has_editor: false,
+            gui_open: false,
+            error: None,
+        });
+        state.instrument[0] = crate::state::InstrumentSource::Plugin;
+
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1200.0, 300.0));
+        let ctx = egui::Context::default();
+        let mut run = |events: Vec<egui::Event>| -> egui::FullOutput {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                draw(ui, screen, &mut state, &mut studio, &mut audio);
+            });
+            output.textures_delta.clear();
+            output
+        };
+
+        // The knob rect is known only after layout, so take the first frame
+        // and find the label the panel drew for the parameter.
+        let first = run(Vec::new());
+        let label_pos = first
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) if text.galley.text() == "Cutoff" => Some(text.pos),
+                _ => None,
+            })
+            .expect("the panel drew the parameter label");
+        // Labels sit at the top of the cell; the knob circle is just below.
+        let knob_center = Pos2::new(label_pos.x, label_pos.y + 26.0);
+
+        let button = |pressed: bool| egui::Event::PointerButton {
+            pos: knob_center,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        run(vec![egui::Event::PointerMoved(knob_center), button(true)]);
+        run(vec![egui::Event::PointerMoved(
+            knob_center - Vec2::new(0.0, 40.0),
+        )]);
+        run(vec![button(false)]);
+
+        let value = studio.slots[0]
+            .as_ref()
+            .and_then(|slot| slot.params.first())
+            .map(|param| param.value)
+            .unwrap_or(f32::NAN);
+        assert!(
+            value > 0.6,
+            "dragging the panel knob did not change the plugin value: {value}"
+        );
+    }
+
+    #[test]
     fn every_plugin_parameter_is_reachable_in_the_panel() {
         let (plugins, _input, _output) = PluginRuntime::start(48_000.0);
         let mut studio = Studio::new(MidiRuntime::new(), plugins);

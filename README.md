@@ -7,7 +7,7 @@ modular master chain, MIDI recording and versioned `.rproj` projects.
 Built with `eframe`/`egui` on `wgpu`; audio is rendered by `cpal` through
 lock-free `rtrb` rings.
 
-**Version 1.4.1** · MIT · Linux, macOS and Windows.
+**Version 1.4.2** · MIT · Linux, macOS and Windows.
 
 ![Replicant DAW session and arrangement](docs/screenshot.png)
 
@@ -15,21 +15,23 @@ lock-free `rtrb` rings.
 > the status reads `SILENT FALLBACK`. A fresh session starts with an empty
 > instrument slot and the plugins already scanned.
 
-## What's new in 1.4.1
+## What's new in 1.4.2
 
-- **Choosing another plugin cleans the slot first.** The previous instance is
-  retired, the engine drops its one-block plugin pipeline and any queued
-  processed audio, and the track stays silent until the new instance reports
-  in. The old sound can no longer trail under the new selection.
-- **The device chain shows every plugin parameter.** The panel used to stop
-  after the first few knobs; it now lays out the full parameter list in a
-  scrollable grid, so all controls of a large VST/CLAP are reachable without
-  opening the editor.
-- **Drag and drop between the arrangement and the session works.** The clip is
-  carried in DAW state instead of egui's per-widget payload, so it survives
-  crossing from one panel to the other. Drop targets highlight, the ghost block
-  follows the pointer, and the move is verified by simulated-input tests.
-- **Donation link restored** in the README.
+- **The knobs in the device chain now move the plugin.** CLAP has no
+  host-side `set_value`: parameter automation is a `ParamValueEvent` on the
+  processor's input list. The host only updated its own mirror, so the knobs
+  looked alive while the plugin never heard them. Changes are now queued and
+  delivered at the start of the next block. Verified against Dexed: a host
+  change survives a parameter refresh (1.000 → 0.100).
+- **Stop silences hosted instruments.** Only scheduled notes were released, so
+  anything played live — the on-screen keyboard or a MIDI controller — kept
+  droning after the transport stopped. Stop (and stopping a clip, and
+  unloading) now sends All Notes Off and All Sound Off to every routed insert.
+  Verified with a held note in CLAP and VST3: 0.27 peak while playing,
+  0.000000 after Stop.
+- **Control changes reach CLAP plugins as MIDI.** They used to be mapped onto
+  parameter indexes, so CC 120/123 poked knobs instead of stopping voices.
+  Pitch bend is forwarded too.
 
 ## Screenshots
 

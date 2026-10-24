@@ -135,7 +135,15 @@ Routing rules:
 - **Instruments** are the track's only generator, so loading another plugin
   into the same slot replaces the previous instance.
 - **MIDI → PLUGINS** in the MIDI window forwards live notes, CC and pitch bend
-  to the insert on the selected input track. It is on by default.
+  to the insert on the selected input track. It is on by default. CLAP
+  receives control changes as MIDI events, not as parameter automation.
+- **Stopping is a panic, not just a pause.** Stop, stopping a clip and
+  unloading an insert send All Notes Off (CC 123) and All Sound Off (CC 120)
+  to every routed plugin, so notes played live or left over from a busy
+  sequence cannot keep ringing.
+- **Host knobs are real automation.** A knob edit becomes a CLAP parameter
+  event (or a VST3 `setParameter` call) applied by the plugin on the next
+  block; the panel mirrors the plugin's value.
 - The sequencer and the piano roll also send note on/off to the instrument
   insert, so hosted instruments play session clips and recorded MIDI.
 

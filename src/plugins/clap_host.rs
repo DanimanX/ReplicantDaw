@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use clack_common::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
+use clack_common::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_common::events::io::EventBuffer;
 use clack_common::events::{Match, Pckn};
 use clack_extensions::audio_ports::PluginAudioPorts;
@@ -307,6 +307,14 @@ pub struct ClapInstance {
     vendor: String,
     version: String,
     params: Vec<ParamInfo>,
+    /// Parameter changes queued by the host, delivered as CLAP parameter
+    /// events at the start of the next block.
+    ///
+    /// CLAP has no host-side `set_value`: parameter automation is expressed as
+    /// `ParamValueEvent`s on the processor's input event list. Updating only
+    /// the mirrored `params` made the host knobs look alive while the plugin
+    /// never heard them.
+    pending_params: Vec<(u32, f32)>,
     /// Whether the plugin declares an audio input port (used for wiring).
     has_audio_input: bool,
     /// Whether the plugin is a generator rather than a track effect.
@@ -764,6 +772,7 @@ impl ClapInstance {
             vendor,
             version,
             params,
+            pending_params: Vec::new(),
             has_audio_input,
             is_instrument,
             sample_rate,
@@ -868,9 +877,43 @@ impl ClapInstance {
     }
 
     pub fn set_param(&mut self, id: u32, value: f32) {
+        let value = value.clamp(0.0, 1.0);
         if let Some(param) = self.params.iter_mut().find(|param| param.id == id) {
-            param.value = value.clamp(0.0, 1.0);
+            param.value = value;
             param.text = format!("{:.2}", param.value);
+        }
+        // Queue the change for the plugin itself. Repeated edits of the same
+        // parameter collapse into the last value, so dragging a knob cannot
+        // overflow the event list.
+        if let Some(entry) = self
+            .pending_params
+            .iter_mut()
+            .find(|(pending, _)| *pending == id)
+        {
+            entry.1 = value;
+        } else {
+            self.pending_params.push((id, value));
+        }
+    }
+
+    /// Drop automation older than the current block, keeping the event list
+    /// inside its fixed capacity.
+    fn queue_pending_params(&mut self) {
+        if self.pending_params.len() > super::MAX_BLOCK_EVENTS / 2 {
+            let keep = super::MAX_BLOCK_EVENTS / 2;
+            let excess = self.pending_params.len() - keep;
+            self.pending_params.drain(..excess);
+        }
+        let Self {
+            events,
+            pending_params,
+            ..
+        } = self;
+        for (id, value) in pending_params.drain(..).take(super::MAX_BLOCK_EVENTS / 2) {
+            events.push(
+                &ParamValueEvent::new(0, ClapId::new(id), Pckn::match_all(), value as f64)
+                    .as_unknown(),
+            );
         }
     }
 
@@ -1193,12 +1236,19 @@ impl ClapInstance {
         right: &mut [f32],
         events: &[BlockEvent],
     ) -> Result<(), String> {
-        let Some(processor) = self.processor.as_mut() else {
+        // Build the event list for this block. Host parameter changes go
+        // first, so a knob edit lands at the same sample as any note it
+        // accompanies. This runs before the processor borrow, because both
+        // borrow `self`.
+        self.events.clear();
+        self.queue_pending_params();
+        let ClapInstance {
+            processor: Some(processor),
+            ..
+        } = self
+        else {
             return Err("CLAP processor is not active".into());
         };
-
-        // Build the event list for this block.
-        self.events.clear();
         for event in events {
             let bytes = &event.bytes[..event.len as usize];
             if bytes.len() < 3 {
@@ -1221,20 +1271,21 @@ impl ClapInstance {
                     );
                 }
                 0xb0 => {
-                    // Treat CC as a parameter change when the plugin exposes a
-                    // matching parameter index; otherwise ignore it.
-                    if let Some(param) = self.params.get(bytes[1] as usize) {
-                        let id = ClapId::new(param.id);
-                        self.events.push(
-                            &ParamValueEvent::new(
-                                event.offset as u32,
-                                id,
-                                Pckn::match_all(),
-                                bytes[2] as f64 / 127.0,
-                            )
+                    // Control changes are MIDI, not parameter automation.
+                    // Mapping them onto parameters by index meant CC 120/123
+                    // (All Sound Off / All Notes Off) poked whichever knob sat
+                    // at that index and never reached the plugin's voice
+                    // allocator, so a held note survived Stop.
+                    self.events.push(
+                        &MidiEvent::new(event.offset as u32, 0, [bytes[0], bytes[1], bytes[2]])
                             .as_unknown(),
-                        );
-                    }
+                    );
+                }
+                0xe0 => {
+                    self.events.push(
+                        &MidiEvent::new(event.offset as u32, 0, [bytes[0], bytes[1], bytes[2]])
+                            .as_unknown(),
+                    );
                 }
                 _ => {}
             }

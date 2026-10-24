@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 
-use crate::audio::messages::{Command, RecordedClip, RecordedNote, TRACK_COUNT};
+use crate::audio::messages::{ArrangementKind, Command, RecordedClip, RecordedNote, TRACK_COUNT};
 use crate::audio::{db_to_gain, AudioRuntime, MidiMessage, MidiRuntime};
 use crate::plugins::{
     scan_all, ParamInfo, PluginCommand, PluginDescriptor, PluginEvent, PluginRuntime,
@@ -19,9 +19,10 @@ use crate::plugins::{
 };
 use crate::project::{Project, ProjectPlugin};
 use crate::samples::{
-    list_directory, ClipDrag, DecodedSample, DropTarget, SampleClip, SampleEntry, SampleSlot,
+    list_directory, ClipDrag, DecodedSample, DragContent, DropTarget, SampleClip, SampleEntry,
+    SampleSlot,
 };
-use crate::state::UiState;
+use crate::state::{ArrangementContent, UiState};
 
 pub const MAX_STATUS_CHARS: usize = 160;
 
@@ -365,10 +366,27 @@ impl Studio {
             let clip = SampleClip::from_tone(name, hz, seconds, rate);
             state.add_arrangement_clip(track, start, clip, true, -2.0);
         }
+        // One MIDI block, so the screenshot shows that both kinds of clip
+        // live on the timeline and each draws its own material.
+        let notes: Vec<RecordedNote> = [0u16, 4, 8, 12]
+            .into_iter()
+            .enumerate()
+            .map(|(index, start_step)| RecordedNote {
+                note: [60u8, 63, 67, 70][index],
+                velocity: 100,
+                start_step,
+                length_steps: 2,
+            })
+            .collect();
+        state.add_arrangement_midi(1, 48, "RIFF".to_string(), notes, 0, 16);
         self.sync_arrangement(state, audio);
     }
 
     /// Mirror the UI's arrangement clips into the audio engine.
+    ///
+    /// The arrangement is a space of its own: every block owns its material,
+    /// whether that is a sample buffer or a copied note list, so the engine
+    /// never has to consult the session matrix to play the timeline.
     pub fn sync_arrangement(&self, state: &UiState, audio: &mut AudioRuntime) {
         let clips = state
             .arrangement
@@ -377,9 +395,27 @@ impl Studio {
                 track: clip.track as u8,
                 start_step: clip.start_step,
                 length_steps: clip.length_steps,
-                sample: Arc::clone(&clip.clip.buffer),
-                loop_enabled: clip.loop_enabled,
-                gain: db_to_gain(clip.gain_db),
+                kind: match &clip.content {
+                    ArrangementContent::Audio {
+                        clip,
+                        loop_enabled,
+                        gain_db,
+                    } => ArrangementKind::Audio {
+                        sample: Arc::clone(&clip.buffer),
+                        loop_enabled: *loop_enabled,
+                        gain: db_to_gain(*gain_db),
+                    },
+                    ArrangementContent::Midi {
+                        notes,
+                        loop_start,
+                        loop_end,
+                        ..
+                    } => ArrangementKind::Midi {
+                        clip: Box::new(clip_from_notes(notes)),
+                        loop_start: *loop_start,
+                        loop_end: *loop_end,
+                    },
+                },
             })
             .collect();
         let _ = audio.command_tx.push(Command::SetArrangement { clips });
@@ -458,7 +494,12 @@ impl Studio {
         true
     }
 
-    /// Move a clip to `target`, whatever views the two ends live in.
+    /// Move or copy a clip to `target`, whatever views the two ends live in.
+    ///
+    /// Within a view a clip moves; across views it is copied. The session
+    /// matrix and the arrangement are independent spaces, so dragging a block
+    /// onto the timeline leaves the matrix slot alone, and the engine silences
+    /// the session layer wherever a timeline clip covers it.
     pub fn apply_clip_drop(
         &mut self,
         state: &mut UiState,
@@ -476,44 +517,88 @@ impl Studio {
             }
             (
                 ClipDrag::Session {
-                    track: source_track,
+                    track: from,
                     scene,
-                    clip,
+                    content: DragContent::Audio(clip),
                 },
                 DropTarget::Arrangement { track, start_step },
             ) => {
-                // Moving a clip to the arrangement takes it out of the matrix,
-                // so the same sample cannot sound from both views.
+                // The matrix keeps its clip; the timeline gets its own copy
+                // with the slot's current loop and trim settings.
                 let (loop_enabled, gain_db) = state
-                    .sample_slot(source_track, scene)
+                    .sample_slot(from, scene)
                     .map(|slot| (slot.loop_enabled, slot.gain_db))
                     .unwrap_or((true, 0.0));
-                self.clear_sample(state, audio, source_track, scene);
-                if state.launched[source_track] == Some(scene as u8) {
-                    state.launched[source_track] = None;
-                    let _ = audio.command_tx.push(Command::StopClip {
-                        track: source_track as u8,
-                    });
-                }
                 state.add_arrangement_clip(track, start_step, clip, loop_enabled, gain_db);
+                self.sync_arrangement(state, audio);
+            }
+            (
+                ClipDrag::Session {
+                    content:
+                        DragContent::Midi {
+                            name,
+                            notes,
+                            loop_start,
+                            loop_end,
+                        },
+                    ..
+                },
+                DropTarget::Arrangement { track, start_step },
+            ) => {
+                state.add_arrangement_midi(track, start_step, name, notes, loop_start, loop_end);
                 self.sync_arrangement(state, audio);
             }
             (
                 ClipDrag::Session {
                     track: from,
                     scene,
-                    clip,
+                    content,
                 },
                 DropTarget::Session { track, scene: to },
-            ) => {
-                self.clear_sample(state, audio, from, scene);
-                self.assign_sample(state, audio, track, to, clip);
-            }
-            (ClipDrag::Arrangement { id, clip }, DropTarget::Session { track, scene }) => {
-                if state.remove_arrangement_clip(id).is_some() {
-                    self.sync_arrangement(state, audio);
+            ) => match content {
+                DragContent::Audio(clip) => {
+                    self.clear_sample(state, audio, from, scene);
+                    self.assign_sample(state, audio, track, to, clip);
                 }
-                self.assign_sample(state, audio, track, scene, clip);
+                DragContent::Midi {
+                    notes,
+                    loop_start,
+                    loop_end,
+                    ..
+                } => {
+                    self.clear_session_midi(state, audio, from, scene);
+                    self.assign_session_midi(
+                        state,
+                        audio,
+                        track,
+                        to,
+                        notes,
+                        (loop_start, loop_end),
+                    );
+                }
+            },
+            (ClipDrag::Arrangement { content, .. }, DropTarget::Session { track, scene }) => {
+                // The timeline block stays put; the matrix receives a copy.
+                match content {
+                    DragContent::Audio(clip) => {
+                        self.assign_sample(state, audio, track, scene, clip);
+                    }
+                    DragContent::Midi {
+                        notes,
+                        loop_start,
+                        loop_end,
+                        ..
+                    } => {
+                        self.assign_session_midi(
+                            state,
+                            audio,
+                            track,
+                            scene,
+                            notes,
+                            (loop_start, loop_end),
+                        );
+                    }
+                }
             }
             (ClipDrag::Arrangement { id, .. }, DropTarget::Arrangement { track, start_step }) => {
                 state.move_arrangement_clip(id, track, start_step);
@@ -522,7 +607,48 @@ impl Studio {
         }
     }
 
-    /// Move an arrangement clip into a session cell (kept for tests and callers
+    /// Put a MIDI clip in a session slot and hand it to the engine.
+    ///
+    /// A slot holds one kind of clip, so the destination drops any sample it
+    /// had instead of layering audio and notes.
+    pub fn assign_session_midi(
+        &mut self,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+        track: usize,
+        scene: usize,
+        notes: Vec<RecordedNote>,
+        loop_region: (u16, u16),
+    ) {
+        if state.sample_slot(track, scene).is_some() {
+            self.clear_sample(state, audio, track, scene);
+        }
+        state.set_recorded(track, scene, notes);
+        state.set_clip_loop(track, scene, loop_region.0, loop_region.1);
+        state.recorded_active[track][scene] = true;
+        sync_track_notes(state, audio, track, scene);
+        sync_clip_loop(state, audio, track, scene);
+    }
+
+    /// Remove one slot's MIDI clip and stop it in the engine.
+    fn clear_session_midi(
+        &mut self,
+        state: &mut UiState,
+        audio: &mut AudioRuntime,
+        track: usize,
+        scene: usize,
+    ) {
+        state.clear_recorded(track, scene);
+        sync_track_notes(state, audio, track, scene);
+        if state.launched[track] == Some(scene as u8) {
+            state.launched[track] = None;
+            let _ = audio
+                .command_tx
+                .push(Command::StopClip { track: track as u8 });
+        }
+    }
+
+    /// Copy an arrangement clip into a session cell (kept for tests and callers
     /// that already know both ends).
     pub fn move_arrangement_to_session(
         &mut self,
@@ -532,11 +658,22 @@ impl Studio {
         track: usize,
         scene: usize,
     ) {
-        let Some(clip) = state.remove_arrangement_clip(id) else {
+        let Some(clip) = state.arrangement_clip(id).cloned() else {
             return;
         };
-        self.sync_arrangement(state, audio);
-        self.assign_sample(state, audio, track, scene, clip.clip);
+        match clip.content {
+            ArrangementContent::Audio { clip, .. } => {
+                self.assign_sample(state, audio, track, scene, clip);
+            }
+            ArrangementContent::Midi {
+                notes,
+                loop_start,
+                loop_end,
+                ..
+            } => {
+                self.assign_session_midi(state, audio, track, scene, notes, (loop_start, loop_end));
+            }
+        }
     }
 
     /// Delete one arrangement clip.
@@ -1148,31 +1285,56 @@ impl Studio {
                 }
             }
 
-            // Restore arrangement audio after the session slots, so a clip
-            // that was saved on the timeline keeps its own sample data.
+            // Restore arrangement clips after the session slots, so a block
+            // that was saved on the timeline keeps its own material.
             for entry in &track.arrangement {
-                match DecodedSample::load(&entry.path) {
-                    Ok(mut sample) => {
-                        sample.edits = entry.edits();
-                        let clip = sample.to_clip(audio.sample_rate);
-                        let length = if entry.length_steps == 0 {
-                            state.steps_for_duration(clip.duration_secs(), entry.start_step)
-                        } else {
-                            entry.length_steps
-                        };
-                        state.add_arrangement_clip_with_length(
-                            index,
-                            entry.start_step,
-                            length,
-                            clip,
-                            entry.loop_enabled,
-                            entry.slot_gain_db,
-                        );
+                if let Some(path) = &entry.path {
+                    match DecodedSample::load(path) {
+                        Ok(mut sample) => {
+                            sample.edits = entry.edits();
+                            let clip = sample.to_clip(audio.sample_rate);
+                            let length = if entry.length_steps == 0 {
+                                state.steps_for_duration(clip.duration_secs(), entry.start_step)
+                            } else {
+                                entry.length_steps
+                            };
+                            state.add_arrangement_clip_with_length(
+                                index,
+                                entry.start_step,
+                                length,
+                                clip,
+                                entry.loop_enabled,
+                                entry.slot_gain_db,
+                            );
+                        }
+                        Err(error) => self.log_error(format!(
+                            "Could not restore arrangement clip '{}': {error}",
+                            path.display()
+                        )),
                     }
-                    Err(error) => self.log_error(format!(
-                        "Could not restore arrangement clip '{}': {error}",
-                        entry.path.display()
-                    )),
+                } else if !entry.notes.is_empty() {
+                    // MIDI timeline clips carry their notes in the project, so
+                    // they no longer depend on a session slot existing.
+                    let length = if entry.length_steps == 0 {
+                        entry.loop_end.saturating_sub(entry.loop_start).max(1)
+                    } else {
+                        entry.length_steps
+                    };
+                    state.insert_arrangement_clip(
+                        index,
+                        entry.start_step,
+                        length,
+                        ArrangementContent::Midi {
+                            name: if entry.name.is_empty() {
+                                "TIMELINE".to_string()
+                            } else {
+                                entry.name.clone()
+                            },
+                            notes: entry.notes.clone(),
+                            loop_start: entry.loop_start,
+                            loop_end: entry.loop_end,
+                        },
+                    );
                 }
             }
 
@@ -1182,6 +1344,9 @@ impl Studio {
             state.clip_fade_out[index] = track.fade_out;
             sync_track_clip(state, audio, index);
         }
+
+        // Timeline clips only reach the engine once every track has loaded.
+        self.sync_arrangement(state, audio);
 
         for plugin in &project.plugins {
             let Some(descriptor) = self
@@ -1446,14 +1611,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_clip_moves_between_the_session_and_the_arrangement() {
+    fn a_clip_copies_from_the_session_to_the_arrangement() {
         let midi = MidiRuntime::new();
         let (plugins, _plugin_in, _plugin_out) = PluginRuntime::start(48_000.0);
         let mut studio = Studio::new(midi, plugins);
         let mut audio = AudioRuntime::start_silent(Some("test".into()));
         let mut state = UiState::new();
 
-        let clip = SampleClip::from_tone("MOVE ME", 220.0, 0.5, 48_000);
+        let clip = SampleClip::from_tone("COPY ME", 220.0, 0.5, 48_000);
         studio.assign_sample(&mut state, &mut audio, 1, 1, clip);
         let clip = state.sample_clip(1, 1).cloned().expect("session sample");
 
@@ -1463,7 +1628,7 @@ mod tests {
             ClipDrag::Session {
                 track: 1,
                 scene: 1,
-                clip,
+                content: DragContent::Audio(clip),
             },
             DropTarget::Arrangement {
                 track: 3,
@@ -1471,8 +1636,8 @@ mod tests {
             },
         );
         assert!(
-            state.sample_clip(1, 1).is_none(),
-            "the session copy must be gone after moving to the timeline"
+            state.sample_clip(1, 1).is_some(),
+            "the matrix slot must keep its clip: the timeline gets a copy"
         );
         let placed = state
             .arrangement
@@ -1483,11 +1648,72 @@ mod tests {
         assert_eq!(placed.start_step, 32);
 
         studio.move_arrangement_to_session(&mut state, &mut audio, placed.id, 2, 4);
-        assert!(state.arrangement.is_empty());
+        assert_eq!(
+            state.arrangement.len(),
+            1,
+            "copying into a slot must leave the timeline block in place"
+        );
         assert!(
             state.sample_clip(2, 4).is_some(),
             "the clip must land in the session cell"
         );
+    }
+
+    #[test]
+    fn a_midi_clip_copies_from_the_matrix_to_the_timeline() {
+        let midi = MidiRuntime::new();
+        let (plugins, _plugin_in, _plugin_out) = PluginRuntime::start(48_000.0);
+        let mut studio = Studio::new(midi, plugins);
+        let mut audio = AudioRuntime::start_silent(Some("test".into()));
+        let mut state = UiState::new();
+
+        let notes = vec![RecordedNote {
+            note: 60,
+            velocity: 100,
+            start_step: 0,
+            length_steps: 4,
+        }];
+        state.set_recorded(2, 3, notes.clone());
+        state.set_clip_loop(2, 3, 0, 16);
+
+        studio.apply_clip_drop(
+            &mut state,
+            &mut audio,
+            ClipDrag::Session {
+                track: 2,
+                scene: 3,
+                content: DragContent::Midi {
+                    name: "SCENE".into(),
+                    notes: notes.clone(),
+                    loop_start: 0,
+                    loop_end: 16,
+                },
+            },
+            DropTarget::Arrangement {
+                track: 5,
+                start_step: 48,
+            },
+        );
+
+        assert_eq!(
+            state.recorded_notes(2, 3),
+            notes.as_slice(),
+            "the matrix slot must keep its notes"
+        );
+        let placed = state
+            .arrangement
+            .iter()
+            .find(|entry| entry.track == 5)
+            .cloned()
+            .expect("timeline clip");
+        assert_eq!(placed.start_step, 48);
+        assert_eq!(placed.length_steps, 16);
+        assert_eq!(placed.content.notes(), notes.as_slice());
+        assert_eq!(placed.content.loop_region(), Some((0, 16)));
+
+        // Editing the matrix afterwards must not reach the timeline copy.
+        state.clear_recorded(2, 3);
+        assert_eq!(placed.content.notes().len(), 1);
     }
 
     #[test]

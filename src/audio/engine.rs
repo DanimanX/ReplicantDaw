@@ -10,9 +10,9 @@ use super::effects::EffectSlot;
 use std::sync::Arc;
 
 use super::messages::{
-    db_to_gain, ArrangementClip, Command, EffectKind, RecordEvent, RecordedClip, RecordedNote,
-    SampleBuffer, SampleUpload, Telemetry, LOOP_STEPS, MAX_EFFECTS, PREVIEW_TRACK, SCENE_COUNT,
-    STEPS_PER_BAR, TRACK_COUNT,
+    db_to_gain, ArrangementClip, ArrangementKind, Command, EffectKind, RecordEvent, RecordedClip,
+    RecordedNote, SampleBuffer, SampleUpload, Telemetry, LOOP_STEPS, MAX_EFFECTS, PREVIEW_TRACK,
+    SCENE_COUNT, STEPS_PER_BAR, TRACK_COUNT,
 };
 use super::midi::MidiMessage;
 #[cfg(test)]
@@ -413,7 +413,19 @@ impl Engine {
             // Audio samples play from their clip slot, one-shot per launch
             // (and retriggered when the 16-bar session wraps).
             if self.playing {
+                let step_frames = self.samples_per_step();
+                let step_pos = self.position as f64 / step_frames;
                 for index in 0..TRACK_COUNT {
+                    // Arrangement clips play at their absolute timeline
+                    // position, independent of whichever session slot the
+                    // track launched. Where an arrangement clip covers the
+                    // step it wins, and the session layer steps aside so the
+                    // same material cannot be heard twice after a copy.
+                    let (left, right, covered) =
+                        self.arrangement_sample(index, step_pos, step_frames);
+                    track_l[index] += left;
+                    track_r[index] += right;
+
                     if !self.tracks[index].active {
                         continue;
                     }
@@ -438,20 +450,15 @@ impl Engine {
                         // until the region wraps and retriggers it.
                         position %= frames;
                     }
+                    // The slot keeps its own time under the arrangement, so it
+                    // resumes in phase when the timeline clip releases it.
+                    self.tracks[index].sample_pos = position + 1;
+                    if covered {
+                        continue;
+                    }
                     let gain = self.sample_gain[index][scene];
                     track_l[index] += sample.frames[position * 2] * gain;
                     track_r[index] += sample.frames[position * 2 + 1] * gain;
-                    self.tracks[index].sample_pos = position + 1;
-                }
-
-                // Arrangement clips play at their absolute timeline position,
-                // independent of which session slot a track has launched.
-                let step_frames = self.samples_per_step();
-                let step_pos = self.position as f64 / step_frames;
-                for index in 0..TRACK_COUNT {
-                    let (left, right) = self.arrangement_sample(index, step_pos, step_frames);
-                    track_l[index] += left;
-                    track_r[index] += right;
                 }
             }
 
@@ -1077,10 +1084,20 @@ impl Engine {
     }
 
     /// Audio from arrangement clips whose timeline range contains `step_pos`.
+    ///
+    /// Also reports whether any arrangement clip covers the track at that
+    /// position: when one does, the session layer steps aside so the same
+    /// material cannot be heard twice.
     #[inline]
-    fn arrangement_sample(&self, track: usize, step_pos: f64, step_frames: f64) -> (f32, f32) {
+    fn arrangement_sample(
+        &self,
+        track: usize,
+        step_pos: f64,
+        step_frames: f64,
+    ) -> (f32, f32, bool) {
         let mut left = 0.0_f32;
         let mut right = 0.0_f32;
+        let mut covered = false;
         for clip in self.arrangement[..self.arrangement_len].iter().flatten() {
             if clip.track as usize != track {
                 continue;
@@ -1090,13 +1107,22 @@ impl Engine {
             if step_pos < start || step_pos >= end {
                 continue;
             }
-            let frames = clip.sample.frame_count();
+            covered = true;
+            let ArrangementKind::Audio {
+                sample,
+                loop_enabled,
+                gain,
+            } = &clip.kind
+            else {
+                continue;
+            };
+            let frames = sample.frame_count();
             if frames == 0 {
                 continue;
             }
             let offset = ((step_pos - start) * step_frames).round().max(0.0) as usize;
             let position = if offset >= frames {
-                if clip.loop_enabled {
+                if *loop_enabled {
                     offset % frames
                 } else {
                     continue;
@@ -1104,11 +1130,24 @@ impl Engine {
             } else {
                 offset
             };
-            let gain = clip.gain.clamp(0.0, 2.0);
-            left += clip.sample.frames[position * 2] * gain;
-            right += clip.sample.frames[position * 2 + 1] * gain;
+            let gain = gain.clamp(0.0, 2.0);
+            left += sample.frames[position * 2] * gain;
+            right += sample.frames[position * 2 + 1] * gain;
         }
-        (left, right)
+        (left, right, covered)
+    }
+
+    /// Whether an arrangement clip of any kind covers `track` at `step`.
+    #[inline]
+    fn arrangement_covers_step(&self, track: usize, step: u16) -> bool {
+        self.arrangement[..self.arrangement_len]
+            .iter()
+            .flatten()
+            .any(|clip| {
+                clip.track as usize == track
+                    && step >= clip.start_step
+                    && step < clip.start_step.saturating_add(clip.length_steps.max(1))
+            })
     }
 
     #[inline]
@@ -1165,11 +1204,19 @@ impl Engine {
         // Release plugin notes whose gate ended on this step.
         self.release_plugin_notes(loop_step);
 
+        // Arrangement MIDI clips play on the absolute timeline, independent of
+        // whichever session slot a track happens to have launched.
+        self.trigger_arrangement_notes(loop_step);
+
         for (track, spec) in TRACKS.iter().enumerate() {
             let _ = spec;
             if !self.tracks[track].active {
                 continue;
             }
+
+            // A timeline clip covering this step owns the track, so the session
+            // layer stays silent underneath it.
+            let covered = self.arrangement_covers_step(track, loop_step);
 
             // Recorded MIDI replaces the generative pattern for this slot, and
             // plays inside its loop region on its own playhead.
@@ -1181,7 +1228,7 @@ impl Engine {
             if !clip.is_empty() {
                 let muted = !self.recorded_active[track][scene];
 
-                if !muted {
+                if !muted && !covered {
                     for note in clip.as_slice() {
                         if note.start_step != phase {
                             continue;
@@ -1216,7 +1263,9 @@ impl Engine {
             if next >= end {
                 self.tracks[track].sample_pos = 0;
             }
-
+            if covered {
+                continue;
+            }
             // A sample slot replaces the generative pattern: otherwise the
             // internal synth would keep playing under the dragged sample.
             if self.clip_samples[clip_index(track, scene)].is_some() {
@@ -1250,6 +1299,68 @@ impl Engine {
             .push_event(track as u8, offset, [0xB0, 123, 0], 3);
         self.plugin_pending
             .push_event(track as u8, offset, [0xB0, 120, 0], 3);
+    }
+
+    /// Trigger notes from arrangement MIDI clips covering the current step.
+    fn trigger_arrangement_notes(&mut self, step: u16) {
+        // Collect first: firing a note mutates the engine, so the clip buffer
+        // cannot stay borrowed across the calls. The buffer is fixed-size, so
+        // this stays allocation-free on the audio thread.
+        let mut pending: [(u8, u8, u8, u16, u16); 64] = [(0, 0, 0, 0, 1); 64];
+        let mut count = 0usize;
+        for clip in self.arrangement[..self.arrangement_len].iter().flatten() {
+            let ArrangementKind::Midi {
+                clip: notes,
+                loop_start,
+                loop_end,
+            } = &clip.kind
+            else {
+                continue;
+            };
+            if step < clip.start_step
+                || step >= clip.start_step.saturating_add(clip.length_steps.max(1))
+            {
+                continue;
+            }
+            let region = loop_end.saturating_sub(*loop_start).max(1);
+            // Map the timeline position into the clip's own loop, so a copy of
+            // a short loop repeats instead of stretching.
+            let local = loop_start.saturating_add((step - clip.start_step) % region);
+            for note in notes.as_slice() {
+                if note.start_step != local {
+                    continue;
+                }
+                if count >= pending.len() {
+                    break;
+                }
+                let delta = (note.end_step().saturating_sub(local)) % region;
+                pending[count] = (
+                    clip.track,
+                    note.note,
+                    note.velocity,
+                    step.saturating_add(delta),
+                    note.length_steps.max(1),
+                );
+                count += 1;
+            }
+        }
+
+        let _step_samples = self.samples_per_step();
+        for &(track, note, velocity, end_step, _length_steps) in &pending[..count] {
+            let track = track as usize;
+            if track >= TRACK_COUNT {
+                continue;
+            }
+            #[cfg(test)]
+            {
+                let gate = (_step_samples * _length_steps as f64).round().max(1.0) as u32;
+                let velocity = (velocity as f32 / 127.0).clamp(0.05, 1.0);
+                let spec = &TRACKS[track];
+                self.trigger_note(track, note, velocity, gate, spec);
+            }
+            self.forward_note_on(track, note, velocity);
+            self.schedule_plugin_off(track, note, end_step);
+        }
     }
 
     /// Send a sequencer note to the track's plugin insert.
@@ -1694,12 +1805,14 @@ mod tests {
                 track: 0,
                 start_step: 16,
                 length_steps: 16,
-                sample: Arc::new(SampleBuffer {
-                    frames: data,
-                    sample_rate: 48_000,
-                }),
-                loop_enabled: true,
-                gain: 1.0,
+                kind: ArrangementKind::Audio {
+                    sample: Arc::new(SampleBuffer {
+                        frames: data,
+                        sample_rate: 48_000,
+                    }),
+                    loop_enabled: true,
+                    gain: 1.0,
+                },
             }],
         });
         let _ = &mut sample_tx;
@@ -2509,6 +2622,74 @@ mod tests {
         engine.apply(Command::LaunchClip { track: 0, scene: 3 });
         let out = render(&mut engine, 24_000);
         assert!(out.iter().any(|sample| sample.abs() > 0.005));
+    }
+
+    #[test]
+    fn arrangement_midi_clip_plays_at_its_timeline_position() {
+        let mut engine = Engine::offline(48_000.0);
+        // Silence every session slot, so the timeline is the only source.
+        for track in 0..TRACK_COUNT {
+            engine.apply(Command::StopClip { track: track as u8 });
+        }
+        engine.apply(Command::SetBpm(120.0));
+        let mut notes = RecordedClip::default();
+        notes.push(RecordedNote {
+            note: 60,
+            velocity: 110,
+            start_step: 0,
+            length_steps: 4,
+        });
+        engine.apply(Command::SetArrangement {
+            clips: vec![ArrangementClip {
+                track: 0,
+                start_step: 16,
+                length_steps: 16,
+                kind: ArrangementKind::Midi {
+                    clip: Box::new(notes),
+                    loop_start: 0,
+                    loop_end: 16,
+                },
+            }],
+        });
+        engine.apply(Command::Play);
+
+        // At 120 BPM a 16th note is 0.125 s: step 16 is second 2.
+        let before = render(&mut engine, 72_000);
+        assert!(
+            peak(&before) < 1e-4,
+            "the timeline clip sounded before its start"
+        );
+
+        let during = render(&mut engine, 48_000);
+        assert!(
+            peak(&during) > 0.005,
+            "the timeline MIDI clip did not sound at its position"
+        );
+    }
+
+    #[test]
+    fn a_timeline_clip_covers_only_its_own_steps_and_track() {
+        let mut engine = Engine::offline(48_000.0);
+        engine.apply(Command::SetArrangement {
+            clips: vec![ArrangementClip {
+                track: 2,
+                start_step: 16,
+                length_steps: 8,
+                kind: ArrangementKind::Midi {
+                    clip: Box::new(RecordedClip::default()),
+                    loop_start: 0,
+                    loop_end: 8,
+                },
+            }],
+        });
+        assert!(!engine.arrangement_covers_step(2, 15));
+        assert!(engine.arrangement_covers_step(2, 16));
+        assert!(engine.arrangement_covers_step(2, 23));
+        assert!(!engine.arrangement_covers_step(2, 24));
+        assert!(
+            !engine.arrangement_covers_step(3, 20),
+            "a clip covered a track it is not on"
+        );
     }
 
     #[test]

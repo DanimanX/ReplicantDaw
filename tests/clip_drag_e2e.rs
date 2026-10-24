@@ -113,7 +113,7 @@ fn drag(h: &mut Harness, from: Pos2, to: Pos2) {
 }
 
 #[test]
-fn a_sample_moves_from_the_matrix_to_a_lane() {
+fn a_sample_copies_from_the_matrix_to_a_lane() {
     let mut h = Harness::new();
     let from = h.cell(1, 1).center();
     let to = h.lane(3).center();
@@ -121,8 +121,8 @@ fn a_sample_moves_from_the_matrix_to_a_lane() {
     drag(&mut h, from, to);
 
     assert!(
-        h.state.sample_clip(1, 1).is_none(),
-        "the session cell kept its sample after the move"
+        h.state.sample_clip(1, 1).is_some(),
+        "the matrix slot must keep its clip after copying it to the timeline"
     );
     let placed = h
         .state
@@ -135,7 +135,7 @@ fn a_sample_moves_from_the_matrix_to_a_lane() {
 }
 
 #[test]
-fn an_arrangement_clip_moves_to_a_session_cell() {
+fn an_arrangement_clip_copies_to_a_session_cell() {
     let mut h = Harness::new();
     // Long enough that its block is a comfortable press target.
     let clip = SampleClip::from_tone("TIMELINE", 330.0, 2.0, 48_000);
@@ -145,9 +145,10 @@ fn an_arrangement_clip_moves_to_a_session_cell() {
     let to = h.cell(4, 4).center();
     drag(&mut h, from, to);
 
-    assert!(
-        h.state.arrangement.is_empty(),
-        "the clip stayed on the timeline"
+    assert_eq!(
+        h.state.arrangement.len(),
+        1,
+        "the timeline block must stay where it is"
     );
     assert!(
         h.state.sample_clip(4, 4).is_some(),
@@ -198,7 +199,11 @@ fn the_overlay_reports_the_target_while_dragging() {
     );
 
     h.frame(vec![egui::Event::PointerMoved(to), press(to, false)]);
-    assert!(h.state.sample_clip(1, 1).is_none());
+    assert!(
+        h.state.sample_clip(1, 1).is_some(),
+        "the dragged clip must keep its slot"
+    );
+    assert_eq!(h.state.arrangement.len(), 1, "the drop was not committed");
 }
 
 #[test]
@@ -216,7 +221,7 @@ fn a_clip_from_the_sample_editor_can_be_dropped_on_a_lane() {
 }
 
 #[test]
-fn a_fast_flick_still_moves_the_clip() {
+fn a_fast_flick_still_copies_the_clip() {
     // Press on one frame, travel and release on the next: the gesture never
     // has a frame where the pointer is down *and* already moved, so waiting
     // for egui's drag threshold would drop it.
@@ -229,8 +234,8 @@ fn a_fast_flick_still_moves_the_clip() {
     h.frame(vec![egui::Event::PointerMoved(to), press(to, false)]);
 
     assert!(
-        h.state.sample_clip(1, 1).is_none(),
-        "the session cell kept its sample after a fast drag"
+        h.state.sample_clip(1, 1).is_some(),
+        "the matrix slot must keep its sample"
     );
     assert_eq!(h.state.arrangement.len(), 1);
     assert_eq!(h.state.arrangement[0].track, 4);
@@ -291,4 +296,122 @@ fn an_arrangement_clip_can_change_lane() {
     let moved = h.state.arrangement_clip(id).expect("clip disappeared");
     assert_eq!(moved.track, 6);
     assert!(moved.start_step > 32);
+}
+
+#[test]
+fn a_midi_clip_copies_from_the_matrix_to_a_lane() {
+    // The case the matrix has to support: a musical block, not just a sample.
+    let mut h = Harness::new();
+    let notes = vec![
+        replicant_daw::audio::RecordedNote {
+            note: 60,
+            velocity: 100,
+            start_step: 0,
+            length_steps: 4,
+        },
+        replicant_daw::audio::RecordedNote {
+            note: 67,
+            velocity: 90,
+            start_step: 8,
+            length_steps: 2,
+        },
+    ];
+    h.state.set_recorded(2, 2, notes.clone());
+    h.state.set_clip_loop(2, 2, 0, 16);
+
+    let from = h.cell(2, 2).center();
+    let to = h.lane(5).center();
+    drag(&mut h, from, to);
+
+    assert_eq!(
+        h.state.recorded_notes(2, 2),
+        notes.as_slice(),
+        "the matrix slot must keep its notes"
+    );
+    let placed = h
+        .state
+        .arrangement
+        .iter()
+        .find(|clip| clip.track == 5)
+        .expect("no MIDI clip landed on the timeline");
+    assert_eq!(placed.content.notes(), notes.as_slice());
+    assert_eq!(placed.content.loop_region(), Some((0, 16)));
+    assert_eq!(placed.length_steps, 16);
+    assert!(h.studio.clip_drag.is_none());
+}
+
+#[test]
+fn a_timeline_midi_block_moves_without_touching_the_matrix() {
+    let mut h = Harness::new();
+    let notes = vec![replicant_daw::audio::RecordedNote {
+        note: 48,
+        velocity: 80,
+        start_step: 0,
+        length_steps: 4,
+    }];
+    let id = h
+        .state
+        .add_arrangement_midi(3, 16, "SCENE".into(), notes.clone(), 0, 16);
+
+    let lane = h.lane(3);
+    let from = Pos2::new(lane.left() + lane.width() * (20.0 / 256.0), lane.center().y);
+    let to = Pos2::new(lane.left() + lane.width() * 0.5, lane.center().y);
+    drag(&mut h, from, to);
+
+    let moved = h.state.arrangement_clip(id).expect("clip disappeared");
+    assert!(
+        moved.start_step > 64,
+        "the block did not follow the pointer"
+    );
+    assert_eq!(moved.content.notes(), notes.as_slice());
+    assert!(
+        h.state.recorded_notes(3, 16).is_empty(),
+        "moving a timeline block must not write into the matrix"
+    );
+}
+
+#[test]
+fn a_block_can_be_grabbed_anywhere_inside_itself() {
+    // The lane used to stop reporting a target while the pointer was inside
+    // the source block, so a wide clip could not be dragged at all.
+    let mut h = Harness::new();
+    let clip = SampleClip::from_tone("LONG", 330.0, 2.0, 48_000);
+    let id = h.state.add_arrangement_clip(2, 64, clip, true, 0.0);
+
+    let lane = h.lane(2);
+    // Press half-way through the block, not on its left edge.
+    let from = Pos2::new(lane.left() + lane.width() * (80.0 / 256.0), lane.center().y);
+    let to = Pos2::new(
+        lane.left() + lane.width() * (144.0 / 256.0),
+        lane.center().y,
+    );
+    drag(&mut h, from, to);
+
+    let moved = h.state.arrangement_clip(id).expect("clip disappeared");
+    assert!(
+        moved.start_step >= 128,
+        "the block was stuck: a grab from its middle did not move it (step {})",
+        moved.start_step
+    );
+}
+
+#[test]
+fn a_plain_click_on_a_timeline_block_does_not_move_it() {
+    let mut h = Harness::new();
+    let clip = SampleClip::from_tone("CLICK", 330.0, 2.0, 48_000);
+    let id = h.state.add_arrangement_clip(2, 64, clip, true, 0.0);
+
+    let lane = h.lane(2);
+    // A point inside the block that is not on a beat boundary.
+    let at = Pos2::new(lane.left() + lane.width() * (73.0 / 256.0), lane.center().y);
+    h.frame(Vec::new());
+    h.frame(vec![egui::Event::PointerMoved(at), press(at, true)]);
+    h.frame(vec![press(at, false)]);
+
+    let unchanged = h.state.arrangement_clip(id).expect("clip disappeared");
+    assert_eq!(
+        unchanged.start_step, 64,
+        "a click grabbed the block and snapped it to another beat"
+    );
+    assert_eq!(h.state.arrangement.len(), 1);
 }

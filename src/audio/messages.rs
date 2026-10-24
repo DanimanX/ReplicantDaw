@@ -52,19 +52,36 @@ pub struct SampleUpload {
     pub sample: Option<Arc<SampleBuffer>>,
 }
 
-/// An audio clip placed on the arrangement timeline.
-///
-/// The buffer is uploaded once and shared with the engine through an `Arc`,
-/// so moving the clip around the UI never copies the sample.
+/// What an arrangement clip plays.
+#[derive(Clone, Debug)]
+pub enum ArrangementKind {
+    /// A rendered sample, shared with the UI through an `Arc` so moving the
+    /// clip never copies the audio.
+    Audio {
+        sample: Arc<SampleBuffer>,
+        loop_enabled: bool,
+        gain: f32,
+    },
+    /// Notes copied from a session slot, looping inside their own region.
+    ///
+    /// The note buffer is boxed because it is large and fixed-capacity: the
+    /// engine holds 64 of these slots inline, and keeping the buffer on the
+    /// heap is what lets the whole engine live on a Windows main-thread stack.
+    Midi {
+        clip: Box<RecordedClip>,
+        loop_start: u16,
+        loop_end: u16,
+    },
+}
+
+/// A clip placed on the arrangement timeline.
 #[derive(Clone, Debug)]
 pub struct ArrangementClip {
     pub track: u8,
     /// Timeline position in 16th notes, from the start of the 16-bar loop.
     pub start_step: u16,
     pub length_steps: u16,
-    pub sample: Arc<SampleBuffer>,
-    pub loop_enabled: bool,
-    pub gain: f32,
+    pub kind: ArrangementKind,
 }
 
 /// A note captured by MIDI recording or loaded from a project.

@@ -21,6 +21,8 @@
 //! - v9: the built-in synth is gone. Tracks host external CLAP/VST3 plugins
 //!   only; an old `synth` instrument id loads as an empty slot, while its
 //!   stored patch is ignored. Arrangement audio clips are part of the format.
+//! - v10: arrangement clips may hold MIDI notes as well as audio. v9 files
+//!   load unchanged, because every new field defaults to an audio clip.
 
 use std::path::{Path, PathBuf};
 
@@ -31,7 +33,7 @@ use crate::audio::TRACKS;
 use crate::samples::SampleEdits;
 
 pub const PROJECT_EXTENSION: &str = "rproj";
-pub const PROJECT_FORMAT_VERSION: u32 = 9;
+pub const PROJECT_FORMAT_VERSION: u32 = 10;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectEffect {
@@ -115,14 +117,21 @@ impl ProjectSample {
     }
 }
 
-/// One audio clip placed on the arrangement timeline.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One clip placed on the arrangement timeline.
+///
+/// A clip is either audio (a `path` plus its edit settings) or MIDI (a note
+/// list with its own loop region). The two are independent spaces: the notes
+/// are copied here when the clip is dragged from the session matrix, so later
+/// edits on either side never reach the other.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProjectArrangementClip {
     /// Timeline position in 16th notes.
     pub start_step: u16,
     #[serde(default)]
     pub length_steps: u16,
-    pub path: PathBuf,
+    /// Audio source. `None` for a MIDI clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
     #[serde(default)]
     pub gain_db: f32,
     #[serde(default)]
@@ -142,6 +151,17 @@ pub struct ProjectArrangementClip {
     /// Per-clip trim in dB.
     #[serde(default)]
     pub slot_gain_db: f32,
+    /// MIDI notes of a timeline clip, already independent of their slot.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<RecordedNote>,
+    /// Loop region of a MIDI clip, in 16th notes from the loop start.
+    #[serde(default)]
+    pub loop_start: u16,
+    #[serde(default)]
+    pub loop_end: u16,
+    /// Slot name a MIDI clip came from, used as its block label.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
 }
 
 impl ProjectArrangementClip {
@@ -502,19 +522,40 @@ impl Project {
                     .arrangement
                     .iter()
                     .filter(|clip| clip.track == index)
-                    .map(|clip| ProjectArrangementClip {
-                        start_step: clip.start_step,
-                        length_steps: clip.length_steps,
-                        path: clip.clip.path.clone(),
-                        gain_db: clip.clip.edits.gain_db,
-                        trim_start: clip.clip.edits.trim_start,
-                        trim_end: clip.clip.edits.trim_end,
-                        fade_in: clip.clip.edits.fade_in,
-                        fade_out: clip.clip.edits.fade_out,
-                        reverse: clip.clip.edits.reverse,
-                        normalize: clip.clip.edits.normalize,
-                        loop_enabled: clip.loop_enabled,
-                        slot_gain_db: clip.gain_db,
+                    .map(|clip| match &clip.content {
+                        crate::state::ArrangementContent::Audio {
+                            clip: audio,
+                            loop_enabled,
+                            gain_db,
+                        } => ProjectArrangementClip {
+                            start_step: clip.start_step,
+                            length_steps: clip.length_steps,
+                            path: Some(audio.path.clone()),
+                            gain_db: audio.edits.gain_db,
+                            trim_start: audio.edits.trim_start,
+                            trim_end: audio.edits.trim_end,
+                            fade_in: audio.edits.fade_in,
+                            fade_out: audio.edits.fade_out,
+                            reverse: audio.edits.reverse,
+                            normalize: audio.edits.normalize,
+                            loop_enabled: *loop_enabled,
+                            slot_gain_db: *gain_db,
+                            ..Default::default()
+                        },
+                        crate::state::ArrangementContent::Midi {
+                            name,
+                            notes,
+                            loop_start,
+                            loop_end,
+                        } => ProjectArrangementClip {
+                            start_step: clip.start_step,
+                            length_steps: clip.length_steps,
+                            notes: notes.clone(),
+                            loop_start: *loop_start,
+                            loop_end: *loop_end,
+                            name: name.clone(),
+                            ..Default::default()
+                        },
                     })
                     .collect(),
                 notes: Vec::new(),
@@ -638,7 +679,7 @@ mod tests {
         project.tracks[1].arrangement.push(ProjectArrangementClip {
             start_step: 48,
             length_steps: 24,
-            path: PathBuf::from("/samples/loop.wav"),
+            path: Some(PathBuf::from("/samples/loop.wav")),
             gain_db: -1.0,
             trim_start: 0.0,
             trim_end: 0.0,
@@ -648,6 +689,23 @@ mod tests {
             normalize: false,
             loop_enabled: true,
             slot_gain_db: -2.0,
+            ..Default::default()
+        });
+        // A MIDI timeline clip carries its notes in the project, so it no
+        // longer needs a session slot to exist when the file is loaded.
+        project.tracks[1].arrangement.push(ProjectArrangementClip {
+            start_step: 96,
+            length_steps: 32,
+            notes: vec![RecordedNote {
+                note: 55,
+                velocity: 96,
+                start_step: 0,
+                length_steps: 4,
+            }],
+            loop_start: 0,
+            loop_end: 32,
+            name: "VERSE".into(),
+            ..Default::default()
         });
         project.effects.push(ProjectEffect::new(EffectKind::Delay));
         project.master_gain = 0.75;
@@ -688,14 +746,26 @@ mod tests {
         assert!(loaded.tracks[1].samples[0].normalize);
         assert!(!loaded.tracks[1].samples[0].loop_enabled);
         assert!((loaded.tracks[1].samples[0].slot_gain_db + 1.5).abs() < 1e-6);
-        assert_eq!(loaded.tracks[1].arrangement.len(), 1);
-        assert_eq!(loaded.tracks[1].arrangement[0].start_step, 48);
-        assert_eq!(loaded.tracks[1].arrangement[0].length_steps, 24);
-        assert_eq!(
-            loaded.tracks[1].arrangement[0].path,
-            PathBuf::from("/samples/loop.wav")
-        );
-        assert!((loaded.tracks[1].arrangement[0].slot_gain_db + 2.0).abs() < 1e-6);
+        assert_eq!(loaded.tracks[1].arrangement.len(), 2);
+        let audio = loaded.tracks[1]
+            .arrangement
+            .iter()
+            .find(|clip| clip.path.is_some())
+            .expect("audio clip");
+        assert_eq!(audio.start_step, 48);
+        assert_eq!(audio.length_steps, 24);
+        assert_eq!(audio.path, Some(PathBuf::from("/samples/loop.wav")));
+        assert!((audio.slot_gain_db + 2.0).abs() < 1e-6);
+        let midi = loaded.tracks[1]
+            .arrangement
+            .iter()
+            .find(|clip| clip.path.is_none())
+            .expect("MIDI clip");
+        assert_eq!(midi.start_step, 96);
+        assert_eq!(midi.length_steps, 32);
+        assert_eq!(midi.notes.len(), 1);
+        assert_eq!(midi.loop_end, 32);
+        assert_eq!(midi.name, "VERSE");
         assert_eq!(loaded.effects.len(), 5);
         assert_eq!(loaded.effects[4].kind, "DELAY");
         assert!((loaded.master_gain - 0.75).abs() < 1e-6);

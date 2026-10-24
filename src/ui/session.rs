@@ -7,7 +7,7 @@ use egui::{Align2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, U
 use crate::audio::{
     db_to_gain, gain_to_db, AudioRuntime, Command, SCENE_COUNT, TRACKS, TRACK_COUNT,
 };
-use crate::samples::{ClipDrag, DropTarget, SampleClip};
+use crate::samples::{ClipDrag, DragContent, DropTarget, SampleClip};
 use crate::state::UiState;
 use crate::studio::Studio;
 use crate::theme;
@@ -263,7 +263,23 @@ pub fn draw_matrix(
             // pattern preview when the slot is empty.
             let notes = state.recorded_notes(track, scene);
             let sample = state.sample_clip(track, scene).cloned();
-            if let Some(clip) = &sample {
+            // Any non-empty slot can be carried: audio with its buffer, MIDI
+            // with its notes and loop region. Taking the snapshot at press time
+            // is what makes the destination independent of this slot.
+            let drag_content = if let Some(clip) = &sample {
+                Some(DragContent::Audio(Arc::clone(clip)))
+            } else if !notes.is_empty() {
+                let (loop_start, loop_end) = state.clip_loop(track, scene);
+                Some(DragContent::Midi {
+                    name: UiState::scene_name(scene).to_string(),
+                    notes: notes.to_vec(),
+                    loop_start,
+                    loop_end,
+                })
+            } else {
+                None
+            };
+            if let Some(content) = drag_content {
                 // The press starts the drag, not the movement: a quick flick
                 // can press, travel and release between two frames, and
                 // waiting for `drag_started` then drops the gesture entirely.
@@ -271,7 +287,7 @@ pub fn draw_matrix(
                     studio.begin_clip_drag(ClipDrag::Session {
                         track,
                         scene,
-                        clip: Arc::clone(clip),
+                        content,
                     });
                 }
             }
@@ -641,10 +657,47 @@ fn draw_midi_row(
         let response = ui.interact(
             cell,
             ui.scope_id().with(("midi_clip", track)),
-            Sense::click(),
+            Sense::click_and_drag(),
         );
         let notes = state.recorded_notes(track, scene);
         let sample = state.sample_clip(track, scene).cloned();
+
+        // The row shows the launched slot, so that is the clip a drag from it
+        // carries, and the cell a drop from the timeline lands in.
+        let drag_content = if let Some(clip) = &sample {
+            Some(DragContent::Audio(Arc::clone(clip)))
+        } else if !notes.is_empty() {
+            let (loop_start, loop_end) = state.clip_loop(track, scene);
+            Some(DragContent::Midi {
+                name: UiState::scene_name(scene).to_string(),
+                notes: notes.to_vec(),
+                loop_start,
+                loop_end,
+            })
+        } else {
+            None
+        };
+        if let Some(content) = drag_content {
+            if response.is_pointer_button_down_on() || response.drag_started() {
+                studio.begin_clip_drag(ClipDrag::Session {
+                    track,
+                    scene,
+                    content,
+                });
+            }
+        }
+        let midi_target = DropTarget::Session { track, scene };
+        if studio.clip_drag.is_some()
+            && ui
+                .input(|input| input.pointer.interact_pos())
+                .is_some_and(|pos| cell.contains(pos))
+            && !studio
+                .clip_drag
+                .as_ref()
+                .is_some_and(|drag| midi_target.is_origin_of(drag))
+        {
+            studio.hover_clip_drop(midi_target);
+        }
         let has_clip = !notes.is_empty();
         let has_sample = sample.is_some();
         let has_content = has_clip || has_sample;
@@ -1143,7 +1196,13 @@ mod tests {
 
         let clip = SampleClip::from_tone("TIMELINE", 330.0, 0.5, 48_000);
         let id = state.add_arrangement_clip(0, 0, clip.clone(), true, 0.0);
-        studio.begin_clip_drag(ClipDrag::Arrangement { id, clip });
+        studio.begin_clip_drag(ClipDrag::Arrangement {
+            id,
+            content: DragContent::Audio(clip),
+            origin_track: 0,
+            origin_step: 0,
+            grab_steps: 0.0,
+        });
 
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 640.0));
         let content = theme::panel_content(screen);
@@ -1167,9 +1226,10 @@ mod tests {
 
         // The application commits that target; the clip must land there.
         assert!(studio.commit_clip_drag(&mut state, &mut audio));
-        assert!(
-            state.arrangement.is_empty(),
-            "the clip stayed on the timeline"
+        assert_eq!(
+            state.arrangement.len(),
+            1,
+            "the timeline block must survive a copy into the matrix"
         );
         assert!(
             state.sample_clip(2, 5).is_some(),
@@ -1191,7 +1251,7 @@ mod tests {
         studio.begin_clip_drag(ClipDrag::Session {
             track: 1,
             scene: 1,
-            clip,
+            content: DragContent::Audio(clip),
         });
 
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 640.0));

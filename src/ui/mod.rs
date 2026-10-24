@@ -44,7 +44,7 @@ pub fn clip_drag_overlay(ui: &mut Ui, studio: &Studio) {
         theme::TEXT_FAINT
     };
 
-    let name = truncate(&drag.clip().name, 26);
+    let name = truncate(&drag.name(), 26);
     let painter = ui.painter();
     let origin = Pos2::new(pointer.x + 14.0, pointer.y + 12.0);
     let rect = Rect::from_min_size(origin, Vec2::new(196.0, 30.0));

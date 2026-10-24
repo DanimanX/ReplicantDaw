@@ -1,13 +1,13 @@
 # Replicant DAW
 
 A cyberpunk digital audio workstation in Rust: external CLAP/VST3 instruments,
-an 8 × 8 session matrix, a 16-bar arrangement with draggable audio clips, a
-modular master chain, MIDI recording and versioned `.rproj` projects.
+an 8 × 8 session matrix, a 16-bar arrangement with independent audio and MIDI
+clips, a modular master chain, MIDI recording and versioned `.rproj` projects.
 
 Built with `eframe`/`egui` on `wgpu`; audio is rendered by `cpal` through
 lock-free `rtrb` rings.
 
-**Version 1.4.3** · MIT · Linux, macOS and Windows.
+**Version 1.5.0** · MIT · Linux, macOS and Windows.
 
 ![Replicant DAW session and arrangement](docs/screenshot.png)
 
@@ -15,30 +15,32 @@ lock-free `rtrb` rings.
 > the status reads `SILENT FALLBACK`. A fresh session starts with an empty
 > instrument slot and the plugins already scanned.
 
-## What's new in 1.4.3
+## What's new in 1.5.0
 
-- **One drag model for both views.** The session matrix and the arrangement
-  each used to resolve drops themselves, with a second payload path to fall
-  back on. Pressing a clip now starts a single drag held in DAW state; each
-  panel only reports the destination under the pointer, and the application
-  commits the move once after everything has drawn. No ordering, no double
-  drops, no duplicated clips.
-- **The drag starts on press, not on movement.** A quick flick used to press,
-  travel and release without ever meeting egui's drag threshold, so nothing
-  happened. A plain click is unaffected: releasing on the clip's own cell is
-  recognised as the origin and cancels, leaving the click to launch as before.
-- **Visible feedback while dragging.** A floating tag follows the pointer with
-  the clip name and destination (`TRK 04 · BAR 8.1`), and the arrangement paints
-  the target block where it will land. Releasing anywhere else cancels.
-- **Clips move, they do not duplicate.** Moving between views clears the
-  source, because the engine sums session and arrangement audio: a copy would
-  sound twice.
-- Verified with a real mouse under X11 in both directions and for lane
-  changes; the saved project showed exactly one clip at the dropped step.
+- **The session matrix and the arrangement are independent spaces.** The
+  timeline used to paint the launched session clip across its lane, as if both
+  views were one piano roll. It no longer does: the matrix owns its slots, the
+  arrangement owns its blocks, and a block only exists there once you put it
+  there.
+- **MIDI clips can live on the timeline.** Dragging a MIDI cell onto a lane
+  copies its notes into a timeline clip with its own loop region, and the block
+  draws those notes. Audio clips work the same way. Editing either side never
+  reaches the other, because a drag carries a snapshot of the material.
+- **Drag and drop is one gesture in both directions.** Press a clip to carry
+  it, release on a lane or a session cell. Within one view the clip moves;
+  across views it is copied. A plain click still launches or opens as before,
+  and a click on a timeline block never nudges it to another beat.
+- **Blocks move freely on the timeline.** The grab point stays under the
+  pointer instead of snapping the block's left edge to it, and a block can be
+  grabbed anywhere inside itself — a wide clip used to be impossible to drag.
+- **No double playback.** Where a timeline clip covers a track, the engine
+  mutes that track's session layer, so a copied clip cannot sound twice.
+- Verified with a real mouse under X11: a MIDI cell dragged to a lane, moved
+  again from the middle of its block, and clicked without moving.
 
 ## Screenshots
 
-![Arrangement lanes with audio clips](docs/arrangement.png)
+![Arrangement lanes with independent audio and MIDI clips](docs/arrangement.png)
 
 ![Dragging a session clip onto the timeline](docs/clip-drag.png)
 
@@ -58,8 +60,9 @@ lock-free `rtrb` rings.
   in-process on a worker thread; VST2 is listed but not hostable.
 - **Session matrix** — 8 tracks × 8 scenes, independent MIDI clips, audio
   samples, per-clip loops and mute.
-- **Arrangement** — 16-bar timeline with audio clips, a beat grid and an
-  animated playhead. Drag audio in from the desktop or from the session view.
+- **Arrangement** — 16-bar timeline with audio and MIDI clips, a beat grid and
+  an animated playhead. Drag clips in from the session matrix or audio files
+  from the desktop. Each block owns its material and its loop region.
 - **Audio clip editor** — waveform, trim, gain, normalize, reverse, fades,
   loop region and one-shot preview.
 - **Piano roll** — add, move, resize and delete notes; per-clip loop region;
@@ -130,16 +133,19 @@ Default project directory:
 
 1. Open the instrument browser from `SELECT VST3 / CLAP` and load an instrument
    into a track. Without one, MIDI clips are silent.
-2. Drop an audio file onto a lane, or drag a sample from the session matrix.
-   The clip lands on the nearest beat; a floating tag names the destination and
-   a ghost block shows exactly where it will land.
-3. Drag the arrangement block onto any session cell to move it back. A clip
-   lives in one view at a time: moving it clears the source so the same audio
-   cannot play twice.
-4. Double-click an arrangement clip to open the audio editor. Right-click for
+2. Drop an audio file onto a lane, or drag any session cell — MIDI notes or a
+   sample — onto a lane. The block lands on the nearest beat; a floating tag
+   names the destination and a ghost block shows exactly where it will land.
+3. The matrix keeps its clip: the timeline receives its own copy with the
+   notes or the buffer it had when you pressed. Editing one never edits the
+   other. Dragging a block back onto a session cell likewise copies it.
+4. Drag a block along its lane or onto another one to move it. The grab point
+   stays under the pointer, so a block does not jump on the first pixel.
+5. Double-click an audio block to open the audio editor. Right-click for
    `OPEN AUDIO EDITOR` or `REMOVE FROM ARRANGEMENT`.
-5. Press Space to play. Arrangement clips play at their absolute timeline
-   position; the 16-bar loop wraps.
+6. Press Space to play. Arrangement clips play at their absolute timeline
+   position; the 16-bar loop wraps. Where a timeline clip covers a track, the
+   session layer underneath it is silent.
 
 ## Controls
 
@@ -149,9 +155,9 @@ Default project directory:
 - **BPM** — click to type, drag vertically, or use `-` / `+`.
 - **Clip slot** — click to launch, click again to stop; right-click for the
   clip menu.
-- **Sample cell** — drag to the arrangement; double-click to edit the clip.
-- **Arrangement lane** — drop audio files or dragged clips; double-click empty
-  space to edit the track's clip.
+- **Session cell** — drag to a lane or another cell; double-click to edit.
+- **Arrangement lane** — drop audio files or dragged clips; drag a block to
+  move it; double-click empty space to edit the track's source clip.
 - **Fader / pan** — drag vertically, double-click to reset.
 - **M / S** — mute and solo.
 - **Effect module** — drag knobs; `b` bypasses, `X` closes, `‹ ›` reorders.
@@ -173,9 +179,9 @@ Details, scan paths and known limits: [docs/PLUGINS.md](docs/PLUGINS.md).
 
 ## Project format
 
-`.rproj` is versioned JSON. Format v9 stores tempo, mix, track names, session
-MIDI clips, session samples, arrangement audio clips, effect chain, master gain
-and plugin state. Older formats load with migrations; a track whose instrument
+`.rproj` is versioned JSON. Format v10 stores tempo, mix, track names, session
+MIDI clips, session samples, arrangement audio and MIDI clips, effect chain,
+master gain and plugin state. Older formats load with migrations; a track whose instrument
 id is `synth` loads as an empty slot because the built-in synth was removed.
 Unknown fields are ignored and newer format versions are rejected with a clear
 error.
@@ -183,7 +189,6 @@ error.
 ## Limits
 
 - One MIDI clip per session slot and one external instrument per track.
-- Arrangement clips are audio; there is no MIDI arrangement clip model yet.
 - One 16-bar loop; no automation lanes, undo or audio export.
 - Plugin hosting is in-process: a crashing plugin can take the app down.
 - Native plugin windows are tested on Linux/X11; other platforms fall back to

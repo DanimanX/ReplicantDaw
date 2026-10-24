@@ -16,10 +16,66 @@ use crate::samples::{SampleClip, SampleSlot};
 
 pub const MAX_SCOPE: usize = 4096;
 
-/// An audio clip placed on the arrangement timeline.
+/// What an arrangement clip plays.
 ///
-/// The clip owns its rendered sample, so it is independent of the session
-/// matrix: moving it between views does not leave a second copy sounding.
+/// Both variants own their material, so an arrangement clip is independent of
+/// the session slot it may have been dragged from: editing or clearing one
+/// never touches the other.
+#[derive(Clone, Debug)]
+pub enum ArrangementContent {
+    /// A rendered audio sample.
+    Audio {
+        clip: Arc<SampleClip>,
+        loop_enabled: bool,
+        gain_db: f32,
+    },
+    /// Notes copied from a session slot, looping inside their own region.
+    Midi {
+        /// Name of the slot the notes came from, kept so the block can be
+        /// labelled after the session has changed.
+        name: String,
+        notes: Vec<RecordedNote>,
+        loop_start: u16,
+        loop_end: u16,
+    },
+}
+
+impl ArrangementContent {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Audio { clip, .. } => format!("AUDIO · {}", clip.name),
+            Self::Midi { name, notes, .. } => format!("MIDI · {name} · {}N", notes.len()),
+        }
+    }
+
+    pub fn audio(&self) -> Option<&Arc<SampleClip>> {
+        match self {
+            Self::Audio { clip, .. } => Some(clip),
+            Self::Midi { .. } => None,
+        }
+    }
+
+    pub fn notes(&self) -> &[RecordedNote] {
+        match self {
+            Self::Audio { .. } => &[],
+            Self::Midi { notes, .. } => notes,
+        }
+    }
+
+    /// Loop region of a MIDI clip, or `None` for audio.
+    pub fn loop_region(&self) -> Option<(u16, u16)> {
+        match self {
+            Self::Audio { .. } => None,
+            Self::Midi {
+                loop_start,
+                loop_end,
+                ..
+            } => Some((*loop_start, *loop_end)),
+        }
+    }
+}
+
+/// A clip placed on the arrangement timeline.
 #[derive(Clone, Debug)]
 pub struct ArrangementClip {
     pub id: u64,
@@ -27,9 +83,29 @@ pub struct ArrangementClip {
     /// Timeline position in 16th notes, from the start of the 16-bar loop.
     pub start_step: u16,
     pub length_steps: u16,
-    pub clip: Arc<SampleClip>,
-    pub loop_enabled: bool,
-    pub gain_db: f32,
+    pub content: ArrangementContent,
+}
+
+impl ArrangementClip {
+    /// Snapshot of this clip's material, ready to be carried by a drag.
+    pub fn drag_content(&self) -> crate::samples::DragContent {
+        match &self.content {
+            ArrangementContent::Audio { clip, .. } => {
+                crate::samples::DragContent::Audio(Arc::clone(clip))
+            }
+            ArrangementContent::Midi {
+                name,
+                notes,
+                loop_start,
+                loop_end,
+            } => crate::samples::DragContent::Midi {
+                name: name.clone(),
+                notes: notes.clone(),
+                loop_start: *loop_start,
+                loop_end: *loop_end,
+            },
+        }
+    }
 }
 
 /// Sound source of a track's single instrument slot.
@@ -357,17 +433,20 @@ impl UiState {
     ) -> u64 {
         let start_step = start_step.min(crate::audio::LOOP_STEPS as u16 - 1);
         let length_steps = self.steps_for_duration(clip.duration_secs(), start_step);
-        self.add_arrangement_clip_with_length(
+        self.insert_arrangement_clip(
             track,
             start_step,
             length_steps,
-            clip,
-            loop_enabled,
-            gain_db,
+            ArrangementContent::Audio {
+                clip,
+                loop_enabled,
+                gain_db,
+            },
         )
     }
 
-    /// Place an audio clip with an explicit length (used by project restore).
+    /// Place an audio clip with an explicit length (used by project restore and
+    /// by resizing).
     pub fn add_arrangement_clip_with_length(
         &mut self,
         track: usize,
@@ -377,18 +456,72 @@ impl UiState {
         loop_enabled: bool,
         gain_db: f32,
     ) -> u64 {
+        self.insert_arrangement_clip(
+            track,
+            start_step,
+            length_steps,
+            ArrangementContent::Audio {
+                clip,
+                loop_enabled,
+                gain_db,
+            },
+        )
+    }
+
+    /// Copy a session slot's notes onto the timeline as an independent clip.
+    pub fn add_arrangement_midi(
+        &mut self,
+        track: usize,
+        start_step: u16,
+        name: String,
+        notes: Vec<RecordedNote>,
+        loop_start: u16,
+        loop_end: u16,
+    ) -> u64 {
+        // The clip is as long as the region it loops, so what you drag is what
+        // you see; it can be stretched afterwards.
+        let length = loop_end.saturating_sub(loop_start).max(1);
+        self.insert_arrangement_clip(
+            track,
+            start_step,
+            length,
+            ArrangementContent::Midi {
+                name,
+                notes,
+                loop_start,
+                loop_end,
+            },
+        )
+    }
+
+    /// Add a clip with an explicit length, keeping its content.
+    pub fn insert_arrangement_clip(
+        &mut self,
+        track: usize,
+        start_step: u16,
+        length_steps: u16,
+        content: ArrangementContent,
+    ) -> u64 {
         let id = self.arrangement_serial;
         self.arrangement_serial = self.arrangement_serial.wrapping_add(1).max(1);
+        let start_step = start_step.min(crate::audio::LOOP_STEPS as u16 - 1);
+        let max_length = crate::audio::LOOP_STEPS as u16 - start_step;
         self.arrangement.push(ArrangementClip {
             id,
             track: track.min(TRACK_COUNT - 1),
-            start_step: start_step.min(crate::audio::LOOP_STEPS as u16 - 1),
-            length_steps: length_steps.max(1),
-            clip,
-            loop_enabled,
-            gain_db,
+            start_step,
+            length_steps: length_steps.clamp(1, max_length.max(1)),
+            content,
         });
         id
+    }
+
+    /// Change a clip's length, clamped to the timeline.
+    pub fn resize_arrangement_clip(&mut self, id: u64, length_steps: u16) {
+        if let Some(clip) = self.arrangement.iter_mut().find(|clip| clip.id == id) {
+            let max_length = crate::audio::LOOP_STEPS as u16 - clip.start_step;
+            clip.length_steps = length_steps.clamp(1, max_length.max(1));
+        }
     }
 
     pub fn arrangement_clip(&self, id: u64) -> Option<&ArrangementClip> {

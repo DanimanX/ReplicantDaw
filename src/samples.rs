@@ -16,6 +16,7 @@ use symphonia::core::formats::{FormatOptions, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 
+use crate::audio::messages::RecordedNote;
 pub use crate::audio::messages::SampleBuffer;
 
 /// Audio extensions the browser lists and the decoder accepts.
@@ -131,7 +132,46 @@ impl SampleClip {
     }
 }
 
-/// Payload carried while an audio clip is dragged between views.
+/// The material a clip carries while it is dragged.
+///
+/// A drag is a snapshot taken at press time, so the destination receives its
+/// own copy of the notes or the buffer. The session matrix and the arrangement
+/// are independent spaces: moving a clip in one never edits the other.
+#[derive(Clone, Debug)]
+pub enum DragContent {
+    Audio(Arc<SampleClip>),
+    Midi {
+        /// Slot or scene name, so a timeline block can say what it plays.
+        name: String,
+        notes: Vec<RecordedNote>,
+        loop_start: u16,
+        loop_end: u16,
+    },
+}
+
+impl DragContent {
+    pub fn audio(&self) -> Option<&Arc<SampleClip>> {
+        match self {
+            Self::Audio(clip) => Some(clip),
+            Self::Midi { .. } => None,
+        }
+    }
+
+    /// Loop span for MIDI material, `None` for audio (its length comes from
+    /// the sample duration).
+    pub fn length_steps(&self) -> Option<u16> {
+        match self {
+            Self::Audio(_) => None,
+            Self::Midi {
+                loop_start,
+                loop_end,
+                ..
+            } => Some(loop_end.saturating_sub(*loop_start).max(1)),
+        }
+    }
+}
+
+/// Payload carried while a clip is dragged between views.
 ///
 /// The same type is used by the sample editor, the session matrix and the
 /// arrangement, so a drop target can distinguish a fresh render from a clip
@@ -140,22 +180,59 @@ impl SampleClip {
 pub enum ClipDrag {
     /// A render from the sample editor that is not assigned to a slot yet.
     Editor { clip: Arc<SampleClip> },
-    /// A sample in a session matrix cell.
+    /// A clip in a session matrix cell.
     Session {
         track: usize,
         scene: usize,
-        clip: Arc<SampleClip>,
+        content: DragContent,
     },
-    /// A clip on the arrangement timeline.
-    Arrangement { id: u64, clip: Arc<SampleClip> },
+    /// A clip on the arrangement timeline, with where it was grabbed so a
+    /// move keeps the grab point under the pointer instead of snapping the
+    /// block's left edge to it.
+    Arrangement {
+        id: u64,
+        content: DragContent,
+        origin_track: usize,
+        origin_step: u16,
+        grab_steps: f32,
+    },
 }
 
 impl ClipDrag {
-    pub fn clip(&self) -> &Arc<SampleClip> {
+    /// Audio payload, when the drag carries a sample.
+    pub fn audio(&self) -> Option<&Arc<SampleClip>> {
         match self {
-            Self::Editor { clip } | Self::Session { clip, .. } | Self::Arrangement { clip, .. } => {
-                clip
-            }
+            Self::Editor { clip } => Some(clip),
+            Self::Session { content, .. } | Self::Arrangement { content, .. } => content.audio(),
+        }
+    }
+
+    /// Material carried by a matrix or timeline clip.
+    pub fn content(&self) -> Option<&DragContent> {
+        match self {
+            Self::Editor { .. } => None,
+            Self::Session { content, .. } | Self::Arrangement { content, .. } => Some(content),
+        }
+    }
+
+    /// Label shown in the floating drag tag.
+    pub fn name(&self) -> String {
+        match self {
+            Self::Editor { clip } => clip.name.clone(),
+            Self::Session { content, .. } | Self::Arrangement { content, .. } => match content {
+                DragContent::Audio(clip) => clip.name.clone(),
+                DragContent::Midi { name, notes, .. } => {
+                    format!("{name} · {}N", notes.len())
+                }
+            },
+        }
+    }
+
+    /// Grab offset inside a timeline block, in 16th notes.
+    pub fn grab_steps(&self) -> f32 {
+        match self {
+            Self::Arrangement { grab_steps, .. } => *grab_steps,
+            _ => 0.0,
         }
     }
 }
@@ -198,6 +275,14 @@ impl DropTarget {
                     ..
                 },
             ) => track == source_track && scene == source_scene,
+            (
+                Self::Arrangement { track, start_step },
+                ClipDrag::Arrangement {
+                    origin_track,
+                    origin_step,
+                    ..
+                },
+            ) => track == origin_track && start_step == origin_step,
             _ => false,
         }
     }

@@ -4,8 +4,8 @@ use egui::{Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Sense, Shape, Stroke
 
 use crate::audio::{AudioRuntime, LOOP_STEPS, TRACKS, TRACK_COUNT};
 use crate::dsp::spectrum::{BINS, HISTORY};
-use crate::samples::{ClipDrag, DropTarget};
-use crate::state::UiState;
+use crate::samples::{ClipDrag, DragContent, DropTarget};
+use crate::state::{ArrangementContent, UiState};
 use crate::studio::Studio;
 use crate::theme;
 use crate::ui::widgets::{mini_roll, MiniRollView};
@@ -181,229 +181,10 @@ pub fn draw_lanes(
             theme::accent_alpha(accent, 130),
         );
 
-        // The launched slot's MIDI clip takes over the lane when present.
-        let notes = state.recorded_notes(track, scene).to_vec();
-        let slot_enabled = state.recorded_active[track][scene];
-        if !notes.is_empty() {
-            let enabled = slot_enabled;
-            let steps_total = crate::audio::LOOP_STEPS as f32;
-            let (loop_start, loop_end) = state.clip_loop(track, scene);
-            // The block is the loop region, not the whole timeline: a short
-            // loop used to be drawn as a 16-bar clip.
-            let x_at = |step: u16| lane.left() + (step as f32 / steps_total) * lane.width();
-            let clip = Rect::from_min_max(
-                Pos2::new(x_at(loop_start) + 1.5, lane.top() + 1.5),
-                Pos2::new(x_at(loop_end) - 1.5, lane.bottom() - 1.5),
-            );
-            ui.painter().rect_filled(
-                clip,
-                CornerRadius::same(2),
-                if enabled {
-                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 18)
-                } else {
-                    Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 6)
-                },
-            );
-            ui.painter().rect_stroke(
-                clip,
-                CornerRadius::same(2),
-                Stroke::new(
-                    1.0,
-                    if enabled {
-                        theme::accent_alpha(accent, 150)
-                    } else {
-                        theme::BORDER
-                    },
-                ),
-                egui::StrokeKind::Inside,
-            );
-            ui.painter().rect_filled(
-                Rect::from_min_size(clip.min, Vec2::new(2.0, clip.height())),
-                CornerRadius::same(1),
-                if enabled { accent } else { theme::BORDER },
-            );
-            let clip_hit = ui.interact(
-                clip,
-                ui.scope_id().with(("arr_midi", track)),
-                Sense::click(),
-            );
-            if clip_hit.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if clip_hit.double_clicked() {
-                state.selected_track = track;
-                studio.open_piano_roll(track, launched.unwrap_or(0));
-            }
-            if clip_hit.hovered() {
-                clip_hit.on_hover_text(format!(
-                    "{} · MIDI clip · double-click to edit in the piano roll",
-                    state.track_label(track)
-                ));
-            }
-
-            // Header: the clip name on the left, its loop on the right, each
-            // in its own clipped box so a narrow block cannot overlap them.
-            let header = Rect::from_min_max(
-                Pos2::new(clip.left() + 6.0, clip.top() + 1.0),
-                Pos2::new(clip.right() - 5.0, clip.top() + 10.0),
-            );
-            // Give the loop readout a fixed slice and let the name shrink into
-            // the rest, with shorter wording when the block is narrow.
-            let loop_w = (header.width() * 0.42).clamp(30.0, 96.0);
-            let name_rect = header.with_max_x(header.right() - loop_w - 3.0);
-            let loop_rect = header.with_min_x(header.right() - loop_w);
-            let name_text = if name_rect.width() > 96.0 {
-                format!("MIDI CLIP · SLOT {:02}", scene + 1)
-            } else if name_rect.width() > 40.0 {
-                format!("SLOT {:02}", scene + 1)
-            } else {
-                format!("{:02}", scene + 1)
-            };
-            let name_color = if enabled {
-                theme::accent_alpha(accent, 230)
-            } else {
-                theme::TEXT_DIM
-            };
-            let name_painter = ui.painter().with_clip_rect(name_rect);
-            let name_font = theme::fitted_font(
-                &name_painter,
-                &name_text,
-                theme::display(6.0),
-                name_rect.width(),
-            );
-            name_painter.text(
-                Pos2::new(name_rect.left(), name_rect.center().y),
-                Align2::LEFT_CENTER,
-                &name_text,
-                name_font,
-                name_color,
-            );
-
-            let end_inclusive = loop_end.saturating_sub(1);
-            let loop_label = format!(
-                "{}.{}–{}.{}",
-                loop_start / 16 + 1,
-                loop_start % 16 / 4 + 1,
-                end_inclusive / 16 + 1,
-                end_inclusive % 16 / 4 + 1
-            );
-            let loop_text = if !enabled {
-                "MUTED".to_string()
-            } else if loop_rect.width() > 62.0 {
-                format!("{} N · {loop_label}", notes.len())
-            } else {
-                loop_label
-            };
-            let loop_painter = ui.painter().with_clip_rect(loop_rect);
-            let loop_font = theme::fitted_font(
-                &loop_painter,
-                &loop_text,
-                theme::mono(5.4),
-                loop_rect.width(),
-            );
-            if loop_rect.width() > 18.0 {
-                loop_painter.text(
-                    Pos2::new(loop_rect.right(), loop_rect.center().y),
-                    Align2::RIGHT_CENTER,
-                    loop_text,
-                    loop_font,
-                    if enabled {
-                        theme::TEXT_DIM
-                    } else {
-                        theme::AMBER
-                    },
-                );
-            }
-
-            let roll = Rect::from_min_max(
-                Pos2::new(clip.left() + 4.0, clip.top() + 10.0),
-                Pos2::new(clip.right() - 4.0, clip.bottom() - 2.0),
-            );
-            if roll.height() > 4.0 {
-                mini_roll(
-                    ui.painter(),
-                    roll,
-                    &notes,
-                    (loop_start, loop_end),
-                    crate::audio::LOOP_STEPS as u16,
-                    MiniRollView::Timeline,
-                    accent,
-                    enabled,
-                );
-                if state.playing && enabled {
-                    // The engine's clip phase already wraps inside the loop,
-                    // so map that step straight onto the clip block.
-                    let phase = state
-                        .clip_phase(track, scene)
-                        .unwrap_or(loop_start)
-                        .clamp(loop_start, loop_end.saturating_sub(1));
-                    let px = roll.left() + phase as f32 / steps_total * roll.width();
-                    ui.painter().line_segment(
-                        [Pos2::new(px, roll.top()), Pos2::new(px, roll.bottom())],
-                        Stroke::new(1.0, theme::CYAN),
-                    );
-                }
-            }
-        }
-
-        // Audio samples live in their slot's loop region, like MIDI clips.
-        let sample = state.sample_clip(track, scene).cloned();
-        if let Some(sample) = &sample {
-            let steps_total = crate::audio::LOOP_STEPS as f32;
-            let (loop_start, loop_end) = state.clip_loop(track, scene);
-            let x0 = lane.left() + loop_start as f32 / steps_total * lane.width();
-            let x1 = lane.left() + loop_end as f32 / steps_total * lane.width();
-            let block = Rect::from_min_max(
-                Pos2::new(x0 + 1.5, lane.top() + 1.5),
-                Pos2::new(x1 - 1.5, lane.bottom() - 1.5),
-            );
-            ui.painter().rect_filled(
-                block,
-                CornerRadius::same(2),
-                theme::accent_alpha(theme::MAGENTA, 16),
-            );
-            ui.painter().rect_stroke(
-                block,
-                CornerRadius::same(2),
-                Stroke::new(1.0, theme::accent_alpha(theme::MAGENTA, 150)),
-                egui::StrokeKind::Inside,
-            );
-            let wave = Rect::from_min_max(
-                Pos2::new(block.left() + 4.0, block.top() + 9.0),
-                Pos2::new(block.right() - 4.0, block.bottom() - 2.0),
-            );
-            if wave.width() > 6.0 && wave.height() > 4.0 {
-                draw_peaks(ui.painter(), wave, &sample.peaks, theme::MAGENTA);
-            }
-            let sample_hit = ui.interact(
-                block,
-                ui.scope_id().with(("arr_sample", track)),
-                Sense::click(),
-            );
-            let edit_sample = sample_hit.double_clicked();
-            if sample_hit.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                sample_hit.on_hover_text(format!(
-                    "{} · sample {} · {:.2} s · double-click to edit",
-                    state.track_label(track),
-                    sample.name,
-                    sample.duration_secs()
-                ));
-            }
-            if edit_sample {
-                state.selected_track = track;
-                studio.open_sample_editor_clip(sample);
-            }
-            ui.painter().text(
-                Pos2::new(block.left() + 6.0, block.top() + 1.0),
-                Align2::LEFT_TOP,
-                format!("SAMPLE · {}", sample.extension()),
-                theme::display(5.8),
-                theme::MAGENTA,
-            );
-        }
-
-        // Arrangement audio clips, placed at their timeline position.
+        // Clips placed on the timeline. Each block owns its material: audio
+        // draws its waveform, MIDI draws its notes, and both are carried with
+        // the pointer. The timeline is a space of its own, so a block can be
+        // moved here without touching the session slot it came from.
         let arrangement: Vec<_> = state
             .arrangement
             .iter()
@@ -412,8 +193,7 @@ pub fn draw_lanes(
             .collect();
         let mut remove_arrangement = None;
         let mut edit_arrangement = None;
-        // True while the pointer sits over the clip currently being carried.
-        let mut over_source_clip = false;
+        let pointer = ui.input(|input| input.pointer.interact_pos());
         for clip in &arrangement {
             let steps_total = LOOP_STEPS as f32;
             let x0 = lane.left() + clip.start_step as f32 / steps_total * lane.width();
@@ -435,17 +215,25 @@ pub fn draw_lanes(
             // A press on the block starts carrying it, so a fast flick that
             // presses, travels and releases inside one frame still moves it.
             if block_hit.is_pointer_button_down_on() || block_hit.drag_started() {
+                // Remember where inside the block the grab happened, so the
+                // block keeps its offset instead of snapping its left edge to
+                // the pointer's beat. A plain click then resolves to the step
+                // the clip already sits on, and cancels as an origin drop.
+                let grab_steps = pointer
+                    .map(|pos| {
+                        let at = ((pos.x - lane.left()) / lane.width().max(1.0)).clamp(0.0, 1.0)
+                            * steps_total;
+                        (at - clip.start_step as f32).clamp(0.0, clip.length_steps.max(1) as f32)
+                    })
+                    .unwrap_or(0.0);
                 studio.begin_clip_drag(ClipDrag::Arrangement {
                     id: clip.id,
-                    clip: std::sync::Arc::clone(&clip.clip),
+                    content: clip.drag_content(),
+                    origin_track: track,
+                    origin_step: clip.start_step,
+                    grab_steps,
                 });
             }
-            // Pressing inside the clip that is being carried is not a move.
-            over_source_clip |= studio.clip_drag.as_ref().is_some_and(
-                |drag| matches!(drag, ClipDrag::Arrangement { id, .. } if *id == clip.id),
-            ) && ui
-                .input(|input| input.pointer.interact_pos())
-                .is_some_and(|pos| block.contains(pos));
 
             let muted = state.mute[track] || (state.any_solo() && !state.solo[track]);
             let fill = if muted {
@@ -477,20 +265,21 @@ pub fn draw_lanes(
                 Pos2::new(block.left() + 5.0, block.top() + 1.0),
                 Pos2::new(block.right() - 4.0, block.top() + 11.0),
             );
-            let label = format!("AUDIO · {}", clip.clip.name);
+            let label = clip.content.label();
             let label_painter = ui.painter().with_clip_rect(header);
             let label_font =
                 theme::fitted_font(&label_painter, &label, theme::display(6.0), header.width());
+            let body_color = if muted {
+                theme::TEXT_DIM
+            } else {
+                theme::accent_alpha(accent, 230)
+            };
             label_painter.text(
                 Pos2::new(header.left(), header.center().y),
                 Align2::LEFT_CENTER,
                 &label,
                 label_font,
-                if muted {
-                    theme::TEXT_DIM
-                } else {
-                    theme::accent_alpha(accent, 230)
-                },
+                body_color,
             );
 
             let wave = Rect::from_min_max(
@@ -498,33 +287,56 @@ pub fn draw_lanes(
                 Pos2::new(block.right() - 4.0, block.bottom() - 2.0),
             );
             if wave.width() > 4.0 && wave.height() > 3.0 {
-                draw_peaks(
-                    ui.painter(),
-                    wave,
-                    &clip.clip.peaks,
-                    if muted {
-                        theme::BORDER
-                    } else {
-                        theme::accent_alpha(accent, 170)
-                    },
-                );
+                match &clip.content {
+                    ArrangementContent::Audio { clip, .. } => draw_peaks(
+                        ui.painter(),
+                        wave,
+                        &clip.peaks,
+                        if muted {
+                            theme::BORDER
+                        } else {
+                            theme::accent_alpha(accent, 170)
+                        },
+                    ),
+                    ArrangementContent::Midi {
+                        notes,
+                        loop_start,
+                        loop_end,
+                        ..
+                    } => mini_roll(
+                        ui.painter(),
+                        wave,
+                        notes,
+                        (*loop_start, *loop_end),
+                        LOOP_STEPS as u16,
+                        MiniRollView::Clip,
+                        accent,
+                        !muted,
+                    ),
+                }
             }
 
             if block_hit.double_clicked() {
-                edit_arrangement = Some(clip.clip.clone());
+                if let ArrangementContent::Audio { clip, .. } = &clip.content {
+                    edit_arrangement = Some(std::sync::Arc::clone(clip));
+                }
             }
             block_hit.context_menu(|ui| {
-                if ui.button("OPEN AUDIO EDITOR").clicked() {
-                    edit_arrangement = Some(clip.clip.clone());
-                    ui.close();
+                if let ArrangementContent::Audio { clip, .. } = &clip.content {
+                    if ui.button("OPEN AUDIO EDITOR").clicked() {
+                        edit_arrangement = Some(std::sync::Arc::clone(clip));
+                        ui.close();
+                    }
                 }
                 if ui.button("REMOVE FROM ARRANGEMENT").clicked() {
                     remove_arrangement = Some(clip.id);
                     ui.close();
                 }
             });
-            block_hit
-                .on_hover_text("Arrangement audio · drag to a session cell · double-click to edit");
+            block_hit.on_hover_text(format!(
+                "{} · drag to move or copy to a session cell",
+                clip.content.label()
+            ));
         }
         if let Some(clip) = edit_arrangement {
             studio.open_sample_editor_clip(&clip);
@@ -536,29 +348,71 @@ pub fn draw_lanes(
         // Ghost of the clip being dragged, and the highlight for OS file drops.
         let pointer = ui.input(|input| input.pointer.interact_pos());
         let over_lane = pointer.is_some_and(|pos| lane.contains(pos));
-        let carrying = studio.clip_drag.as_ref().map(|drag| drag.clip().clone());
-        let carried = carrying.is_some() && over_lane && !over_source_clip;
-        if carried {
-            // Publish the destination from the panel that paints the ghost, so
-            // the block drawn and the clip committed cannot disagree.
+        // Snapshot what the ghost needs before touching Studio: reporting the
+        // drop target mutates it, so no borrow may outlive that call.
+        let grab = studio
+            .clip_drag
+            .as_ref()
+            .map(|drag| drag.grab_steps())
+            .unwrap_or(0.0);
+        let content = studio
+            .clip_drag
+            .as_ref()
+            .and_then(|drag| drag.content())
+            .cloned();
+        let editor_clip = studio
+            .clip_drag
+            .as_ref()
+            .and_then(|drag| drag.audio())
+            .cloned();
+        let carried = studio.clip_drag.is_some() && over_lane;
+        let ghost_step = if carried {
+            // A block moving inside the timeline keeps the grab point under the
+            // pointer; a clip arriving from the matrix lands at the pointer.
+            let raw_step = pointer
+                .map(|pos| {
+                    ((pos.x - lane.left()) / lane.width().max(1.0)).clamp(0.0, 1.0)
+                        * LOOP_STEPS as f32
+                })
+                .unwrap_or(0.0);
+            let adjusted = (raw_step - grab).max(0.0);
+            let snapped =
+                ((adjusted / 4.0).round() * 4.0).clamp(0.0, (LOOP_STEPS - 1) as f32) as u16;
             studio.hover_clip_drop(DropTarget::Arrangement {
                 track,
-                start_step: drop_step,
+                start_step: snapped,
             });
-        }
+            Some(snapped)
+        } else {
+            None
+        };
         if studio.clip_drag.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
         let files_hovered = ui.ctx().input(|input| !input.raw.hovered_files.is_empty());
-        if carried || (files_hovered && over_lane) {
-            let length = carrying
-                .as_ref()
-                .map(|clip| state.steps_for_duration(clip.duration_secs(), drop_step))
-                .unwrap_or(16);
-            let x0 = lane.left() + drop_step as f32 / LOOP_STEPS as f32 * lane.width();
+        if ghost_step.is_some() || (files_hovered && over_lane) {
+            let step = ghost_step.unwrap_or(drop_step);
+            let length = match &content {
+                Some(DragContent::Midi { .. }) => content
+                    .as_ref()
+                    .and_then(|c| c.length_steps())
+                    .unwrap_or(16),
+                Some(DragContent::Audio(clip)) => {
+                    state.steps_for_duration(clip.duration_secs(), step)
+                }
+                None => editor_clip
+                    .as_ref()
+                    .map(|clip| state.steps_for_duration(clip.duration_secs(), step))
+                    .unwrap_or(16),
+            };
+            let ghost_label = if matches!(&content, Some(DragContent::Midi { .. })) {
+                "DROP MIDI"
+            } else {
+                "DROP AUDIO"
+            };
+            let x0 = lane.left() + step as f32 / LOOP_STEPS as f32 * lane.width();
             let x1 = lane.left()
-                + (drop_step.saturating_add(length)).min(LOOP_STEPS as u16) as f32
-                    / LOOP_STEPS as f32
+                + (step.saturating_add(length)).min(LOOP_STEPS as u16) as f32 / LOOP_STEPS as f32
                     * lane.width();
             let ghost = Rect::from_min_max(
                 Pos2::new(x0 + 1.0, lane.top() + 2.0),
@@ -578,76 +432,10 @@ pub fn draw_lanes(
             ui.painter().text(
                 ghost.center(),
                 Align2::CENTER_CENTER,
-                "DROP AUDIO",
+                ghost_label,
                 theme::mono(6.5),
                 theme::MAGENTA,
             );
-        }
-
-        // Audio clip blocks, one per four bars (generative slots only).
-        let block_bars = 4usize;
-        let blocks = if launched.is_some() && notes.is_empty() && sample.is_none() {
-            TIMELINE_BARS / block_bars
-        } else {
-            0
-        };
-        for block in 0..blocks {
-            let x0 = lane.left() + (block * block_bars) as f32 * 4.0 * beat_w;
-            let x1 = x0 + block_bars as f32 * 4.0 * beat_w;
-            let block_rect = Rect::from_min_max(
-                Pos2::new(x0 + 2.0, lane.top() + 3.0),
-                Pos2::new(x1 - 2.0, lane.bottom() - 3.0),
-            );
-            let block_hit = ui.interact(
-                block_rect,
-                ui.scope_id().with(("arr_audio", track, block)),
-                Sense::click(),
-            );
-            if block_hit.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if block_hit.double_clicked() {
-                state.selected_track = track;
-                studio.open_audio_editor(track);
-            }
-            if block_hit.hovered() {
-                block_hit.on_hover_text(format!(
-                    "{} · audio clip · double-click to edit the clip envelope",
-                    state.track_label(track)
-                ));
-            }
-            let muted = state.mute[track] || (state.any_solo() && !state.solo[track]);
-            let alpha = if muted { 45 } else { 150 };
-            ui.painter().rect_filled(
-                block_rect,
-                CornerRadius::same(2),
-                Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 12),
-            );
-            ui.painter().rect_stroke(
-                block_rect,
-                CornerRadius::same(2),
-                Stroke::new(1.0, theme::accent_alpha(accent, 55)),
-                egui::StrokeKind::Inside,
-            );
-
-            if block_rect.width() > 12.0 && block_rect.height() > 8.0 {
-                let points = state.clip_waveform(track, scene, 72);
-                let mid = block_rect.center().y;
-                let amp = block_rect.height() * 0.40;
-                let path: Vec<Pos2> = points
-                    .iter()
-                    .enumerate()
-                    .map(|(i, value)| {
-                        let x = block_rect.left()
-                            + block_rect.width() * i as f32 / (points.len() - 1) as f32;
-                        Pos2::new(x, mid - value * amp)
-                    })
-                    .collect();
-                ui.painter().add(Shape::line(
-                    path,
-                    Stroke::new(1.0, theme::accent_alpha(accent, alpha)),
-                ));
-            }
         }
 
         // Mute / solo indicators on the gutter.
@@ -672,11 +460,14 @@ pub fn draw_lanes(
         if lane_hit.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
+        // Double-clicking empty lane opens the source the track would play:
+        // its sample, or the launched slot's piano roll. Nothing is painted
+        // here, because the timeline only shows clips placed on it.
         if lane_hit.double_clicked() {
             state.selected_track = track;
-            if sample.is_some() {
+            if state.sample_clip(track, scene).is_some() {
                 studio.open_sample_clip(track, scene);
-            } else if notes.is_empty() {
+            } else if state.recorded_notes(track, scene).is_empty() {
                 studio.open_audio_editor(track);
             } else {
                 studio.open_piano_roll(track, launched.unwrap_or(0));
@@ -684,9 +475,13 @@ pub fn draw_lanes(
         }
         if lane_hit.hovered() {
             lane_hit.clone().on_hover_text(format!(
-                "{} · drop audio here · double-click to edit the {} clip",
+                "{} · drop a clip here · double-click to edit the {} clip",
                 state.track_label(track),
-                if notes.is_empty() { "audio" } else { "MIDI" }
+                if state.recorded_notes(track, scene).is_empty() {
+                    "audio"
+                } else {
+                    "MIDI"
+                }
             ));
         }
 
@@ -1067,7 +862,7 @@ mod tests {
         studio.begin_clip_drag(ClipDrag::Session {
             track: 0,
             scene: 0,
-            clip,
+            content: DragContent::Audio(clip),
         });
 
         let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0));
@@ -1092,8 +887,8 @@ mod tests {
         // Committing that target is what the application does on release.
         assert!(studio.commit_clip_drag(&mut state, &mut audio));
         assert!(
-            state.sample_clip(0, 0).is_none(),
-            "the session copy should move, not duplicate"
+            state.sample_clip(0, 0).is_some(),
+            "the matrix slot must keep its clip: the timeline got a copy"
         );
         let placed = state
             .arrangement

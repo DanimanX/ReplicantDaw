@@ -361,6 +361,12 @@ impl ReplicantApp {
             right.max,
         );
 
+        // A drag reports its destination every frame; start from "nowhere" so
+        // a stale target from the previous frame cannot win.
+        if self.studio.clip_drag.is_some() {
+            self.studio.clear_clip_drop();
+        }
+
         ui::studio_windows::draw_menu_bar(ui, menu_rect, &mut self.studio, &mut self.state);
         ui::transport::draw(ui, top_rect, &mut self.state, &mut self.audio);
         ui::session::draw_matrix(
@@ -401,10 +407,15 @@ impl ReplicantApp {
         );
         ui::devices::draw_add_menu(ui.ctx(), &mut self.state, &mut self.audio);
 
-        // A released pointer ends any clip drag. Drop targets already ran
-        // during this frame, so this only clears a drag that ended nowhere.
+        // The floating tag follows the pointer across panels, and the drop is
+        // committed here — once, after every view has reported its target.
+        ui::clip_drag_overlay(ui, &self.studio);
         if ui.ctx().input(|input| input.pointer.any_released()) {
-            self.studio.clip_drag = None;
+            self.studio
+                .commit_clip_drag(&mut self.state, &mut self.audio);
+        }
+        if self.studio.clip_drag.is_some() {
+            ui.ctx().request_repaint();
         }
     }
 

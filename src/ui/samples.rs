@@ -321,6 +321,9 @@ pub fn draw_editor(ctx: &egui::Context, studio: &mut Studio, audio: &mut AudioRu
     let mut open = true;
     let mut preview = false;
     let mut stop = false;
+    // Clip the editor hands to the shared drag state when its handle is
+    // pressed; applied after the window closure releases the editor borrow.
+    let mut begin_drag: Option<std::sync::Arc<crate::samples::SampleClip>> = None;
     let mut trim_drag = studio.sample_trim_drag;
     let preview_started = studio.preview_started;
 
@@ -418,13 +421,15 @@ pub fn draw_editor(ctx: &egui::Context, studio: &mut Studio, audio: &mut AudioRu
                         );
                     } else {
                         let clip = editor.to_clip(audio.sample_rate);
-                        ui.dnd_drag_source(
+                        let drag = ui.dnd_drag_source(
                             egui::Id::unique("sample_editor_drag"),
-                            crate::samples::ClipDrag::Editor { clip },
+                            crate::samples::ClipDrag::Editor {
+                                clip: std::sync::Arc::clone(&clip),
+                            },
                             |ui| {
                                 ui.add(
                                     egui::Button::new(
-                                        RichText::new("DRAG TO A CLIP CELL  ->")
+                                        RichText::new("DRAG TO A CLIP CELL OR ARRANGEMENT  ->")
                                             .font(theme::display(8.5)),
                                     )
                                     .fill(theme::accent_alpha(theme::MAGENTA, 40))
@@ -434,10 +439,15 @@ pub fn draw_editor(ctx: &egui::Context, studio: &mut Studio, audio: &mut AudioRu
                                     )),
                                 )
                             },
-                        )
-                        .response
-                        .on_hover_text(
-                            "Drag this into any cell of the clip matrix (session view)",
+                        );
+                        // The editor lives in its own window, so it starts the
+                        // same drag every other view starts; the panels then
+                        // report where the pointer is.
+                        if drag.response.is_pointer_button_down_on() || drag.response.drag_started() {
+                            begin_drag = Some(clip);
+                        }
+                        drag.response.on_hover_text(
+                            "Drag this into a session cell or onto an arrangement lane",
                         );
                     }
                     ui.separator();
@@ -524,6 +534,9 @@ pub fn draw_editor(ctx: &egui::Context, studio: &mut Studio, audio: &mut AudioRu
             });
     }
 
+    if let Some(clip) = begin_drag {
+        studio.begin_clip_drag(crate::samples::ClipDrag::Editor { clip });
+    }
     studio.sample_trim_drag = trim_drag;
     if preview {
         studio.preview_sample(audio);

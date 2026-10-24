@@ -4,7 +4,7 @@ use egui::{Align2, Color32, CornerRadius, Mesh, Pos2, Rect, Sense, Shape, Stroke
 
 use crate::audio::{AudioRuntime, LOOP_STEPS, TRACKS, TRACK_COUNT};
 use crate::dsp::spectrum::{BINS, HISTORY};
-use crate::samples::ClipDrag;
+use crate::samples::{ClipDrag, DropTarget};
 use crate::state::UiState;
 use crate::studio::Studio;
 use crate::theme;
@@ -412,6 +412,8 @@ pub fn draw_lanes(
             .collect();
         let mut remove_arrangement = None;
         let mut edit_arrangement = None;
+        // True while the pointer sits over the clip currently being carried.
+        let mut over_source_clip = false;
         for clip in &arrangement {
             let steps_total = LOOP_STEPS as f32;
             let x0 = lane.left() + clip.start_step as f32 / steps_total * lane.width();
@@ -430,14 +432,20 @@ pub fn draw_lanes(
             if block_hit.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             }
-            let payload = ClipDrag::Arrangement {
-                id: clip.id,
-                clip: std::sync::Arc::clone(&clip.clip),
-            };
-            block_hit.dnd_set_drag_payload(payload.clone());
-            if block_hit.drag_started() {
-                studio.clip_drag = Some(payload);
+            // A press on the block starts carrying it, so a fast flick that
+            // presses, travels and releases inside one frame still moves it.
+            if block_hit.is_pointer_button_down_on() || block_hit.drag_started() {
+                studio.begin_clip_drag(ClipDrag::Arrangement {
+                    id: clip.id,
+                    clip: std::sync::Arc::clone(&clip.clip),
+                });
             }
+            // Pressing inside the clip that is being carried is not a move.
+            over_source_clip |= studio.clip_drag.as_ref().is_some_and(
+                |drag| matches!(drag, ClipDrag::Arrangement { id, .. } if *id == clip.id),
+            ) && ui
+                .input(|input| input.pointer.interact_pos())
+                .is_some_and(|pos| block.contains(pos));
 
             let muted = state.mute[track] || (state.any_solo() && !state.solo[track]);
             let fill = if muted {
@@ -528,19 +536,22 @@ pub fn draw_lanes(
         // Ghost of the clip being dragged, and the highlight for OS file drops.
         let pointer = ui.input(|input| input.pointer.interact_pos());
         let over_lane = pointer.is_some_and(|pos| lane.contains(pos));
-        let carried = studio.clip_drag.is_some() && over_lane;
+        let carrying = studio.clip_drag.as_ref().map(|drag| drag.clip().clone());
+        let carried = carrying.is_some() && over_lane && !over_source_clip;
+        if carried {
+            // Publish the destination from the panel that paints the ghost, so
+            // the block drawn and the clip committed cannot disagree.
+            studio.hover_clip_drop(DropTarget::Arrangement {
+                track,
+                start_step: drop_step,
+            });
+        }
         if studio.clip_drag.is_some() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
         }
-        let drag_payload = lane_hit.dnd_hover_payload::<ClipDrag>();
         let files_hovered = ui.ctx().input(|input| !input.raw.hovered_files.is_empty());
-        if carried || drag_payload.is_some() || (files_hovered && over_lane) {
-            let source = studio
-                .clip_drag
-                .as_ref()
-                .map(|drag| drag.clip().clone())
-                .or_else(|| drag_payload.as_ref().map(|drag| drag.clip().clone()));
-            let length = source
+        if carried || (files_hovered && over_lane) {
+            let length = carrying
                 .as_ref()
                 .map(|clip| state.steps_for_duration(clip.duration_secs(), drop_step))
                 .unwrap_or(16);
@@ -679,29 +690,8 @@ pub fn draw_lanes(
             ));
         }
 
-        // A clip dragged from the session matrix (or another lane) lands here.
-        // The pointer is tested against the lane rect instead of the widget
-        // hover, because egui suppresses hover on other widgets while a drag
-        // is live.
-        let released = ui.input(|input| input.pointer.any_released());
-        if released {
-            if let Some(pos) = pointer {
-                if lane.contains(pos) {
-                    if let Some(drag) = studio.clip_drag.clone() {
-                        studio.drop_clip_on_arrangement(state, audio, drag, track, drop_step);
-                        studio.clip_drag = None;
-                    } else if let Some(payload) = lane_hit.dnd_release_payload::<ClipDrag>() {
-                        studio.drop_clip_on_arrangement(
-                            state,
-                            audio,
-                            (*payload).clone(),
-                            track,
-                            drop_step,
-                        );
-                    }
-                }
-            }
-        }
+        // The drop is committed by the application once, after both panels
+        // have drawn (see `DropTarget`).
 
         // Audio files dropped from the desktop become arrangement clips.
         let dropped: Vec<std::path::PathBuf> = ui.ctx().input(|input| {
@@ -1002,30 +992,6 @@ mod tests {
     use crate::samples::SampleClip;
     use crate::state::UiState;
 
-    /// One frame with the pointer released at `pos`, to exercise a drop.
-    fn release_at(
-        ctx: &egui::Context,
-        screen: Rect,
-        pos: Pos2,
-        mut draw: impl FnMut(&mut egui::Ui),
-    ) {
-        let input = egui::RawInput {
-            screen_rect: Some(screen),
-            events: vec![
-                egui::Event::PointerMoved(pos),
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ],
-            ..Default::default()
-        };
-        let mut output = ctx.run_ui(input, |ui| draw(ui));
-        output.textures_delta.clear();
-    }
-
     fn frame(
         ctx: &egui::Context,
         screen: Rect,
@@ -1089,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn a_session_clip_dropped_on_a_lane_lands_on_the_timeline() {
+    fn a_carried_clip_reports_the_lane_and_step_under_the_pointer() {
         let (plugins, _input, _output) = PluginRuntime::start(48_000.0);
         let mut studio = Studio::new(MidiRuntime::new(), plugins);
         let mut state = UiState::new();
@@ -1098,7 +1064,7 @@ mod tests {
         let clip = SampleClip::from_tone("DRAGGED", 220.0, 0.5, 48_000);
         studio.assign_sample(&mut state, &mut audio, 0, 0, clip);
         let clip = state.sample_clip(0, 0).cloned().expect("session sample");
-        studio.clip_drag = Some(ClipDrag::Session {
+        studio.begin_clip_drag(ClipDrag::Session {
             track: 0,
             scene: 0,
             clip,
@@ -1110,10 +1076,21 @@ mod tests {
         let pos = Pos2::new(lane.left() + lane.width() * 0.25, lane.center().y);
 
         let ctx = egui::Context::default();
-        release_at(&ctx, screen, pos, |ui| {
+        frame(&ctx, screen, vec![egui::Event::PointerMoved(pos)], |ui| {
             draw_lanes(ui, screen, &mut state, &mut studio, &mut audio);
         });
 
+        let Some(DropTarget::Arrangement { track, start_step }) = studio.clip_drop else {
+            panic!(
+                "the lane under the pointer was not reported: {:?}",
+                studio.clip_drop
+            );
+        };
+        assert_eq!(track, 3);
+        assert!(start_step > 0, "the drop step ignored the pointer");
+
+        // Committing that target is what the application does on release.
+        assert!(studio.commit_clip_drag(&mut state, &mut audio));
         assert!(
             state.sample_clip(0, 0).is_none(),
             "the session copy should move, not duplicate"
@@ -1123,7 +1100,7 @@ mod tests {
             .iter()
             .find(|clip| clip.track == 3)
             .expect("clip should land on the lane");
-        assert!(placed.start_step > 0);
+        assert_eq!(placed.start_step, start_step);
         assert!(studio.clip_drag.is_none());
     }
 }

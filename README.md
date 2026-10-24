@@ -7,7 +7,7 @@ modular master chain, MIDI recording and versioned `.rproj` projects.
 Built with `eframe`/`egui` on `wgpu`; audio is rendered by `cpal` through
 lock-free `rtrb` rings.
 
-**Version 1.4.2** · MIT · Linux, macOS and Windows.
+**Version 1.4.3** · MIT · Linux, macOS and Windows.
 
 ![Replicant DAW session and arrangement](docs/screenshot.png)
 
@@ -15,27 +15,32 @@ lock-free `rtrb` rings.
 > the status reads `SILENT FALLBACK`. A fresh session starts with an empty
 > instrument slot and the plugins already scanned.
 
-## What's new in 1.4.2
+## What's new in 1.4.3
 
-- **The knobs in the device chain now move the plugin.** CLAP has no
-  host-side `set_value`: parameter automation is a `ParamValueEvent` on the
-  processor's input list. The host only updated its own mirror, so the knobs
-  looked alive while the plugin never heard them. Changes are now queued and
-  delivered at the start of the next block. Verified against Dexed: a host
-  change survives a parameter refresh (1.000 → 0.100).
-- **Stop silences hosted instruments.** Only scheduled notes were released, so
-  anything played live — the on-screen keyboard or a MIDI controller — kept
-  droning after the transport stopped. Stop (and stopping a clip, and
-  unloading) now sends All Notes Off and All Sound Off to every routed insert.
-  Verified with a held note in CLAP and VST3: 0.27 peak while playing,
-  0.000000 after Stop.
-- **Control changes reach CLAP plugins as MIDI.** They used to be mapped onto
-  parameter indexes, so CC 120/123 poked knobs instead of stopping voices.
-  Pitch bend is forwarded too.
+- **One drag model for both views.** The session matrix and the arrangement
+  each used to resolve drops themselves, with a second payload path to fall
+  back on. Pressing a clip now starts a single drag held in DAW state; each
+  panel only reports the destination under the pointer, and the application
+  commits the move once after everything has drawn. No ordering, no double
+  drops, no duplicated clips.
+- **The drag starts on press, not on movement.** A quick flick used to press,
+  travel and release without ever meeting egui's drag threshold, so nothing
+  happened. A plain click is unaffected: releasing on the clip's own cell is
+  recognised as the origin and cancels, leaving the click to launch as before.
+- **Visible feedback while dragging.** A floating tag follows the pointer with
+  the clip name and destination (`TRK 04 · BAR 8.1`), and the arrangement paints
+  the target block where it will land. Releasing anywhere else cancels.
+- **Clips move, they do not duplicate.** Moving between views clears the
+  source, because the engine sums session and arrangement audio: a copy would
+  sound twice.
+- Verified with a real mouse under X11 in both directions and for lane
+  changes; the saved project showed exactly one clip at the dropped step.
 
 ## Screenshots
 
 ![Arrangement lanes with audio clips](docs/arrangement.png)
+
+![Dragging a session clip onto the timeline](docs/clip-drag.png)
 
 ![Instrument browser listing external CLAP/VST3 plugins](docs/instrument-browser.png)
 
@@ -126,10 +131,11 @@ Default project directory:
 1. Open the instrument browser from `SELECT VST3 / CLAP` and load an instrument
    into a track. Without one, MIDI clips are silent.
 2. Drop an audio file onto a lane, or drag a sample from the session matrix.
-   The clip lands on the nearest beat; the ghost block shows where it will go.
-3. Drag the arrangement block onto any session cell to move it back. Dragging
-   a session cell onto a lane moves it out of the matrix so it cannot sound
-   twice.
+   The clip lands on the nearest beat; a floating tag names the destination and
+   a ghost block shows exactly where it will land.
+3. Drag the arrangement block onto any session cell to move it back. A clip
+   lives in one view at a time: moving it clears the source so the same audio
+   cannot play twice.
 4. Double-click an arrangement clip to open the audio editor. Right-click for
    `OPEN AUDIO EDITOR` or `REMOVE FROM ARRANGEMENT`.
 5. Press Space to play. Arrangement clips play at their absolute timeline

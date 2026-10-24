@@ -160,6 +160,49 @@ impl ClipDrag {
     }
 }
 
+/// Where the pointer currently is, expressed in the terms of one view.
+///
+/// Both views publish this while a clip is being dragged; the application
+/// commits the move once, after every panel has drawn, so the session matrix
+/// and the arrangement never fight over the same release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropTarget {
+    Session { track: usize, scene: usize },
+    Arrangement { track: usize, start_step: u16 },
+}
+
+impl DropTarget {
+    /// Short label for the drag overlay.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Session { track, scene } => {
+                format!("TRK {:02} · SLOT {:02}", track + 1, scene + 1)
+            }
+            Self::Arrangement { track, start_step } => format!(
+                "TRK {:02} · BAR {}.{}",
+                track + 1,
+                start_step / 16 + 1,
+                start_step % 16 / 4 + 1
+            ),
+        }
+    }
+
+    /// Is this the place the clip already lives?
+    pub fn is_origin_of(&self, drag: &ClipDrag) -> bool {
+        match (self, drag) {
+            (
+                Self::Session { track, scene },
+                ClipDrag::Session {
+                    track: source_track,
+                    scene: source_scene,
+                    ..
+                },
+            ) => track == source_track && scene == source_scene,
+            _ => false,
+        }
+    }
+}
+
 /// A sample assigned to one session slot, plus its slot-level settings.
 #[derive(Clone, Debug)]
 pub struct SampleSlot {

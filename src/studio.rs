@@ -19,7 +19,7 @@ use crate::plugins::{
 };
 use crate::project::{Project, ProjectPlugin};
 use crate::samples::{
-    list_directory, ClipDrag, DecodedSample, SampleClip, SampleEntry, SampleSlot,
+    list_directory, ClipDrag, DecodedSample, DropTarget, SampleClip, SampleEntry, SampleSlot,
 };
 use crate::state::UiState;
 
@@ -72,6 +72,11 @@ pub struct Studio {
     /// Audio clip currently held by the pointer, for moving it between the
     /// session matrix and the arrangement.
     pub clip_drag: Option<ClipDrag>,
+    /// Destination reported by the panel under the pointer this frame.
+    ///
+    /// Both views publish it while a drag is live; the application commits the
+    /// move once, after every panel has drawn.
+    pub clip_drop: Option<DropTarget>,
     pub selected_slot: usize,
 
     pub scan_results: Vec<PluginDescriptor>,
@@ -151,6 +156,7 @@ impl Studio {
             slot_pending: [false; MAX_PLUGIN_SLOTS],
             plugin_sent: [(false, false); MAX_PLUGIN_SLOTS],
             clip_drag: None,
+            clip_drop: None,
             selected_slot: 0,
             scan_results: Vec::new(),
             scan_running: false,
@@ -406,24 +412,76 @@ impl Studio {
         }
     }
 
-    /// Handle a clip dropped on an arrangement lane.
-    pub fn drop_clip_on_arrangement(
+    /// Start carrying a clip. Idempotent: a press that becomes a drag must not
+    /// replace the payload the press already established.
+    pub fn begin_clip_drag(&mut self, drag: ClipDrag) {
+        if self.clip_drag.is_none() {
+            self.clip_drag = Some(drag);
+            self.clip_drop = None;
+        }
+    }
+
+    /// Report the destination under the pointer for this frame.
+    pub fn hover_clip_drop(&mut self, target: DropTarget) {
+        if self.clip_drag.is_some() {
+            self.clip_drop = Some(target);
+        }
+    }
+
+    pub fn cancel_clip_drag(&mut self) {
+        self.clip_drag = None;
+        self.clip_drop = None;
+    }
+
+    /// Forget where the pointer was; called before each frame draws panels.
+    pub fn clear_clip_drop(&mut self) {
+        self.clip_drop = None;
+    }
+
+    /// Apply and end the current drag.
+    ///
+    /// Returns `true` when a clip actually moved. A release with no target, or
+    /// over the clip's own origin, cancels without touching anything, which is
+    /// what makes a plain click still behave like a click.
+    pub fn commit_clip_drag(&mut self, state: &mut UiState, audio: &mut AudioRuntime) -> bool {
+        let Some(drag) = self.clip_drag.take() else {
+            self.clip_drop = None;
+            return false;
+        };
+        let Some(target) = self.clip_drop.take() else {
+            return false;
+        };
+        if target.is_origin_of(&drag) {
+            return false;
+        }
+        self.apply_clip_drop(state, audio, drag, target);
+        true
+    }
+
+    /// Move a clip to `target`, whatever views the two ends live in.
+    pub fn apply_clip_drop(
         &mut self,
         state: &mut UiState,
         audio: &mut AudioRuntime,
         drag: ClipDrag,
-        track: usize,
-        start_step: u16,
+        target: DropTarget,
     ) {
-        match drag {
-            ClipDrag::Editor { clip } => {
+        match (drag, target) {
+            (ClipDrag::Editor { clip }, DropTarget::Arrangement { track, start_step }) => {
                 state.add_arrangement_clip(track, start_step, clip, true, 0.0);
+                self.sync_arrangement(state, audio);
             }
-            ClipDrag::Session {
-                track: source_track,
-                scene,
-                clip,
-            } => {
+            (ClipDrag::Editor { clip }, DropTarget::Session { track, scene }) => {
+                self.assign_sample(state, audio, track, scene, clip);
+            }
+            (
+                ClipDrag::Session {
+                    track: source_track,
+                    scene,
+                    clip,
+                },
+                DropTarget::Arrangement { track, start_step },
+            ) => {
                 // Moving a clip to the arrangement takes it out of the matrix,
                 // so the same sample cannot sound from both views.
                 let (loop_enabled, gain_db) = state
@@ -438,15 +496,34 @@ impl Studio {
                     });
                 }
                 state.add_arrangement_clip(track, start_step, clip, loop_enabled, gain_db);
+                self.sync_arrangement(state, audio);
             }
-            ClipDrag::Arrangement { id, .. } => {
+            (
+                ClipDrag::Session {
+                    track: from,
+                    scene,
+                    clip,
+                },
+                DropTarget::Session { track, scene: to },
+            ) => {
+                self.clear_sample(state, audio, from, scene);
+                self.assign_sample(state, audio, track, to, clip);
+            }
+            (ClipDrag::Arrangement { id, clip }, DropTarget::Session { track, scene }) => {
+                if state.remove_arrangement_clip(id).is_some() {
+                    self.sync_arrangement(state, audio);
+                }
+                self.assign_sample(state, audio, track, scene, clip);
+            }
+            (ClipDrag::Arrangement { id, .. }, DropTarget::Arrangement { track, start_step }) => {
                 state.move_arrangement_clip(id, track, start_step);
+                self.sync_arrangement(state, audio);
             }
         }
-        self.sync_arrangement(state, audio);
     }
 
-    /// Move an arrangement clip into a session cell.
+    /// Move an arrangement clip into a session cell (kept for tests and callers
+    /// that already know both ends).
     pub fn move_arrangement_to_session(
         &mut self,
         state: &mut UiState,
@@ -1380,7 +1457,7 @@ mod tests {
         studio.assign_sample(&mut state, &mut audio, 1, 1, clip);
         let clip = state.sample_clip(1, 1).cloned().expect("session sample");
 
-        studio.drop_clip_on_arrangement(
+        studio.apply_clip_drop(
             &mut state,
             &mut audio,
             ClipDrag::Session {
@@ -1388,8 +1465,10 @@ mod tests {
                 scene: 1,
                 clip,
             },
-            3,
-            32,
+            DropTarget::Arrangement {
+                track: 3,
+                start_step: 32,
+            },
         );
         assert!(
             state.sample_clip(1, 1).is_none(),
